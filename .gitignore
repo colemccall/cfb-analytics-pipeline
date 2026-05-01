@@ -1,0 +1,32 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Pipeline output (JSON exports, model artifacts)
+output/
+!output/.gitkeep
+
+# API response cache
+.cache/
+
+# Data seeds you don't want in git
+data/*.csv
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
