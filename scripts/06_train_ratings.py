@@ -43,24 +43,23 @@ import shap
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
-from utils.db import bulk_upsert
-from utils.supabase_client import get_client
+from utils.db import bulk_upsert, get_connection
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output" / "models"
 MODEL_VERSION = "v1.0-xgb"
 
 # Minimum stat volume to qualify for ML rating (otherwise use fallback)
 STARTER_THRESHOLDS = {
-    "QB":  {"passingAtt": 100},
-    "RB":  {"rushingCar": 60},
-    "WR":  {"receivingRec": 20},
-    "TE":  {"receivingRec": 10},
-    "OL":  {},         # No individual stats — always use team proxy
-    "DL":  {"defensiveTot": 10},
-    "LB":  {"defensiveTot": 20},
-    "DB":  {"defensiveTot": 15},
+    "QB":  {"passingATT": 100},
+    "RB":  {"rushingCAR": 60},
+    "WR":  {"receivingREC": 20},
+    "TE":  {"receivingREC": 10},
+    "OL":  {},           # No individual stats — always use team proxy
+    "DL":  {"defensiveTOT": 10},
+    "LB":  {"defensiveTOT": 20},
+    "DB":  {"defensiveTOT": 15},
     "K":   {"kickingFGM": 5},
-    "P":   {"puntingPunts": 10},
+    "P":   {"puntingNO": 10},
 }
 
 # Stars → baseline rating offset from team starter average (from v1 rating_engine.py)
@@ -73,59 +72,48 @@ STARS_FALLBACK_OFFSET = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
 
 def load_players_with_stats(season: int, position_group: str) -> pd.DataFrame:
     """Pull players + season stats + recruiting + transfers for one position group."""
-    client = get_client()
+    with get_connection() as conn:
+        cur = conn.cursor()
 
-    # Players
-    players_res = (
-        client.table("players")
-        .select("id, name, cfb_api_id, position_group, team_id, year")
-        .eq("position_group", position_group)
-        .execute()
-    )
-    if not players_res.data:
-        return pd.DataFrame()
+        # Players
+        cur.execute(
+            "SELECT id, name, team_id, year FROM players WHERE position_group = %s",
+            (position_group,)
+        )
+        player_rows = cur.fetchall()
+        if not player_rows:
+            return pd.DataFrame()
+        player_ids = [r[0] for r in player_rows]
+        players_df = pd.DataFrame(player_rows, columns=["id", "name", "team_id", "year"]).set_index("id")
 
-    player_ids = [r["id"] for r in players_res.data]
-    players_df = pd.DataFrame(players_res.data).set_index("id")
+        # Season-aggregate stats — fetch all at once
+        cur.execute(
+            """SELECT player_id, data FROM stats
+               WHERE season = %s AND stat_type = 'season_aggregate'
+               AND player_id = ANY(%s)""",
+            (season, player_ids)
+        )
+        stats_map = {}
+        for pid, data in cur.fetchall():
+            stats_map[pid] = data if isinstance(data, dict) else json.loads(data)
 
-    # Season-aggregate stats
-    stats_res = (
-        client.table("stats")
-        .select("player_id, data")
-        .in_("player_id", player_ids)
-        .eq("season", season)
-        .eq("stat_type", "season_aggregate")
-        .execute()
-    )
-    stats_map = {}
-    for row in stats_res.data or []:
-        data = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
-        stats_map[row["player_id"]] = data
+        # Recruiting — most recent class within 5 years
+        cur.execute(
+            """SELECT player_id, stars, composite_score, recruit_year FROM recruiting
+               WHERE recruit_year >= %s AND player_id = ANY(%s)""",
+            (season - 5, player_ids)
+        )
+        rec_map = {}
+        for pid, stars, composite_score, recruit_year in cur.fetchall():
+            if pid not in rec_map or (composite_score or 0) > (rec_map[pid].get("composite_score") or 0):
+                rec_map[pid] = {"stars": stars, "composite_score": composite_score}
 
-    # Recruiting (most recent class within 5 years of current season)
-    rec_res = (
-        client.table("recruiting")
-        .select("player_id, stars, composite_score, recruit_year")
-        .in_("player_id", player_ids)
-        .gte("recruit_year", season - 5)
-        .execute()
-    )
-    rec_map = {}
-    for row in rec_res.data or []:
-        pid = row["player_id"]
-        # Keep highest composite score if multiple classes
-        if pid not in rec_map or (row.get("composite_score") or 0) > (rec_map[pid].get("composite_score") or 0):
-            rec_map[pid] = row
-
-    # Transfer flag
-    xfer_res = (
-        client.table("transfers")
-        .select("player_id")
-        .in_("player_id", player_ids)
-        .eq("transfer_year", season)
-        .execute()
-    )
-    transfer_set = {r["player_id"] for r in xfer_res.data or []}
+        # Transfer flag
+        cur.execute(
+            "SELECT player_id FROM transfers WHERE transfer_year = %s AND player_id = ANY(%s)",
+            (season, player_ids)
+        )
+        transfer_set = {row[0] for row in cur.fetchall()}
 
     # Assemble rows
     rows = []
@@ -133,19 +121,18 @@ def load_players_with_stats(season: int, position_group: str) -> pd.DataFrame:
         stats = stats_map.get(pid, {})
         rec = rec_map.get(pid, {})
         row = {
-            "player_id":   pid,
-            "name":        player["name"],
-            "team_id":     player["team_id"],
-            "year":        player.get("year", 0) or 0,
-            "stars":       rec.get("stars", 0) or 0,
-            "composite_score": rec.get("composite_score", 0.8) or 0.8,
+            "player_id":         pid,
+            "name":              player["name"],
+            "team_id":           player["team_id"],
+            "year":              player.get("year", 0) or 0,
+            "stars":             rec.get("stars", 0) or 0,
+            "composite_score":   rec.get("composite_score", 0.8) or 0.8,
             "recruit_composite": _composite_to_100(rec.get("composite_score")),
-            "transfer_flag": 1 if pid in transfer_set else 0,
-            "games_played": stats.get("games_played", 0) or 0,
-            "snap_pct":    stats.get("snap_pct", 0) or 0,
-            "award_tier":  stats.get("award_tier", 0) or 0,
-            "ppa":         stats.get("ppa", 0) or 0,
-            # Raw stats (position-specific; undefined ones stay 0)
+            "transfer_flag":     1 if pid in transfer_set else 0,
+            "games_played":      stats.get("games_played", 0) or 0,
+            "snap_pct":          stats.get("snap_pct", 0) or 0,
+            "award_tier":        stats.get("award_tier", 0) or 0,
+            "ppa":               stats.get("ppa", 0) or 0,
             **_extract_stats(stats, position_group),
         }
         rows.append(row)
@@ -157,60 +144,73 @@ def _composite_to_100(score: float | None) -> float:
     """247 composite is 0.7000–1.0000; scale to 0–100."""
     if not score:
         return 40.0
-    return max(0.0, min(100.0, (score - 0.7) / 0.3 * 100))
+    return max(0.0, min(100.0, (float(score) - 0.7) / 0.3 * 100))
 
 
 def _extract_stats(stats: dict, pg: str) -> dict:
-    """Extract position-relevant numeric stats from the JSONB blob."""
-    s = {k: float(v) if v is not None else 0.0 for k, v in stats.items() if isinstance(v, (int, float))}
-    games = max(s.get("games_played", 1), 1)
+    """Extract position-relevant numeric stats from the JSONB blob.
+    Key names mirror what script 01 stores: passingATT, rushingCAR, receivingREC, etc.
+    Raw volume fields prefixed 'raw_' are used by is_starter_tier() proxy.
+    """
+    def f(key):
+        v = stats.get(key)
+        try: return float(v) if v is not None else 0.0
+        except (TypeError, ValueError): return 0.0
+
+    games = max(f("games_played"), 1)  # usually 0 due to usage API gap — OK, per-game stats degrade gracefully
 
     if pg == "QB":
-        att = max(s.get("passingAtt", 0), 1)
+        att = max(f("passingATT"), 1)
         return {
-            "comp_pct":       s.get("passingComp", 0) / att,
-            "yards_per_att":  s.get("passingYds", 0) / att,
-            "td_int_ratio":   (s.get("passingTd", 0) + 1) / (s.get("passingInt", 0) + 1),
+            "comp_pct":        f("passingCOMPLETIONS") / att,
+            "yards_per_att":   f("passingYDS") / att,
+            "td_int_ratio":    (f("passingTD") + 1) / (f("passingINT") + 1),
+            "raw_passingATT":  f("passingATT"),
         }
     if pg == "RB":
-        car = max(s.get("rushingCar", 0), 1)
+        car = max(f("rushingCAR"), 1)
         return {
-            "yards_per_carry": s.get("rushingYds", 0) / car,
-            "yards_per_game":  s.get("rushingYds", 0) / games,
-            "rec_per_game":    s.get("receivingRec", 0) / games,
+            "yards_per_carry": f("rushingYDS") / car,
+            "yards_per_game":  f("rushingYDS") / games,
+            "rec_per_game":    f("receivingREC") / games,
+            "raw_rushingCAR":  f("rushingCAR"),
         }
     if pg in ("WR", "TE"):
-        rec = max(s.get("receivingRec", 0), 1)
+        rec = max(f("receivingREC"), 1)
         return {
-            "yards_per_rec":  s.get("receivingYds", 0) / rec,
-            "catch_rate":     s.get("receivingRec", 0) / max(s.get("receivingRec", 1), 1),
-            "rec_per_game":   s.get("receivingRec", 0) / games,
+            "yards_per_rec":   f("receivingYDS") / rec,
+            "catch_rate":      f("receivingREC") / max(f("receivingREC"), 1),  # always 1.0 — placeholder for target data
+            "rec_per_game":    f("receivingREC") / games,
+            "raw_receivingREC": f("receivingREC"),
         }
     if pg == "OL":
         return {
-            "team_rush_ypa":  s.get("team_rush_ypa", 0),
-            "team_sack_rate": s.get("team_sack_rate", 0),
+            "team_rush_ypa":  f("team_rush_ypa"),
+            "team_sack_rate": f("team_sack_rate"),
         }
     if pg in ("DL", "LB", "DB"):
         return {
-            "tackles_per_game": s.get("defensiveTot", 0) / games,
-            "sacks_per_game":   s.get("defensiveSacks", 0) / games,
-            "tfl_per_game":     s.get("defensiveTfl", 0) / games,
-            "ints_per_game":    s.get("defensiveInt", 0) / games,
-            "pbu_per_game":     s.get("defensivePd", 0) / games,
+            "tackles_per_game": f("defensiveTOT") / games,
+            "sacks_per_game":   f("defensiveSACKS") / games,
+            "tfl_per_game":     f("defensiveTFL") / games,
+            "ints_per_game":    f("interceptionsINT") / games,
+            "pbu_per_game":     f("defensivePD") / games,
+            "raw_defensiveTOT": f("defensiveTOT"),
         }
     if pg == "K":
-        att = max(s.get("kickingFGA", 0), 1)
+        att = max(f("kickingFGA"), 1)
         return {
-            "fg_pct":  s.get("kickingFGM", 0) / att,
-            "fg_long": s.get("kickingLng", 0),
-            "xp_pct":  s.get("kickingXPM", 0) / max(s.get("kickingXPA", 1), 1),
+            "fg_pct":       f("kickingFGM") / att,
+            "fg_long":      f("kickingLNG"),
+            "xp_pct":       f("kickingXPM") / max(f("kickingXPA"), 1),
+            "raw_kickingFGM": f("kickingFGM"),
         }
     if pg == "P":
-        punts = max(s.get("puntingPunts", 0), 1)
+        punts = max(f("puntingNO"), 1)
         return {
-            "avg_yards":     s.get("puntingYds", 0) / punts,
-            "inside_20_pct": s.get("puntingIn20", 0) / punts,
+            "avg_yards":     f("puntingYDS") / punts,
+            "inside_20_pct": f("puntingIn 20") / punts,
+            "raw_puntingNO": f("puntingNO"),
         }
     return {}
 
@@ -218,10 +218,31 @@ def _extract_stats(stats: dict, pg: str) -> dict:
 def is_starter_tier(row: pd.Series, position_group: str) -> bool:
     thresholds = STARTER_THRESHOLDS.get(position_group, {})
     if not thresholds:
-        return True  # OL: always use fallback path
-    stats = {}  # We only have extracted stats here, not raw
-    # Use games_played + snap_pct as a proxy for starter tier
-    return (row.get("games_played", 0) >= 6) and (row.get("snap_pct", 0) >= 0.10)
+        return True  # OL: always use team-proxy path
+
+    # Prefer games_played if available (> 0), otherwise fall back to stat-volume thresholds
+    gp = row.get("games_played", 0) or 0
+    snap = row.get("snap_pct", 0) or 0
+    if gp >= 6 and snap >= 0.10:
+        return True
+
+    # games_played is 0 (usage API gap) — use raw stat volume thresholds instead
+    VOLUME_PROXY = {
+        "QB":  ("raw_passingATT", 100),
+        "RB":  ("raw_rushingCAR", 60),
+        "WR":  ("raw_receivingREC", 20),
+        "TE":  ("raw_receivingREC", 10),
+        "DL":  ("raw_defensiveTOT", 10),
+        "LB":  ("raw_defensiveTOT", 20),
+        "DB":  ("raw_defensiveTOT", 15),
+        "K":   ("raw_kickingFGM", 5),
+        "P":   ("raw_puntingNO", 10),
+    }
+    proxy = VOLUME_PROXY.get(position_group)
+    if proxy:
+        field, threshold = proxy
+        return (row.get(field, 0) or 0) >= threshold
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -316,21 +337,19 @@ def fallback_rating(stars: int, team_avg: float = 65.0) -> float:
 
 def compute_trajectory(current_ratings: dict, prev_season: int, current_season: int) -> dict:
     """Compare current ratings to previous season; return {player_id: trajectory_score}."""
-    client = get_client()
-    result = (
-        client.table("ratings")
-        .select("player_id, overall_rating")
-        .eq("season", prev_season)
-        .execute()
-    )
-    prev_map = {r["player_id"]: r["overall_rating"] for r in result.data or []}
+    if not current_ratings:
+        return {}
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT player_id, overall_rating FROM ratings WHERE season = %s AND player_id = ANY(%s)",
+            (prev_season, list(current_ratings.keys()))
+        )
+        prev_map = {pid: float(rating) for pid, rating in cur.fetchall()}
     trajectory = {}
     for pid, curr_rating in current_ratings.items():
         prev_rating = prev_map.get(pid)
-        if prev_rating is not None:
-            trajectory[pid] = round(curr_rating - prev_rating, 2)
-        else:
-            trajectory[pid] = 0.0
+        trajectory[pid] = round(curr_rating - prev_rating, 2) if prev_rating is not None else 0.0
     return trajectory
 
 
@@ -421,18 +440,18 @@ def rate_position(season: int, position_group: str) -> list[dict]:
     else:
         breakout_map = {}
 
-    # Assemble output rows
+    # Assemble output rows (cast numpy scalars to native Python types for psycopg2)
     rows = []
     for pid in df.index:
         rows.append({
-            "player_id":           pid,
-            "season":              season,
-            "overall_rating":      ratings_map.get(pid, 50.0),
-            "position_rating":     ratings_map.get(pid, 50.0),  # same until cross-position normalization
-            "trajectory_score":    trajectory.get(pid, 0.0),
-            "breakout_probability": breakout_map.get(pid, 0.05),
-            "shap_values":         json.dumps(shap_map.get(pid, {})),
-            "model_version":       MODEL_VERSION,
+            "player_id":            int(pid),
+            "season":               int(season),
+            "overall_rating":       float(ratings_map.get(pid, 50.0)),
+            "position_rating":      float(ratings_map.get(pid, 50.0)),
+            "trajectory_score":     float(trajectory.get(pid, 0.0)),
+            "breakout_probability": float(breakout_map.get(pid, 0.05)),
+            "shap_values":          json.dumps(shap_map.get(pid, {})),
+            "model_version":        MODEL_VERSION,
         })
 
     print(f"    Rated {len(rows)} players (ML: {len(starter_df)}, fallback: {len(backup_df)})")

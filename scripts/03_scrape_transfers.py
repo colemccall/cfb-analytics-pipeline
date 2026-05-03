@@ -1,15 +1,13 @@
-"""Scrape transfer portal data → upsert to Supabase.
+"""Fetch transfer portal data from CFB Data API → upsert to Supabase.
 
-Sources (try in order):
-  1. On3 transfer portal tracker
-  2. 247Sports transfer portal
+Uses /player/portal endpoint (origin, destination, transferDate, rating, stars).
+Player linkage uses fuzzy name matching against the `players` table.
 
-Also resolves player_id linkages for transfer rows inserted by script 01.
+Falls back to On3 scraping if API returns no data for a year.
 
 Usage:
     python scripts/03_scrape_transfers.py              # 2021-2025
     python scripts/03_scrape_transfers.py --year 2024  # single year
-    python scripts/03_scrape_transfers.py --link-only  # just re-run player linkage
 """
 
 import argparse
@@ -25,6 +23,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
+from utils.api_client import load_api_key, fetch_transfer_portal
 from utils.db import bulk_upsert, get_connection
 
 YEARS_DEFAULT = list(range(2021, 2026))
@@ -38,6 +37,97 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# CFB Data API source
+# ---------------------------------------------------------------------------
+
+def fetch_transfers_api(api_key: str, year: int) -> list[dict]:
+    """Fetch transfer portal from CFB Data API. Returns normalized dicts."""
+    raw = fetch_transfer_portal(api_key, year)
+    results = []
+    for r in raw:
+        name = f"{r.get('firstName', '')} {r.get('lastName', '')}".strip()
+        raw_date = r.get("transferDate", "")
+        portal_date = raw_date[:10] if raw_date and len(raw_date) >= 10 else None
+        results.append({
+            "name":          name,
+            "from_school":   r.get("origin"),
+            "to_school":     r.get("destination"),
+            "position":      r.get("position"),
+            "portal_date":   portal_date,
+            "transfer_year": r.get("season", year),
+            "stars":         r.get("stars"),
+            "rating":        r.get("rating"),
+            "eligibility":   r.get("eligibility"),
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# On3 scrape fallback
+# ---------------------------------------------------------------------------
+
+def scrape_on3(year: int) -> list[dict]:
+    url = ON3_URL.format(year=year)
+    print(f"  [On3 fallback] Fetching {url}")
+    entries = []
+    page = 1
+
+    while True:
+        page_url = f"{url}?page={page}" if page > 1 else url
+        try:
+            resp = requests.get(page_url, headers=HEADERS, timeout=20)
+            if resp.status_code in (403, 404):
+                print(f"  {resp.status_code} on page {page} — stopping.")
+                break
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"  Request failed: {e}")
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        rows = soup.select(".transfer-portal-player-card") or soup.select("[class*='PlayerCard']")
+        if not rows:
+            break
+
+        for row in rows:
+            entry = _parse_on3_row(row, year)
+            if entry:
+                entries.append(entry)
+
+        page += 1
+        time.sleep(SLEEP_SEC)
+
+    return entries
+
+
+def _parse_on3_row(row, year: int) -> dict | None:
+    try:
+        name_el = row.select_one("[class*='PlayerName']") or row.select_one(".player-name")
+        if not name_el:
+            return None
+        name = name_el.get_text(strip=True)
+        from_el = row.select_one("[class*='FromSchool']") or row.select_one(".from-school")
+        to_el = row.select_one("[class*='ToSchool']") or row.select_one(".to-school")
+        pos_el = row.select_one("[class*='Position']") or row.select_one(".position")
+        date_el = row.select_one("[class*='Date']") or row.select_one(".portal-date")
+        raw_date = date_el.get_text(strip=True) if date_el else None
+        return {
+            "name":          name,
+            "from_school":   from_el.get_text(strip=True) if from_el else None,
+            "to_school":     to_el.get_text(strip=True) if to_el else None,
+            "position":      pos_el.get_text(strip=True) if pos_el else None,
+            "portal_date":   (raw_date or "")[:10] or None,
+            "transfer_year": year,
+            "stars":         None,
+            "rating":        None,
+            "eligibility":   None,
+        }
+    except Exception as e:
+        print(f"  Row parse error: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -104,76 +194,6 @@ def fuzzy_match_player(
 
 
 # ---------------------------------------------------------------------------
-# On3 scraper
-# ---------------------------------------------------------------------------
-
-def scrape_on3(year: int) -> list[dict]:
-    url = ON3_URL.format(year=year)
-    print(f"  Fetching {url}")
-    entries = []
-    page = 1
-
-    while True:
-        page_url = f"{url}?page={page}" if page > 1 else url
-        try:
-            resp = requests.get(page_url, headers=HEADERS, timeout=20)
-            if resp.status_code in (403, 404):
-                print(f"  {resp.status_code} on page {page} — stopping.")
-                break
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  Request failed: {e}")
-            break
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select(".transfer-portal-player-card") or soup.select("[class*='PlayerCard']")
-        if not rows:
-            break
-
-        for row in rows:
-            entry = _parse_on3_row(row, year)
-            if entry:
-                entries.append(entry)
-
-        page += 1
-        time.sleep(SLEEP_SEC)
-
-    return entries
-
-
-def _parse_on3_row(row, year: int) -> dict | None:
-    try:
-        name_el = row.select_one("[class*='PlayerName']") or row.select_one(".player-name")
-        if not name_el:
-            return None
-        name = name_el.get_text(strip=True)
-
-        from_el = row.select_one("[class*='FromSchool']") or row.select_one(".from-school")
-        from_school = from_el.get_text(strip=True) if from_el else None
-
-        to_el = row.select_one("[class*='ToSchool']") or row.select_one(".to-school")
-        to_school = to_el.get_text(strip=True) if to_el else None
-
-        pos_el = row.select_one("[class*='Position']") or row.select_one(".position")
-        position = pos_el.get_text(strip=True) if pos_el else None
-
-        date_el = row.select_one("[class*='Date']") or row.select_one(".portal-date")
-        portal_date = date_el.get_text(strip=True) if date_el else None
-
-        return {
-            "name": name,
-            "from_school": from_school,
-            "to_school": to_school,
-            "position": position,
-            "portal_date": portal_date,
-            "transfer_year": year,
-        }
-    except Exception as e:
-        print(f"  Row parse error: {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Upsert
 # ---------------------------------------------------------------------------
 
@@ -190,17 +210,13 @@ def upsert_transfers(entries: list[dict], player_index: dict, team_index: dict) 
         from_id = team_index.get((e.get("from_school") or "").lower())
         to_id = team_index.get((e.get("to_school") or "").lower())
 
-        # Parse portal_date — keep only YYYY-MM-DD portion if present
-        raw_date = (e.get("portal_date") or "").strip()
-        portal_date = raw_date[:10] if len(raw_date) >= 10 else (raw_date or None)
-
         rows.append({
             "player_id":     player_id,
             "from_team_id":  from_id,
             "to_team_id":    to_id,
             "transfer_year": e["transfer_year"],
-            "portal_date":   portal_date,
-            "source":        "on3_scrape",
+            "portal_date":   e.get("portal_date"),
+            "source":        "cfb_api",
         })
 
     # Compute portal_entry_count per player across this batch
@@ -209,10 +225,13 @@ def upsert_transfers(entries: list[dict], player_index: dict, team_index: dict) 
     for r in rows:
         r["portal_entry_count"] = pid_counts[r["player_id"]]
 
-    # Dedup by (player_id, transfer_year) — keep last seen
+    # Dedup by (player_id, transfer_year) — keep entry with portal_date if available
     seen: dict = {}
     for r in rows:
-        seen[(r["player_id"], r["transfer_year"])] = r
+        key = (r["player_id"], r["transfer_year"])
+        existing = seen.get(key)
+        if existing is None or (r.get("portal_date") and not existing.get("portal_date")):
+            seen[key] = r
     rows = list(seen.values())
 
     if rows:
@@ -225,25 +244,27 @@ def upsert_transfers(entries: list[dict], player_index: dict, team_index: dict) 
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape transfer portal → Supabase")
+    parser = argparse.ArgumentParser(description="Fetch transfer portal → Supabase")
     parser.add_argument("--year", type=int, help="Single year")
-    parser.add_argument("--link-only", action="store_true", help="Only re-run player linkage (no-op placeholder)")
     args = parser.parse_args()
 
+    api_key = load_api_key()
     years = [args.year] if args.year else YEARS_DEFAULT
+
     print("Building player and team indexes...")
     player_index = build_player_index()
     team_index = build_team_index()
     print(f"  {len(player_index)} player names, {len(team_index)} teams loaded")
 
-    if args.link_only:
-        print("--link-only: no scrape source to re-link without names. Exiting.")
-        return
-
     for year in years:
         print(f"\n--- Transfer portal {year} ---")
-        entries = scrape_on3(year)
-        print(f"  Scraped {len(entries)} portal entries")
+        entries = fetch_transfers_api(api_key, year)
+
+        if not entries:
+            print(f"  API returned nothing for {year} — trying On3 scrape fallback")
+            entries = scrape_on3(year)
+
+        print(f"  Got {len(entries)} portal entries")
         if entries:
             upsert_transfers(entries, player_index, team_index)
 

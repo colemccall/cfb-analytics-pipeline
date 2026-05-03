@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
-from utils.supabase_client import get_client
+from utils.db import get_connection
 
 DEFAULT_OUTPUT = Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"
 CURRENT_SEASON = 2025
@@ -43,70 +43,99 @@ def write_json(path: Path, data) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, separators=(",", ":"))
     size_kb = path.stat().st_size / 1024
-    print(f"  Wrote {path.name} ({size_kb:.1f} KB, {len(data) if isinstance(data, list) else len(data)} items)")
+    n = len(data) if isinstance(data, (list, dict)) else "?"
+    print(f"  Wrote {path.name} ({size_kb:.1f} KB, {n} items)")
 
+
+def _parse_shap(val) -> dict:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except Exception:
+            pass
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Export functions (all use psycopg2 — no 1000-row REST limit)
+# ---------------------------------------------------------------------------
 
 def export_players(output_dir: Path, season: int) -> None:
-    """Export all players with their ratings, recruiting info, and team."""
-    client = get_client()
+    """Export all rated players with ratings, recruiting info, and team."""
+    with get_connection() as conn:
+        cur = conn.cursor()
 
-    result = (
-        client.table("ratings")
-        .select(
-            "player_id, season, overall_rating, position_rating, trajectory_score, "
-            "breakout_probability, shap_values, "
-            "players(id, name, position, position_group, year, height_in, weight_lbs, "
-            "hometown_state, teams(id, school, abbreviation, conference, color, logo_url))"
-        )
-        .eq("season", season)
-        .order("overall_rating", desc=True)
-        .execute()
-    )
+        # Ratings + player + team in one join
+        cur.execute("""
+            SELECT
+                r.player_id,
+                r.overall_rating,
+                r.position_rating,
+                r.trajectory_score,
+                r.breakout_probability,
+                r.shap_values,
+                p.name,
+                p.position,
+                p.position_group,
+                p.year,
+                p.height_in,
+                p.weight_lbs,
+                p.hometown_state,
+                t.id   AS team_id,
+                t.school,
+                t.abbreviation,
+                t.conference,
+                t.color,
+                t.logo_url
+            FROM ratings r
+            JOIN players p ON p.id = r.player_id
+            LEFT JOIN teams t ON t.id = p.team_id
+            WHERE r.season = %s
+            ORDER BY r.overall_rating DESC NULLS LAST
+        """, (season,))
+        rating_rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
 
-    # Build recruiting lookup
-    rec_res = client.table("recruiting").select("player_id, stars, composite_score, recruit_year").execute()
-    rec_map = {}
-    for r in rec_res.data or []:
-        pid = r["player_id"]
-        if pid not in rec_map or (r.get("composite_score") or 0) > (rec_map[pid].get("composite_score") or 0):
-            rec_map[pid] = r
+        # Recruiting — best record per player
+        cur.execute("""
+            SELECT DISTINCT ON (player_id)
+                player_id, stars, composite_score, recruit_year
+            FROM recruiting
+            ORDER BY player_id, composite_score DESC NULLS LAST
+        """)
+        rec_map = {row[0]: {"stars": row[1], "composite_score": row[2], "recruit_year": row[3]}
+                   for row in cur.fetchall()}
 
     players = []
-    for row in result.data or []:
-        p = row.get("players") or {}
-        team = p.get("teams") or {}
+    for raw in rating_rows:
+        row = dict(zip(cols, raw))
         rec = rec_map.get(row["player_id"], {})
-        shap = row.get("shap_values")
-        if isinstance(shap, str):
-            try:
-                shap = json.loads(shap)
-            except Exception:
-                shap = {}
-
         players.append({
-            "id":                row["player_id"],
-            "name":              p.get("name"),
-            "position":          p.get("position"),
-            "position_group":    p.get("position_group"),
-            "year":              p.get("year"),
-            "height_in":         p.get("height_in"),
-            "weight_lbs":        p.get("weight_lbs"),
-            "hometown_state":    p.get("hometown_state"),
-            "team_id":           team.get("id"),
-            "team":              team.get("school"),
-            "team_abbr":         team.get("abbreviation"),
-            "conference":        team.get("conference"),
-            "team_color":        team.get("color"),
-            "logo_url":          team.get("logo_url"),
-            "overall_rating":    row.get("overall_rating"),
-            "position_rating":   row.get("position_rating"),
-            "trajectory":        row.get("trajectory_score"),
-            "breakout_prob":     row.get("breakout_probability"),
-            "shap":              shap,
-            "stars":             rec.get("stars"),
-            "composite_score":   rec.get("composite_score"),
-            "recruit_year":      rec.get("recruit_year"),
-            "season":            season,
+            "id":             row["player_id"],
+            "name":           row["name"],
+            "position":       row["position"],
+            "position_group": row["position_group"],
+            "year":           row["year"],
+            "height_in":      row["height_in"],
+            "weight_lbs":     row["weight_lbs"],
+            "hometown_state": row["hometown_state"],
+            "team_id":        row["team_id"],
+            "team":           row["school"],
+            "team_abbr":      row["abbreviation"],
+            "conference":     row["conference"],
+            "team_color":     row["color"],
+            "logo_url":       row["logo_url"],
+            "overall_rating": row["overall_rating"],
+            "position_rating": row["position_rating"],
+            "trajectory":     row["trajectory_score"],
+            "breakout_prob":  row["breakout_probability"],
+            "shap":           _parse_shap(row["shap_values"]),
+            "stars":          rec.get("stars"),
+            "composite_score": rec.get("composite_score"),
+            "recruit_year":   rec.get("recruit_year"),
+            "season":         season,
         })
 
     write_json(output_dir / "players.json", players)
@@ -114,35 +143,36 @@ def export_players(output_dir: Path, season: int) -> None:
 
 def export_teams(output_dir: Path, season: int) -> None:
     """Export teams with average rating and player counts."""
-    client = get_client()
+    with get_connection() as conn:
+        cur = conn.cursor()
 
-    teams_res = client.table("teams").select("id, school, abbreviation, conference, color, alt_color, logo_url, stadium_name, city, state, capacity").execute()
+        cur.execute("""
+            SELECT id, school, abbreviation, conference, color, alt_color,
+                   logo_url, stadium_name, city, state, capacity
+            FROM teams
+            ORDER BY school
+        """)
+        team_rows = cur.fetchall()
+        team_cols = [d[0] for d in cur.description]
 
-    # Aggregate ratings per team
-    ratings_res = (
-        client.table("ratings")
-        .select("overall_rating, players(team_id)")
-        .eq("season", season)
-        .execute()
-    )
-    team_ratings: dict = {}
-    for r in ratings_res.data or []:
-        p = r.get("players") or {}
-        tid = p.get("team_id")
-        if tid:
-            team_ratings.setdefault(tid, []).append(r.get("overall_rating") or 0)
+        # Per-team rating aggregates for this season
+        cur.execute("""
+            SELECT p.team_id,
+                   COUNT(r.overall_rating) AS player_count,
+                   ROUND(AVG(r.overall_rating)::numeric, 2) AS avg_rating
+            FROM ratings r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.season = %s AND p.team_id IS NOT NULL
+            GROUP BY p.team_id
+        """, (season,))
+        team_stats = {row[0]: {"player_count": row[1], "avg_rating": float(row[2]) if row[2] else None}
+                      for row in cur.fetchall()}
 
     teams = []
-    for t in teams_res.data or []:
-        tid = t["id"]
-        ratings_list = team_ratings.get(tid, [])
-        avg_rating = round(sum(ratings_list) / len(ratings_list), 2) if ratings_list else None
-        teams.append({
-            **t,
-            "avg_rating":    avg_rating,
-            "player_count":  len(ratings_list),
-            "season":        season,
-        })
+    for raw in team_rows:
+        t = dict(zip(team_cols, raw))
+        stats = team_stats.get(t["id"], {"player_count": 0, "avg_rating": None})
+        teams.append({**t, **stats, "season": season})
 
     teams.sort(key=lambda x: x.get("avg_rating") or 0, reverse=True)
     write_json(output_dir / "teams.json", teams)
@@ -150,75 +180,83 @@ def export_teams(output_dir: Path, season: int) -> None:
 
 def export_ratings_by_position(output_dir: Path, season: int) -> None:
     """Export top-N players per position group for the ratings dashboard."""
-    client = get_client()
+    with get_connection() as conn:
+        cur = conn.cursor()
 
-    result = (
-        client.table("ratings")
-        .select(
-            "player_id, overall_rating, position_rating, trajectory_score, breakout_probability, shap_values, "
-            "players(name, position_group, year, teams(school, abbreviation, conference, color))"
-        )
-        .eq("season", season)
-        .order("overall_rating", desc=True)
-        .execute()
-    )
+        cur.execute("""
+            SELECT
+                r.player_id,
+                r.overall_rating,
+                r.position_rating,
+                r.trajectory_score,
+                r.breakout_probability,
+                r.shap_values,
+                p.name,
+                p.position_group,
+                p.year,
+                t.school,
+                t.abbreviation,
+                t.conference,
+                t.color
+            FROM ratings r
+            JOIN players p ON p.id = r.player_id
+            LEFT JOIN teams t ON t.id = p.team_id
+            WHERE r.season = %s
+            ORDER BY r.overall_rating DESC NULLS LAST
+        """, (season,))
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
 
-    # Build recruiting lookup for stars display
-    rec_res = client.table("recruiting").select("player_id, stars, composite_score").execute()
-    rec_map = {}
-    for r in rec_res.data or []:
-        pid = r["player_id"]
-        if pid not in rec_map or (r.get("composite_score") or 0) > (rec_map[pid].get("composite_score") or 0):
-            rec_map[pid] = r
+        cur.execute("""
+            SELECT DISTINCT ON (player_id)
+                player_id, stars, composite_score
+            FROM recruiting
+            ORDER BY player_id, composite_score DESC NULLS LAST
+        """)
+        rec_map = {row[0]: {"stars": row[1], "composite": row[2]} for row in cur.fetchall()}
 
     by_position: dict = {}
-    for row in result.data or []:
-        p = row.get("players") or {}
-        pg = p.get("position_group") or "ATH"
-        team = p.get("teams") or {}
+    for raw in rows:
+        row = dict(zip(cols, raw))
+        pg = row["position_group"] or "ATH"
+        if pg not in by_position:
+            by_position[pg] = []
+        if len(by_position[pg]) >= TOP_N_PER_POSITION:
+            continue
         rec = rec_map.get(row["player_id"], {})
-        shap = row.get("shap_values")
-        if isinstance(shap, str):
-            try:
-                shap = json.loads(shap)
-            except Exception:
-                shap = {}
+        by_position[pg].append({
+            "id":              row["player_id"],
+            "name":            row["name"],
+            "year":            row["year"],
+            "team":            row["school"],
+            "team_abbr":       row["abbreviation"],
+            "conference":      row["conference"],
+            "team_color":      row["color"],
+            "overall":         row["overall_rating"],
+            "position_rating": row["position_rating"],
+            "trajectory":      row["trajectory_score"],
+            "breakout_prob":   row["breakout_probability"],
+            "shap":            _parse_shap(row["shap_values"]),
+            "stars":           rec.get("stars"),
+            "composite":       rec.get("composite"),
+        })
 
-        entry = {
-            "id":             row["player_id"],
-            "name":           p.get("name"),
-            "year":           p.get("year"),
-            "team":           team.get("school"),
-            "team_abbr":      team.get("abbreviation"),
-            "conference":     team.get("conference"),
-            "team_color":     team.get("color"),
-            "overall":        row.get("overall_rating"),
-            "position_rating": row.get("position_rating"),
-            "trajectory":     row.get("trajectory_score"),
-            "breakout_prob":  row.get("breakout_probability"),
-            "shap":           shap,
-            "stars":          rec.get("stars"),
-            "composite":      rec.get("composite_score"),
-        }
-        by_position.setdefault(pg, []).append(entry)
-
-    # Trim to top N per position
-    trimmed = {pg: players[:TOP_N_PER_POSITION] for pg, players in by_position.items()}
-    write_json(output_dir / "ratings_by_position.json", trimmed)
+    write_json(output_dir / "ratings_by_position.json", by_position)
 
 
 def export_research(output_dir: Path) -> None:
     """Export any precomputed research findings from research_cache table."""
-    client = get_client()
-    result = client.table("research_cache").select("research_key, data, generated_at").execute()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT research_key, data, generated_at FROM research_cache")
+        rows = cur.fetchall()
 
     research_dir = output_dir / "research"
     count = 0
-    for row in result.data or []:
-        key = row["research_key"]
-        data = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
-        data["_generated_at"] = row["generated_at"]
-        write_json(research_dir / f"{key}.json", data)
+    for key, data, generated_at in rows:
+        payload = data if isinstance(data, dict) else json.loads(data)
+        payload["_generated_at"] = str(generated_at)
+        write_json(research_dir / f"{key}.json", payload)
         count += 1
 
     if count == 0:
@@ -253,7 +291,7 @@ def main():
     print("research/*.json...")
     export_research(output_dir)
 
-    print("\nDone. Copy data/ folder to cfb-analytics-app/data/ if not writing there directly.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
