@@ -182,7 +182,71 @@ CREATE INDEX IF NOT EXISTS idx_ratings_season   ON ratings(season);
 CREATE INDEX IF NOT EXISTS idx_ratings_player   ON ratings(player_id);
 
 -- ============================================================
--- 10. RESEARCH_CACHE
+-- 10. PLAYS  (depends on: games, teams)
+-- Raw play-by-play. Source of truth for EDGE computation.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS plays (
+    id              SERIAL PRIMARY KEY,
+    cfb_api_id      BIGINT UNIQUE,      -- play id from CFB Data API
+    game_id         INTEGER REFERENCES games(id),
+    season          INTEGER NOT NULL,
+    week            INTEGER,
+    offense_team_id INTEGER REFERENCES teams(id),
+    defense_team_id INTEGER REFERENCES teams(id),
+    period          INTEGER,            -- 1-4 (+ OT)
+    clock_seconds   INTEGER,            -- seconds remaining in period
+    down            INTEGER,            -- 1-4
+    distance        INTEGER,            -- yards to first down
+    yards_to_goal   INTEGER,            -- yards to end zone
+    home_score      INTEGER,
+    away_score      INTEGER,
+    offense_score   INTEGER,
+    defense_score   INTEGER,
+    play_type       TEXT,               -- "Pass Reception", "Rush", "Sack", etc.
+    yards_gained    INTEGER,
+    epa             NUMERIC(8,4),       -- API-provided EPA (may be NULL)
+    ppa             NUMERIC(8,4),       -- API-provided PPA (may be NULL)
+    -- player attribution (offensive skill players)
+    passer_player_id   INTEGER REFERENCES players(id),
+    rusher_player_id   INTEGER REFERENCES players(id),
+    receiver_player_id INTEGER REFERENCES players(id),
+    -- raw text for backup parsing
+    play_text       TEXT,
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_plays_game    ON plays(game_id);
+CREATE INDEX IF NOT EXISTS idx_plays_season  ON plays(season);
+CREATE INDEX IF NOT EXISTS idx_plays_offense ON plays(offense_team_id, season);
+CREATE INDEX IF NOT EXISTS idx_plays_passer  ON plays(passer_player_id, season);
+CREATE INDEX IF NOT EXISTS idx_plays_rusher  ON plays(rusher_player_id, season);
+CREATE INDEX IF NOT EXISTS idx_plays_receiver ON plays(receiver_player_id, season);
+
+-- ============================================================
+-- 11. PLAYER_EDGE  (depends on: players)
+-- Precomputed EDGE (Efficiency-Driven Grade per Event) scores.
+-- Updated by 08_compute_edge_score.py after plays are loaded.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS player_edge (
+    id              SERIAL PRIMARY KEY,
+    player_id       INTEGER REFERENCES players(id),
+    season          INTEGER NOT NULL,
+    edge_score      NUMERIC(8,4),       -- raw EDGE: opponent-adj EPA per play
+    edge_scaled     NUMERIC(5,2),       -- 0-100 scaled within position group
+    crunch_epa      NUMERIC(8,4),       -- EPA only in crunch-time situations
+    garbage_epa     NUMERIC(8,4),       -- EPA only in garbage time (context)
+    plays_counted   INTEGER,            -- plays included in edge_score
+    opponent_avg_sp NUMERIC(6,2),       -- avg opponent SP+ for context
+    model_version   TEXT,
+    generated_at    TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(player_id, season)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edge_player ON player_edge(player_id, season);
+CREATE INDEX IF NOT EXISTS idx_edge_season ON player_edge(season);
+
+-- ============================================================
+-- 12. RESEARCH_CACHE
 -- Precomputed research findings for static JSON export.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS research_cache (
@@ -207,6 +271,8 @@ ALTER TABLE transfers       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE nil_valuations  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE coaching_changes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ratings         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE plays           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE player_edge     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE research_cache  ENABLE ROW LEVEL SECURITY;
 
 -- Public read policies (anon key can SELECT)
@@ -219,4 +285,6 @@ CREATE POLICY "Public read transfers"  ON transfers       FOR SELECT USING (true
 CREATE POLICY "Public read nil"        ON nil_valuations  FOR SELECT USING (true);
 CREATE POLICY "Public read coaching"   ON coaching_changes FOR SELECT USING (true);
 CREATE POLICY "Public read ratings"    ON ratings         FOR SELECT USING (true);
-CREATE POLICY "Public read research"   ON research_cache  FOR SELECT USING (true);
+CREATE POLICY "Public read plays"       ON plays           FOR SELECT USING (true);
+CREATE POLICY "Public read edge"        ON player_edge     FOR SELECT USING (true);
+CREATE POLICY "Public read research"    ON research_cache  FOR SELECT USING (true);

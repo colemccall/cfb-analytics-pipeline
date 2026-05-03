@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "context-engine": {
+      "command": "C:\\Python312\\Scripts\\cce.EXE",
+      "args": [
+        "serve",
+        "--project-dir",
+        "C:\\Projects\\CFB-Analytics-Portfolio\\cfb-analytics-pipeline"
+      ]
+    }
+  }
+}

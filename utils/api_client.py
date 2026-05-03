@@ -199,3 +199,15 @@ def fetch_plays(api_key: str, year: int) -> list:
             all_plays.extend(chunk)
         time.sleep(0.3)
     return all_plays
+
+
+def fetch_sp_ratings_all(api_key: str, year: int) -> dict:
+    """Return {team_lower: sp_rating} for a year. Used for opponent quality adjustment."""
+    raw = fetch_sp_ratings(api_key, year)
+    result = {}
+    for r in raw:
+        team = (r.get("team") or "").lower()
+        rating = r.get("rating") or r.get("sp") or 0
+        if team:
+            result[team] = float(rating)
+    return result

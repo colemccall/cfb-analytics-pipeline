@@ -29,6 +29,7 @@ from utils.api_client import (
     fetch_games,
     fetch_all_game_player_stats,
     fetch_transfer_portal,
+    fetch_plays,
 )
 from utils.db import bulk_upsert, get_connection
 
@@ -328,6 +329,109 @@ def upsert_season_stats(
         print(f"  Upserted {len(rows)} season-aggregate stat rows")
 
 
+def _parse_clock(clock_str) -> int | None:
+    """'13:24' → seconds remaining. Returns None on bad input."""
+    if not clock_str:
+        return None
+    try:
+        parts = str(clock_str).split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        return None
+
+
+def upsert_plays(plays_raw: list, game_id_map: dict, team_id_map: dict, player_id_map: dict, season: int) -> None:
+    """Upsert play-by-play rows into the plays table.
+
+    Player attribution uses the API's passer/rusher/receiver fields (player names).
+    We do a best-effort name lookup into player_id_map using the cfb_api_id if
+    the play has it; otherwise we leave attribution NULL.
+    """
+    # Build name→db_id lookup from player_id_map inverse (cfb_api_id → db_id already done upstream)
+    # For plays, the API returns player names not IDs, so we need a separate lookup.
+    # Build {name_lower: db_id} from all players in DB for this season.
+    name_to_db_id: dict = {}
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT p.id, p.name FROM players p "
+            "INNER JOIN stats s ON s.player_id = p.id "
+            "WHERE s.season = %s AND s.game_id IS NULL LIMIT 50000",
+            (season,)
+        )
+        for db_id, name in cur.fetchall():
+            name_to_db_id[name.lower()] = db_id
+
+    rows = []
+    for play in plays_raw:
+        game_api_id = play.get("game_id") or play.get("gameId")
+        game_db_id  = game_id_map.get(game_api_id)
+
+        offense_raw = (play.get("offense") or "").lower()
+        defense_raw = (play.get("defense") or "").lower()
+
+        # Player attribution from name fields
+        passer_name   = (play.get("passer_player_name") or play.get("passerPlayerName") or "").lower().strip()
+        rusher_name   = (play.get("rusher_player_name") or play.get("rusherPlayerName") or "").lower().strip()
+        receiver_name = (play.get("receiver_player_name") or play.get("receiverPlayerName") or "").lower().strip()
+
+        rows.append({
+            "cfb_api_id":          play.get("id"),
+            "game_id":             game_db_id,
+            "season":              season,
+            "week":                play.get("week"),
+            "offense_team_id":     team_id_map.get(offense_raw),
+            "defense_team_id":     team_id_map.get(defense_raw),
+            "period":              play.get("period"),
+            "clock_seconds":       _parse_clock(play.get("clock") or play.get("clock_time")),
+            "down":                play.get("down"),
+            "distance":            play.get("distance"),
+            "yards_to_goal":       play.get("yards_to_goal") or play.get("yardsToGoal"),
+            "home_score":          play.get("home_score") or play.get("homeScore"),
+            "away_score":          play.get("away_score") or play.get("awayScore"),
+            "offense_score":       play.get("offense_score") or play.get("offenseScore"),
+            "defense_score":       play.get("defense_score") or play.get("defenseScore"),
+            "play_type":           play.get("play_type") or play.get("playType"),
+            "yards_gained":        play.get("yards_gained") or play.get("yardsGained"),
+            "epa":                 play.get("epa"),
+            "ppa":                 play.get("ppa"),
+            "passer_player_id":    name_to_db_id.get(passer_name) if passer_name else None,
+            "rusher_player_id":    name_to_db_id.get(rusher_name) if rusher_name else None,
+            "receiver_player_id":  name_to_db_id.get(receiver_name) if receiver_name else None,
+            "play_text":           (play.get("play_text") or play.get("playText") or "")[:500],
+        })
+
+    valid_rows = [r for r in rows if r.get("cfb_api_id")]
+    if not valid_rows:
+        print("  No plays to upsert")
+        return
+
+    # Deduplicate by cfb_api_id
+    seen: dict = {}
+    for r in valid_rows:
+        seen[r["cfb_api_id"]] = r
+    valid_rows = list(seen.values())
+
+    import psycopg2.extras
+    cols = list(valid_rows[0].keys())
+    col_str = ", ".join(cols)
+    placeholder = "(" + ", ".join(f"%({c})s" for c in cols) + ")"
+    sql = f"""
+        INSERT INTO plays ({col_str}) VALUES %s
+        ON CONFLICT (cfb_api_id) DO UPDATE SET
+            epa = EXCLUDED.epa,
+            ppa = EXCLUDED.ppa,
+            passer_player_id = COALESCE(EXCLUDED.passer_player_id, plays.passer_player_id),
+            rusher_player_id = COALESCE(EXCLUDED.rusher_player_id, plays.rusher_player_id),
+            receiver_player_id = COALESCE(EXCLUDED.receiver_player_id, plays.receiver_player_id),
+            updated_at = now()
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, valid_rows, template=placeholder, page_size=500)
+    print(f"  Upserted {len(valid_rows)} plays")
+
+
 def upsert_transfers(portal_raw: list, player_id_map: dict, team_id_map: dict, season: int) -> None:
     """Upsert transfer portal entries for a season."""
     rows = []
@@ -395,6 +499,11 @@ def run_year(api_key: str, season: int) -> None:
     print("Transfer portal...")
     portal_raw = fetch_transfer_portal(api_key, season)
     upsert_transfers(portal_raw, player_id_map, team_id_map, season)
+
+    # Play-by-play (large — ~40k plays/season; feeds EDGE computation in script 08)
+    print("Play-by-play...")
+    plays_raw = fetch_plays(api_key, season)
+    upsert_plays(plays_raw, game_id_map, team_id_map, player_id_map, season)
 
     print(f"Season {season} complete.")
 
