@@ -104,6 +104,11 @@ def fetch_player_stats(api_key: str, year: int) -> list:
     return _safe(api_key, "/stats/player/season", {"year": year, "seasonType": "regular"})
 
 
+def fetch_player_stats_postseason(api_key: str, year: int) -> list:
+    """Postseason (bowl/CFP) player stats for a given year."""
+    return _safe(api_key, "/stats/player/season", {"year": year, "seasonType": "postseason"})
+
+
 def fetch_ppa(api_key: str, year: int) -> list:
     """Predicted Points Added per player per season."""
     return _safe(api_key, "/ppa/players/season", {"year": year})

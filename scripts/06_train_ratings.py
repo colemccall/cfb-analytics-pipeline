@@ -74,7 +74,7 @@ STARTER_THRESHOLDS = {
 STARS_FALLBACK = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
 
 # Positions where EDGE (play-by-play EPA) is available and trusted
-EDGE_POSITIONS = {"QB", "RB", "WR", "TE"}
+EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "DL", "LB", "DB"}
 
 
 def _f(stats, key):
@@ -138,14 +138,44 @@ def extract_features(stats: dict, pg: str) -> dict:
             "award_tier":         _f(stats, "award_tier"),
         }
 
-    if pg in ("DL", "LB", "DB"):
+    if pg == "DL":
+        tot   = max(_f(stats, "defensiveTOT"), 1)
+        sacks = _f(stats, "defensiveSACKS")
+        tfl   = _f(stats, "defensiveTFL")
+        hur   = _f(stats, "defensiveQB HUR")
         return {
-            "tackles_total": _f(stats, "defensiveTOT"),
-            "sacks_total":   _f(stats, "defensiveSACKS"),
-            "tfl_total":     _f(stats, "defensiveTFL"),
-            "ints_total":    _f(stats, "interceptionsINT"),
-            "pbu_total":     _f(stats, "defensivePD"),
-            "volume_score":  _f(stats, "defensiveTOT"),
+            "pass_rush_score":  sacks * 5.0 + hur * 1.5 + tfl * 1.0,   # sacks + pressure
+            "run_stop_score":   tfl * 2.5 + (tot - sacks) * 0.4,        # run stuffs + tackle presence
+            "disruption_rate":  (sacks + tfl) / tot,                     # impact per play
+            "volume_score":     tot,
+        }
+
+    if pg == "LB":
+        tot    = max(_f(stats, "defensiveTOT"), 1)
+        sacks  = _f(stats, "defensiveSACKS")
+        tfl    = _f(stats, "defensiveTFL")
+        ints   = _f(stats, "interceptionsINT")
+        pbu    = _f(stats, "defensivePD")
+        return {
+            "tackling_score":   tot * 0.5 + tfl * 2.0,                  # pursuit + run stop
+            "pass_rush_score":  sacks * 4.0 + tfl * 1.0,                # blitz / pressure
+            "coverage_score":   ints * 3.0 + pbu * 1.5,                 # zone/man skills
+            "instinct_score":   (ints + pbu + tfl) / tot,               # playmaking rate
+            "volume_score":     tot,
+        }
+
+    if pg == "DB":
+        tot   = max(_f(stats, "defensiveTOT"), 1)
+        sacks = _f(stats, "defensiveSACKS")
+        tfl   = _f(stats, "defensiveTFL")
+        ints  = _f(stats, "interceptionsINT")
+        pbu   = _f(stats, "defensivePD")
+        return {
+            "coverage_score":   ints * 3.0 + pbu * 1.5,                 # ball skills
+            "tackling_score":   tot * 0.5 + tfl * 2.0,                  # run support
+            "pass_rush_score":  sacks * 4.0 + tfl * 1.5,                # blitz value
+            "instinct_score":   (ints + pbu) / tot,                     # playmaking rate
+            "volume_score":     tot,
         }
 
     if pg == "K":
@@ -213,26 +243,26 @@ WEIGHTS = {
         "recruit_composite":  0.15,
     },
     "DL": {
-        "tfl_total":        0.30,
-        "sacks_total":      0.30,
-        "tackles_total":    0.15,
-        "volume_score":     0.10,
-        "recruit_composite": 0.15,
+        "edge_scaled":      0.50,
+        "tfl_total":        0.18,
+        "sacks_total":      0.17,
+        "tackles_total":    0.07,
+        "recruit_composite": 0.08,
     },
     "LB": {
-        "tackles_total":    0.30,
-        "tfl_total":        0.20,
-        "sacks_total":      0.15,
-        "ints_total":       0.10,
-        "volume_score":     0.10,
-        "recruit_composite": 0.15,
+        "edge_scaled":      0.50,
+        "tackles_total":    0.18,
+        "tfl_total":        0.12,
+        "sacks_total":      0.08,
+        "ints_total":       0.05,
+        "recruit_composite": 0.07,
     },
     "DB": {
-        "ints_total":       0.30,
-        "pbu_total":        0.25,
-        "tackles_total":    0.15,
-        "volume_score":     0.10,
-        "recruit_composite": 0.20,
+        "edge_scaled":      0.50,
+        "ints_total":       0.18,
+        "pbu_total":        0.14,
+        "tackles_total":    0.08,
+        "recruit_composite": 0.10,
     },
     "K": {
         "fg_pct":     0.50,
@@ -277,6 +307,28 @@ WEIGHTS_NO_EDGE = {
         "volume_score":    0.05,
         "recruit_composite": 0.05,
     },
+    "DL": {
+        "tfl_total":        0.35,
+        "sacks_total":      0.30,
+        "tackles_total":    0.15,
+        "volume_score":     0.05,
+        "recruit_composite": 0.15,
+    },
+    "LB": {
+        "tackles_total":    0.30,
+        "tfl_total":        0.22,
+        "sacks_total":      0.15,
+        "ints_total":       0.10,
+        "volume_score":     0.08,
+        "recruit_composite": 0.15,
+    },
+    "DB": {
+        "ints_total":       0.30,
+        "pbu_total":        0.28,
+        "tackles_total":    0.15,
+        "volume_score":     0.07,
+        "recruit_composite": 0.20,
+    },
 }
 
 
@@ -285,29 +337,36 @@ WEIGHTS_NO_EDGE = {
 # ---------------------------------------------------------------------------
 
 def load_position_data(season: int, pg: str) -> pd.DataFrame:
-    """Load players, stats, EDGE scores, and recruiting for a position group."""
+    """Load players, stats, EDGE scores, and recruiting for a position group.
+
+    Only includes players who appeared on a roster in this season, determined
+    by the presence of a season_aggregate stats row. This prevents ghost ratings
+    for players who transferred, graduated, or turned pro in prior seasons.
+    """
     with get_connection() as conn:
         cur = conn.cursor()
 
-        # All players at this position
+        # Only players who have a stats row this season — they were on a roster
         cur.execute(
-            "SELECT id, name, team_id, year FROM players WHERE position_group = %s",
-            (pg,)
+            """SELECT p.id, p.name, p.team_id, p.year, s.data
+               FROM players p
+               JOIN stats s ON s.player_id = p.id
+               WHERE p.position_group = %s
+                 AND s.season = %s
+                 AND s.stat_type = 'season_aggregate'
+                 AND s.game_id IS NULL""",
+            (pg, season)
         )
-        player_rows = cur.fetchall()
-        if not player_rows:
+        raw_rows = cur.fetchall()
+        if not raw_rows:
             return pd.DataFrame()
+
+        player_rows = [(r[0], r[1], r[2], r[3]) for r in raw_rows]
         player_ids = [r[0] for r in player_rows]
 
-        # Season stats
-        cur.execute(
-            """SELECT player_id, data FROM stats
-               WHERE season = %s AND stat_type = 'season_aggregate'
-               AND player_id = ANY(%s)""",
-            (season, player_ids)
-        )
         stats_map = {}
-        for pid, data in cur.fetchall():
+        for r in raw_rows:
+            pid, data = r[0], r[4]
             stats_map[pid] = data if isinstance(data, dict) else json.loads(data)
 
         # EDGE scores (NULL if not enough plays)
@@ -332,12 +391,31 @@ def load_position_data(season: int, pg: str) -> pd.DataFrame:
             if pid not in rec_map:
                 rec_map[pid] = {"stars": stars or 0, "composite_score": cs}
 
-        # Transfer flag
+        # Conference for G5 discount
         cur.execute(
-            "SELECT player_id FROM transfers WHERE transfer_year = %s AND player_id = ANY(%s)",
-            (season, player_ids)
+            "SELECT t.id, t.conference FROM teams t WHERE t.id = ANY(%s)",
+            (list({r[2] for r in player_rows if r[2]}),)
         )
-        transfer_set = {r[0] for r in cur.fetchall()}
+        conf_map = {tid: conf for tid, conf in cur.fetchall()}
+
+        # Transfer history — used to resolve correct team per season
+        # For a player who transferred in year Y, to_team_id is their team for seasons >= Y.
+        # Take the most recent transfer at or before this season.
+        cur.execute(
+            """SELECT player_id, transfer_year, to_team_id
+               FROM transfers
+               WHERE player_id = ANY(%s) AND transfer_year <= %s AND to_team_id IS NOT NULL
+               ORDER BY transfer_year DESC""",
+            (player_ids, season)
+        )
+        # Build {player_id: team_id_for_this_season}
+        transfer_team_map: dict = {}
+        transfer_set: set = set()
+        for pid, yr, to_tid in cur.fetchall():
+            if pid not in transfer_team_map:
+                transfer_team_map[pid] = to_tid
+            if yr == season:
+                transfer_set.add(pid)
 
     rows = []
     for pid, name, team_id, year in player_rows:
@@ -352,12 +430,19 @@ def load_position_data(season: int, pg: str) -> pd.DataFrame:
         feats["transfer_flag"]     = 1 if pid in transfer_set else 0
         feats["stars"]             = stars
         feats["year"]              = int(year or 0)
-        feats["team_id"]           = team_id
+        # Use transfer-resolved team for this season; fall back to players.team_id
+        feats["team_id"]           = transfer_team_map.get(pid, team_id)
         feats["name"]              = name
         # EDGE — may be None if insufficient plays
         feats["edge_scaled"]       = edge_info.get("edge_scaled")
-        feats["plays_counted"]     = edge_info.get("plays_counted") or 0
+        plays_counted              = edge_info.get("plays_counted") or 0
+        feats["plays_counted"]     = plays_counted
         feats["crunch_epa"]        = edge_info.get("crunch_epa") or 0.0
+        # Estimate games played from attributed plays (~15 plays/game for skill positions)
+        feats["games_played"]      = min(plays_counted / 15.0, 15.0)
+        # Conference — used for G5 discount (resolved via season-correct team_id)
+        resolved_tid = transfer_team_map.get(pid, team_id)
+        feats["conference"]        = conf_map.get(resolved_tid, "")
         rows.append({"player_id": pid, **feats})
 
     return pd.DataFrame(rows).set_index("player_id")
@@ -457,11 +542,63 @@ def compute_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
     return np.array(final_scores), final_contribs
 
 
+# P4 conferences — players in other conferences get a G5 discount
+P4_CONFERENCES = {"SEC", "Big Ten", "Big 12", "ACC", "Pac-12"}
+G5_DISCOUNT = 0.93   # G5 raw scores multiplied by this before normalization
+
+
 def scale_to_range(scores: np.ndarray, low=30, high=99) -> np.ndarray:
+    """Z-score → sigmoid normalization.
+
+    Maps raw composite scores to 0–100 using the population's mean and std.
+    The sigmoid shape means a player needs to be genuinely elite (+3σ) to
+    reach 95+. Most seasons top out at 90–94; generational seasons hit 97–99.
+    A few 94–99 players per position per season is by design.
+    """
     if len(scores) < 2:
-        return np.full(len(scores), (low + high) / 2)
-    scaler = MinMaxScaler(feature_range=(low, high))
-    return scaler.fit_transform(scores.reshape(-1, 1)).flatten().round(2)
+        return np.full(len(scores), 55.0)
+    mu  = np.mean(scores)
+    std = np.std(scores)
+    if std < 1e-9:
+        return np.full(len(scores), 55.0)
+    z = (scores - mu) / std
+    # Sigmoid: output ≈ 55 at z=0, 75 at z=1, 88 at z=2, 95 at z=3, 98 at z=4
+    raw = 100.0 / (1.0 + np.exp(-0.85 * z)) * 1.06 - 3.0
+    return np.clip(raw, low, high).round(2)
+
+
+def apply_conference_discount(scores: np.ndarray, df: pd.DataFrame) -> np.ndarray:
+    """Apply a small discount to G5 players before final scaling.
+
+    G5 players face weaker competition on average; their raw production
+    numbers are slightly inflated relative to P4 peers. Jeanty-level
+    seasons still rate elite — the discount only affects average G5 starters.
+    """
+    result = scores.copy()
+    for i, (_, row) in enumerate(df.iterrows()):
+        conf = row.get("conference") or ""
+        if conf not in P4_CONFERENCES:
+            result[i] = scores[i] * G5_DISCOUNT
+    return result
+
+
+def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame) -> np.ndarray:
+    """Damp ratings toward position average only for low-game-count players.
+
+    Players with 8+ games: untouched (full confidence).
+    Players with fewer games: rating pulled toward position average proportionally.
+    Prevents a 2-game wonder from rating 95 but doesn't compress full-season players.
+    """
+    avg = float(np.mean(scaled))
+    result = scaled.copy()
+    for i, (_, row) in enumerate(df.iterrows()):
+        games = float(row.get("games_played", 0) or 0)
+        if games >= 8:
+            continue  # full-season starters: no change
+        # linear from 0.25 confidence at 1 game to 1.0 at 8 games
+        confidence = max(0.25, games / 8.0)
+        result[i] = round(float(avg + confidence * (scaled[i] - avg)), 2)
+    return result
 
 
 def fallback_rating(stars: int, position_avg: float = 60.0) -> float:
@@ -532,7 +669,14 @@ def rate_position(season: int, pg: str) -> list[dict]:
 
     if len(starter_df) >= 5:
         raw_scores, contribs = compute_ratings(starter_df, pg)
-        scaled = scale_to_range(raw_scores)
+        # Apply G5 discount before z-score normalization so the sigmoid
+        # naturally places G5 players slightly below equivalent P4 output
+        discounted = apply_conference_discount(raw_scores, starter_df)
+        scaled = scale_to_range(discounted)
+        # Only apply sample-size damping for EDGE positions (QB/RB/WR/TE)
+        # where plays_counted is meaningful; skip for stat-only positions
+        if pg in EDGE_POSITIONS:
+            scaled = apply_games_confidence(scaled, starter_df)
         for i, pid in enumerate(starter_df.index):
             ratings_map[pid] = float(scaled[i])
             contrib_map[pid] = contribs[i]
@@ -563,6 +707,7 @@ def rate_position(season: int, pg: str) -> list[dict]:
             "trajectory_score":     float(trajectory.get(pid, 0.0)),
             "breakout_probability": float(breakout_map.get(pid, 0.05)),
             "shap_values":          json.dumps(contrib_map.get(pid, {})),
+            "team_id":              int(df.loc[pid, "team_id"]) if df.loc[pid, "team_id"] else None,
             "model_version":        MODEL_VERSION,
         })
 
@@ -586,13 +731,13 @@ def main():
     positions = [args.position.upper()] if args.position else list(WEIGHTS.keys())
 
     for season in seasons:
-        print(f"\n── Season {season} ──")
+        print(f"\n-- Season {season} --")
         all_rows = []
         for pg in positions:
             all_rows.extend(rate_position(season, pg))
         if all_rows:
             bulk_upsert("ratings", all_rows, ["player_id", "season"])
-            print(f"  → Upserted {len(all_rows)} rows")
+            print(f"  Upserted {len(all_rows)} rows")
 
     print("\nDone.")
 

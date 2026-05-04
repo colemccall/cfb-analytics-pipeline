@@ -157,7 +157,8 @@ def load_plays(season: int) -> pd.DataFrame:
             p.ppa,
             p.passer_player_id,
             p.rusher_player_id,
-            p.receiver_player_id
+            p.receiver_player_id,
+            p.defender_player_id
         FROM plays p
         WHERE p.season = %s
           AND p.play_type NOT IN ('Kickoff', 'Punt', 'Extra Point', 'Two Point Conversion',
@@ -255,6 +256,26 @@ def compute_edge(plays_df: pd.DataFrame, sp_map: dict, player_positions: dict) -
     rec_plays = attribute(plays_df, "receiver_player_id",
                           ["Pass Completion", "Pass Reception", "Receiving Touchdown"])
     records.extend(rec_plays[["player_id", "adj_epa", "situation", "opp_mult"]].to_dict("records"))
+
+    # DL/LB/DB: defensive plays — use offense_team_id SP+ for opponent quality
+    # For defenders, a sack/INT is *good* — negate EPA so positive = good for defender
+    # Opponent multiplier uses offense_team's SP+ (they faced a strong offense = multiplied reward)
+    if "defender_player_id" in plays_df.columns:
+        def_plays = attribute(plays_df, "defender_player_id",
+                              ["Sack", "Interception", "Pass Interception Return",
+                               "Interception Return Touchdown", "Fumble", "Fumble Recovery (Opponent)",
+                               "Fumble Return Touchdown"])
+        if not def_plays.empty:
+            # Use offense_team SP+ as opponent quality for defenders
+            def_plays = def_plays.copy()
+            def_plays["def_opp_mult"] = def_plays["offense_team_id"].apply(
+                lambda oid: opponent_multiplier(oid, sp_map)
+            )
+            # Negate EPA: a sack with EPA=-3 means defender contributed +3 value
+            def_plays["def_adj_epa"] = -def_plays["raw_epa"] * def_plays["sit_weight"] * def_plays["def_opp_mult"]
+            def_records = def_plays[["player_id", "def_adj_epa", "situation", "def_opp_mult"]].copy()
+            def_records = def_records.rename(columns={"def_adj_epa": "adj_epa", "def_opp_mult": "opp_mult"})
+            records.extend(def_records.to_dict("records"))
 
     if not records:
         return pd.DataFrame()

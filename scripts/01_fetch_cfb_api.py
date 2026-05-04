@@ -21,6 +21,7 @@ from utils.api_client import (
     fetch_teams,
     fetch_all_rosters,
     fetch_player_stats,
+    fetch_player_stats_postseason,
     fetch_ppa,
     fetch_team_stats,
     fetch_sp_ratings,
@@ -329,6 +330,58 @@ def upsert_season_stats(
         print(f"  Upserted {len(rows)} season-aggregate stat rows")
 
 
+def upsert_postseason_stats(
+    postseason_stats_raw: list,
+    player_id_map: dict,
+    rosters_by_team: dict,
+    season: int,
+) -> None:
+    """Build postseason-aggregate stat rows and upsert as stat_type='postseason_aggregate'."""
+    stat_lookup = build_stat_lookup(postseason_stats_raw)
+
+    rows = []
+    for team_name, players in rosters_by_team.items():
+        for p in players:
+            pid = p.get("id")
+            try:
+                pid_int = int(pid) if pid is not None else None
+            except (ValueError, TypeError):
+                pid_int = None
+            db_id = player_id_map.get(pid_int)
+            if not db_id:
+                continue
+            first = p.get("firstName", "")
+            last = p.get("lastName", "")
+            stats = find_player_stats(stat_lookup, first, last, team_name)
+            if stats:
+                rows.append({
+                    "player_id": db_id,
+                    "game_id":   None,
+                    "season":    season,
+                    "stat_type": "postseason_aggregate",
+                    "data":      json.dumps(stats),
+                })
+
+    if rows:
+        seen: dict = {}
+        for r in rows:
+            seen[(r["player_id"], r["season"], r["stat_type"])] = r
+        rows = list(seen.values())
+
+        sql = """
+            INSERT INTO stats (player_id, game_id, season, stat_type, data)
+            VALUES %s
+            ON CONFLICT (player_id, season, stat_type) WHERE game_id IS NULL
+            DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+        """
+        template = "(%(player_id)s, %(game_id)s, %(season)s, %(stat_type)s, %(data)s)"
+        import psycopg2.extras
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, sql, rows, template=template, page_size=500)
+        print(f"  Upserted {len(rows)} postseason-aggregate stat rows")
+
+
 def _parse_clock(clock_str) -> int | None:
     """'13:24' → seconds remaining. Returns None on bad input."""
     if not clock_str:
@@ -340,16 +393,58 @@ def _parse_clock(clock_str) -> int | None:
         return None
 
 
-def upsert_plays(plays_raw: list, game_id_map: dict, team_id_map: dict, player_id_map: dict, season: int) -> None:
-    """Upsert play-by-play rows into the plays table.
+import re as _re
 
-    Player attribution uses the API's passer/rusher/receiver fields (player names).
-    We do a best-effort name lookup into player_id_map using the cfb_api_id if
-    the play has it; otherwise we leave attribution NULL.
-    """
-    # Build name→db_id lookup from player_id_map inverse (cfb_api_id → db_id already done upstream)
-    # For plays, the API returns player names not IDs, so we need a separate lookup.
-    # Build {name_lower: db_id} from all players in DB for this season.
+_PASS_RE    = _re.compile(r'^(.+?)\s+pass\s+(?:complete|incomplete)', _re.IGNORECASE)
+_RUSH_RE    = _re.compile(r'^(.+?)\s+(?:run|rush|scramble)', _re.IGNORECASE)
+_RECV_RE    = _re.compile(r'pass\s+(?:complete|incomplete)\s+to\s+(.+?)\s+for', _re.IGNORECASE)
+_SACK_RE    = _re.compile(r'sacked by (.+?)(?:\s+for|\s+at|$)', _re.IGNORECASE)
+_DEF_SACK_RE = _re.compile(r'sacked by (.+?)(?:\s+for|\s+at|\s*$)', _re.IGNORECASE)
+_DEF_INT_RE  = _re.compile(r'intercepted by (.+?)(?:\s+at|\s+for|\s+return|\s*$)', _re.IGNORECASE)
+_DEF_TFL_RE  = _re.compile(r'(?:run|rush) for a loss.*?(?:tackle by|tackled by) (.+?)(?:\s+for|\s*$)', _re.IGNORECASE)
+
+
+def _parse_play_names(play_text: str, play_type: str) -> tuple:
+    """Extract (passer, rusher, receiver, defender) names from play text."""
+    pt = (play_text or "").strip()
+    ptype = (play_type or "").lower()
+    passer = rusher = receiver = defender = ""
+
+    if "pass" in ptype or "sack" in ptype or "interception" in ptype:
+        m = _PASS_RE.match(pt)
+        if m:
+            passer = m.group(1).strip()
+        m2 = _RECV_RE.search(pt)
+        if m2:
+            receiver = m2.group(1).strip()
+        if "sack" in ptype:
+            m3 = _DEF_SACK_RE.search(pt)
+            if m3:
+                defender = m3.group(1).strip()
+            if not passer:
+                # play starts with QB name before "sacked"
+                m4 = _re.match(r'^(.+?)\s+sacked', pt, _re.IGNORECASE)
+                if m4:
+                    passer = m4.group(1).strip()
+        if "interception" in ptype:
+            m5 = _DEF_INT_RE.search(pt)
+            if m5:
+                defender = m5.group(1).strip()
+    elif "rush" in ptype or "run" in ptype:
+        m = _RUSH_RE.match(pt)
+        if m:
+            rusher = m.group(1).strip()
+        # TFL — defender made the stop
+        m2 = _DEF_TFL_RE.search(pt)
+        if m2:
+            defender = m2.group(1).strip()
+
+    return passer.lower(), rusher.lower(), receiver.lower(), defender.lower()
+
+
+def upsert_plays(plays_raw: list, game_id_map: dict, team_id_map: dict, player_id_map: dict, season: int) -> None:
+    """Upsert play-by-play rows. Player attribution is parsed from playText."""
+    # Build {name_lower: db_id} from players with stats this season.
     name_to_db_id: dict = {}
     with get_connection() as conn:
         cur = conn.cursor()
@@ -370,10 +465,10 @@ def upsert_plays(plays_raw: list, game_id_map: dict, team_id_map: dict, player_i
         offense_raw = (play.get("offense") or "").lower()
         defense_raw = (play.get("defense") or "").lower()
 
-        # Player attribution from name fields
-        passer_name   = (play.get("passer_player_name") or play.get("passerPlayerName") or "").lower().strip()
-        rusher_name   = (play.get("rusher_player_name") or play.get("rusherPlayerName") or "").lower().strip()
-        receiver_name = (play.get("receiver_player_name") or play.get("receiverPlayerName") or "").lower().strip()
+        play_text  = play.get("play_text") or play.get("playText") or ""
+        play_type  = play.get("play_type") or play.get("playType") or ""
+
+        passer_name, rusher_name, receiver_name, defender_name = _parse_play_names(play_text, play_type)
 
         rows.append({
             "cfb_api_id":          play.get("id"),
@@ -395,9 +490,10 @@ def upsert_plays(plays_raw: list, game_id_map: dict, team_id_map: dict, player_i
             "yards_gained":        play.get("yards_gained") or play.get("yardsGained"),
             "epa":                 play.get("epa"),
             "ppa":                 play.get("ppa"),
-            "passer_player_id":    name_to_db_id.get(passer_name) if passer_name else None,
-            "rusher_player_id":    name_to_db_id.get(rusher_name) if rusher_name else None,
+            "passer_player_id":    name_to_db_id.get(passer_name)   if passer_name   else None,
+            "rusher_player_id":    name_to_db_id.get(rusher_name)   if rusher_name   else None,
             "receiver_player_id":  name_to_db_id.get(receiver_name) if receiver_name else None,
+            "defender_player_id":  name_to_db_id.get(defender_name) if defender_name else None,
             "play_text":           (play.get("play_text") or play.get("playText") or "")[:500],
         })
 
@@ -421,9 +517,10 @@ def upsert_plays(plays_raw: list, game_id_map: dict, team_id_map: dict, player_i
         ON CONFLICT (cfb_api_id) DO UPDATE SET
             epa = EXCLUDED.epa,
             ppa = EXCLUDED.ppa,
-            passer_player_id = COALESCE(EXCLUDED.passer_player_id, plays.passer_player_id),
-            rusher_player_id = COALESCE(EXCLUDED.rusher_player_id, plays.rusher_player_id),
+            passer_player_id   = COALESCE(EXCLUDED.passer_player_id,   plays.passer_player_id),
+            rusher_player_id   = COALESCE(EXCLUDED.rusher_player_id,   plays.rusher_player_id),
             receiver_player_id = COALESCE(EXCLUDED.receiver_player_id, plays.receiver_player_id),
+            defender_player_id = COALESCE(EXCLUDED.defender_player_id, plays.defender_player_id),
             updated_at = now()
     """
     with get_connection() as conn:
@@ -494,6 +591,11 @@ def run_year(api_key: str, season: int) -> None:
     usage_raw = fetch_player_usage(api_key, season)
     awards_raw = fetch_awards(api_key, season)
     upsert_season_stats(player_stats_raw, ppa_raw, usage_raw, awards_raw, player_id_map, rosters_by_team, season)
+
+    # Postseason stats (bowl/CFP — stored separately, not used in ratings)
+    postseason_stats_raw = fetch_player_stats_postseason(api_key, season)
+    if postseason_stats_raw:
+        upsert_postseason_stats(postseason_stats_raw, player_id_map, rosters_by_team, season)
 
     # Transfer portal (raw entries; player linkage done in script 03)
     print("Transfer portal...")

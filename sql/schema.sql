@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS ratings (
     trajectory_score      NUMERIC(5,2),  -- YoY change: positive = improving
     breakout_probability  NUMERIC(5,4),  -- 0.0000–1.0000
     shap_values           JSONB,         -- { "yards_per_carry": 0.34, "recruit_composite": -0.12, ... }
+    team_id               INTEGER REFERENCES teams(id),  -- team this player was on THIS season
     model_version         TEXT,
     generated_at          TIMESTAMPTZ DEFAULT now(),
     UNIQUE(player_id, season)
@@ -210,6 +211,8 @@ CREATE TABLE IF NOT EXISTS plays (
     passer_player_id   INTEGER REFERENCES players(id),
     rusher_player_id   INTEGER REFERENCES players(id),
     receiver_player_id INTEGER REFERENCES players(id),
+    -- defensive attribution (sacks, INTs, TFLs)
+    defender_player_id INTEGER REFERENCES players(id),
     -- raw text for backup parsing
     play_text       TEXT,
     updated_at      TIMESTAMPTZ DEFAULT now()

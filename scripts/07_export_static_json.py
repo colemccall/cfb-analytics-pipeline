@@ -38,10 +38,18 @@ TOP_N_PER_POSITION = 50
 # Export helpers
 # ---------------------------------------------------------------------------
 
+class _Encoder(json.JSONEncoder):
+    def default(self, o):
+        import decimal
+        if isinstance(o, decimal.Decimal):
+            return float(o)
+        return super().default(o)
+
+
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, separators=(",", ":"))
+        json.dump(data, f, separators=(",", ":"), cls=_Encoder)
     size_kb = path.stat().st_size / 1024
     n = len(data) if isinstance(data, (list, dict)) else "?"
     print(f"  Wrote {path.name} ({size_kb:.1f} KB, {n} items)")
@@ -83,6 +91,7 @@ def export_players(output_dir: Path, season: int) -> None:
                 p.height_in,
                 p.weight_lbs,
                 p.hometown_state,
+                COALESCE(r.team_id, p.team_id) AS resolved_team_id,
                 t.id   AS team_id,
                 t.school,
                 t.abbreviation,
@@ -91,7 +100,7 @@ def export_players(output_dir: Path, season: int) -> None:
                 t.logo_url
             FROM ratings r
             JOIN players p ON p.id = r.player_id
-            LEFT JOIN teams t ON t.id = p.team_id
+            LEFT JOIN teams t ON t.id = COALESCE(r.team_id, p.team_id)
             WHERE r.season = %s
             ORDER BY r.overall_rating DESC NULLS LAST
         """, (season,))
@@ -157,13 +166,13 @@ def export_teams(output_dir: Path, season: int) -> None:
 
         # Per-team rating aggregates for this season
         cur.execute("""
-            SELECT p.team_id,
+            SELECT COALESCE(r.team_id, p.team_id) AS resolved_team_id,
                    COUNT(r.overall_rating) AS player_count,
                    ROUND(AVG(r.overall_rating)::numeric, 2) AS avg_rating
             FROM ratings r
             JOIN players p ON p.id = r.player_id
-            WHERE r.season = %s AND p.team_id IS NOT NULL
-            GROUP BY p.team_id
+            WHERE r.season = %s AND COALESCE(r.team_id, p.team_id) IS NOT NULL
+            GROUP BY COALESCE(r.team_id, p.team_id)
         """, (season,))
         team_stats = {row[0]: {"player_count": row[1], "avg_rating": float(row[2]) if row[2] else None}
                       for row in cur.fetchall()}
@@ -200,7 +209,7 @@ def export_ratings_by_position(output_dir: Path, season: int) -> None:
                 t.color
             FROM ratings r
             JOIN players p ON p.id = r.player_id
-            LEFT JOIN teams t ON t.id = p.team_id
+            LEFT JOIN teams t ON t.id = COALESCE(r.team_id, p.team_id)
             WHERE r.season = %s
             ORDER BY r.overall_rating DESC NULLS LAST
         """, (season,))
