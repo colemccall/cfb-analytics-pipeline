@@ -2,29 +2,28 @@
 
 Rating architecture:
   ENGINE A — "What did this player do this season?"
-    Offensive skill (QB/RB/WR/TE): EDGE score (opponent-adjusted, situation-weighted
-      EPA from play-by-play) is the PRIMARY input. Traditional season stats serve as
-      supplementary features to fill gaps when EDGE data is thin.
-    Defensive / OL / Special Teams: Season stat percentile composite (no EPA
-      attribution available in play-by-play for these positions).
+    QB/RB/WR: EDGE score (opponent-adjusted, situation-weighted EPA from
+      play-by-play) is the PRIMARY input (~42-55%). Traditional stats fill the rest.
+    TE/OL/DL/LB/DB/K/P: Stat-only composites (EDGE attribution too sparse
+      for these positions to be meaningful).
+
+  Cross-season normalization: percentile ranks are computed across ALL seasons
+  (2021–2025) combined so a rating of 85 means the same thing in every year.
 
   Recruiting composite is used as an ANCHOR — not a primary input:
-    - Starters (≥ threshold plays/attempts): recruiting weight is 0–5%
-    - Rotation (partial data): 10–15%
+    - Starters: recruiting weight is 5-10%
+    - Sub-threshold: blended fallback (70% recruiting, 30% efficiency-implied)
     - No stats / true freshmen: 100% recruiting fallback
-
-  This is honest: if a player played, we trust what they did on the field.
-  If they didn't play, we fall back to what scouts expected of them.
 
 Formula weights by position:
   QB:  edge_scaled 55%, yards_per_att 15%, td_int_ratio 15%, comp_pct 10%, recruit 5%
   RB:  edge_scaled 55%, yards_per_carry 20%, yards_total 15%, rec_versatility 5%, recruit 5%
-  WR:  edge_scaled 55%, yards_per_rec 20%, yards_total 15%, rec_volume 5%, recruit 5%
-  TE:  edge_scaled 55%, yards_per_rec 20%, yards_total 15%, rec_volume 5%, recruit 5%
-  OL:  team_rush_ypa 40%, team_sack_rate_inv 35%, award_tier 10%, recruit 15%
-  DL:  tfl_total 30%, sacks_total 30%, tackles_total 15%, volume 10%, recruit 15%
-  LB:  tackles_total 30%, tfl_total 20%, sacks_total 15%, ints_total 10%, volume 10%, recruit 15%
-  DB:  ints_total 30%, pbu_total 25%, tackles_total 15%, volume 10%, recruit 20%
+  WR:  td_score 35%, yards_per_rec 28%, yards_total 22%, rec_volume 10%, recruit 5%
+  TE:  td_score 22%, yards_per_rec 18%, yards_total 13%, rec_volume 5% (no EDGE)
+  OL:  recruit 30%, team_rush_ypa 30%, team_sack_rate_inv 25%, experience 10%, award 5%
+  DL:  pass_rush 38%, run_stop 28%, disruption 19%, volume 5%, recruit 10%
+  LB:  tackling 33%, pass_rush 22%, coverage 20%, instinct 15%, recruit 10%
+  DB:  coverage 38%, tackling 22%, instinct 20%, pass_rush 10%, recruit 10%
   K:   fg_pct 50%, fg_long 25%, xp_pct 15%, volume 10%
   P:   avg_yards 55%, inside_20_pct 30%, volume 15%
 
@@ -50,7 +49,7 @@ load_dotenv()
 
 from utils.db import bulk_upsert, get_connection
 
-MODEL_VERSION = "v3.0-edge"
+MODEL_VERSION = "v3.1-multiseason"
 
 # ---------------------------------------------------------------------------
 # Starter thresholds — determines how much we trust stats vs recruiting
@@ -73,8 +72,18 @@ STARTER_THRESHOLDS = {
 # based on recruiting stars when a player has NO usable stats.
 STARS_FALLBACK = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
 
-# Positions where EDGE (play-by-play EPA) is available and trusted
-EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "DL", "LB", "DB"}
+# Positions where EDGE is the primary rating driver.
+# QB/RB: EDGE attribution is comprehensive (~60-70% of starters get edge_scaled).
+# WR: only ~25% of starters get attribution — mixing EDGE and non-EDGE players in
+#   the same normalized pool creates systematic bias against non-EDGE players.
+# TE/DL/LB/DB: attribution near-zero (<1% of starters). Stat-only for all.
+EDGE_POSITIONS = {"QB", "RB"}
+
+# Hard ceiling on overall_rating by position (K/P have inflated stats by nature)
+POSITION_CEILING = {"K": 78, "P": 78}
+
+# All seasons used for cross-season normalization
+ALL_SEASONS = list(range(2021, 2026))
 
 
 def _f(stats, key):
@@ -124,11 +133,13 @@ def extract_features(stats: dict, pg: str) -> dict:
     if pg in ("WR", "TE"):
         rec = max(_f(stats, "receivingREC"), 1)
         yds = _f(stats, "receivingYDS")
+        tds = _f(stats, "receivingTD")
         return {
-            "yards_per_rec": yds / rec,
-            "yards_total":   yds,
-            "rec_volume":    _f(stats, "receivingREC"),
-            "volume_score":  _f(stats, "receivingREC"),
+            "yards_per_rec":   yds / rec,
+            "yards_total":     yds,
+            "td_score":        tds * 8.0 + yds * 0.01,
+            "rec_volume":      rec,
+            "volume_score":    rec,   # alias used by is_starter threshold check
         }
 
     if pg == "OL":
@@ -136,6 +147,7 @@ def extract_features(stats: dict, pg: str) -> dict:
             "team_rush_ypa":      _f(stats, "team_rush_ypa"),
             "team_sack_rate_inv": 1.0 - min(_f(stats, "team_sack_rate"), 1.0),
             "award_tier":         _f(stats, "award_tier"),
+            "experience":         2.0,   # placeholder; overwritten below from players.year
         }
 
     if pg == "DL":
@@ -174,7 +186,7 @@ def extract_features(stats: dict, pg: str) -> dict:
             "coverage_score":   ints * 3.0 + pbu * 1.5,                 # ball skills
             "tackling_score":   tot * 0.5 + tfl * 2.0,                  # run support
             "pass_rush_score":  sacks * 4.0 + tfl * 1.5,                # blitz value
-            "instinct_score":   (ints + pbu) / tot,                     # playmaking rate
+            "instinct_score":   (ints + pbu + tfl * 0.5) / tot,         # playmaking rate (coverage + disruption)
             "volume_score":     tot,
         }
 
@@ -222,46 +234,49 @@ WEIGHTS = {
         "recruit_composite": 0.05,
     },
     "WR": {
-        "edge_scaled":     0.55,
-        "yards_per_rec":   0.20,
-        "yards_total":     0.15,
-        "rec_volume":      0.05,
+        "td_score":        0.35,
+        "yards_per_rec":   0.28,
+        "yards_total":     0.22,
+        "rec_volume":      0.10,
         "recruit_composite": 0.05,
     },
     "TE": {
-        "edge_scaled":     0.55,
-        "yards_per_rec":   0.20,
-        "yards_total":     0.15,
-        "rec_volume":      0.05,
+        "td_score":        0.35,
+        "yards_per_rec":   0.28,
+        "yards_total":     0.22,
+        "rec_volume":      0.10,
         "recruit_composite": 0.05,
     },
     # Non-EDGE positions: no edge_scaled, higher recruit weight
     "OL": {
-        "team_rush_ypa":      0.40,
-        "team_sack_rate_inv": 0.35,
-        "award_tier":         0.10,
-        "recruit_composite":  0.15,
+        "team_rush_ypa":      0.30,
+        "team_sack_rate_inv": 0.25,
+        "recruit_composite":  0.30,   # primary individual differentiator
+        "experience":         0.10,
+        "award_tier":         0.05,
     },
+    # DL/LB/DB: no edge_scaled — defender attribution in play-by-play is too
+    # sparse (~4-14 players/season with edge_scaled vs ~800 starters).
+    # Weights reflect the composite scores defined in extract_features().
     "DL": {
-        "edge_scaled":      0.50,
-        "tfl_total":        0.18,
-        "sacks_total":      0.17,
-        "tackles_total":    0.07,
-        "recruit_composite": 0.08,
+        "pass_rush_score":  0.38,
+        "run_stop_score":   0.28,
+        "disruption_rate":  0.19,
+        "volume_score":     0.05,
+        "recruit_composite": 0.10,
     },
     "LB": {
-        "edge_scaled":      0.50,
-        "tackles_total":    0.18,
-        "tfl_total":        0.12,
-        "sacks_total":      0.08,
-        "ints_total":       0.05,
-        "recruit_composite": 0.07,
+        "tackling_score":   0.33,
+        "pass_rush_score":  0.22,
+        "coverage_score":   0.20,
+        "instinct_score":   0.15,
+        "recruit_composite": 0.10,
     },
     "DB": {
-        "edge_scaled":      0.50,
-        "ints_total":       0.18,
-        "pbu_total":        0.14,
-        "tackles_total":    0.08,
+        "coverage_score":   0.32,
+        "tackling_score":   0.22,
+        "instinct_score":   0.20,
+        "pass_rush_score":  0.16,
         "recruit_composite": 0.10,
     },
     "K": {
@@ -294,40 +309,41 @@ WEIGHTS_NO_EDGE = {
         "recruit_composite": 0.05,
     },
     "WR": {
-        "yards_per_rec":   0.40,
-        "yards_total":     0.40,
+        "yards_per_rec":   0.35,
+        "td_score":        0.30,
+        "yards_total":     0.20,
         "rec_volume":      0.10,
-        "volume_score":    0.05,
         "recruit_composite": 0.05,
     },
     "TE": {
-        "yards_per_rec":   0.40,
-        "yards_total":     0.40,
+        "yards_per_rec":   0.35,
+        "td_score":        0.30,
+        "yards_total":     0.20,
         "rec_volume":      0.10,
-        "volume_score":    0.05,
         "recruit_composite": 0.05,
     },
     "DL": {
-        "tfl_total":        0.35,
-        "sacks_total":      0.30,
-        "tackles_total":    0.15,
+        "pass_rush_score":  0.40,
+        "run_stop_score":   0.28,
+        "disruption_rate":  0.12,
         "volume_score":     0.05,
         "recruit_composite": 0.15,
     },
     "LB": {
-        "tackles_total":    0.30,
-        "tfl_total":        0.22,
-        "sacks_total":      0.15,
-        "ints_total":       0.10,
-        "volume_score":     0.08,
+        "tackling_score":   0.30,
+        "pass_rush_score":  0.22,
+        "coverage_score":   0.18,
+        "instinct_score":   0.10,
+        "volume_score":     0.05,
         "recruit_composite": 0.15,
     },
     "DB": {
-        "ints_total":       0.30,
-        "pbu_total":        0.28,
-        "tackles_total":    0.15,
-        "volume_score":     0.07,
-        "recruit_composite": 0.20,
+        "coverage_score":   0.27,
+        "tackling_score":   0.20,
+        "pass_rush_score":  0.17,
+        "instinct_score":   0.16,
+        "volume_score":     0.05,
+        "recruit_composite": 0.15,
     },
 }
 
@@ -337,115 +353,129 @@ WEIGHTS_NO_EDGE = {
 # ---------------------------------------------------------------------------
 
 def load_position_data(season: int, pg: str) -> pd.DataFrame:
-    """Load players, stats, EDGE scores, and recruiting for a position group.
+    """Load one season's data for a position group.
 
     Only includes players who appeared on a roster in this season, determined
-    by the presence of a season_aggregate stats row. This prevents ghost ratings
-    for players who transferred, graduated, or turned pro in prior seasons.
+    by the presence of a season_aggregate stats row.
+    """
+    return _load_seasons([season], pg)
+
+
+def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
+    """Load one or more seasons of data for a position group via player_seasons.
+
+    player_seasons is the join anchor: one row per player × season × team.
+    This correctly handles same-name players at different schools — they are
+    distinct player_seasons rows and never collide.
     """
     with get_connection() as conn:
         cur = conn.cursor()
 
-        # Only players who have a stats row this season — they were on a roster
+        # Core join: player_seasons → players → stats
+        # ps.id is the player_season_id; it uniquely identifies a player-season-team combo.
         cur.execute(
-            """SELECT p.id, p.name, p.team_id, p.year, s.data
-               FROM players p
-               JOIN stats s ON s.player_id = p.id
-               WHERE p.position_group = %s
-                 AND s.season = %s
+            """SELECT ps.id, p.id, p.name, ps.team_id, ps.year, ps.season, s.data
+               FROM player_seasons ps
+               JOIN players p ON p.id = ps.player_id
+               JOIN stats s ON s.player_season_id = ps.id
+               WHERE ps.position_group = %s
+                 AND ps.season = ANY(%s)
                  AND s.stat_type = 'season_aggregate'
                  AND s.game_id IS NULL""",
-            (pg, season)
+            (pg, seasons)
         )
         raw_rows = cur.fetchall()
         if not raw_rows:
             return pd.DataFrame()
 
-        player_rows = [(r[0], r[1], r[2], r[3]) for r in raw_rows]
-        player_ids = [r[0] for r in player_rows]
+        # (ps_id, player_id, name, team_id, year, season, data)
+        player_season_rows = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in raw_rows]
+        all_ps_ids    = list({r[0] for r in raw_rows})
+        all_player_ids = list({r[1] for r in raw_rows})
 
+        # stats_map keyed by ps_id (already one row per player_season_id + stat_type)
         stats_map = {}
         for r in raw_rows:
-            pid, data = r[0], r[4]
-            stats_map[pid] = data if isinstance(data, dict) else json.loads(data)
+            ps_id, data = r[0], r[6]
+            stats_map[ps_id] = data if isinstance(data, dict) else json.loads(data)
 
-        # EDGE scores (NULL if not enough plays)
+        # EDGE scores — keyed by player_season_id
         cur.execute(
-            """SELECT player_id, edge_scaled, plays_counted, crunch_epa
+            """SELECT player_season_id, season, edge_scaled, plays_counted, crunch_epa
                FROM player_edge
-               WHERE season = %s AND player_id = ANY(%s)""",
-            (season, player_ids)
+               WHERE player_season_id = ANY(%s)""",
+            (all_ps_ids,)
         )
-        edge_map = {pid: {"edge_scaled": es, "plays_counted": pc, "crunch_epa": ce}
-                    for pid, es, pc, ce in cur.fetchall()}
+        edge_map = {ps_id: {"edge_scaled": es, "plays_counted": pc, "crunch_epa": ce}
+                    for ps_id, s, es, pc, ce in cur.fetchall()}
 
-        # Recruiting (most recent composite within 5 years)
+        # Recruiting — keyed by player_id (career-level, not season-level)
+        min_season = min(seasons)
         cur.execute(
-            """SELECT player_id, stars, composite_score FROM recruiting
+            """SELECT player_id, stars, composite_score, recruit_year FROM recruiting
                WHERE recruit_year >= %s AND player_id = ANY(%s)
                ORDER BY composite_score DESC NULLS LAST""",
-            (season - 5, player_ids)
+            (min_season - 5, all_player_ids)
         )
         rec_map = {}
-        for pid, stars, cs in cur.fetchall():
+        for pid, stars, cs, ry in cur.fetchall():
             if pid not in rec_map:
                 rec_map[pid] = {"stars": stars or 0, "composite_score": cs}
 
-        # Conference for G5 discount
+        # Conference — keyed by team_id
+        all_team_ids = list({r[3] for r in raw_rows if r[3]})
         cur.execute(
             "SELECT t.id, t.conference FROM teams t WHERE t.id = ANY(%s)",
-            (list({r[2] for r in player_rows if r[2]}),)
+            (all_team_ids,)
         )
         conf_map = {tid: conf for tid, conf in cur.fetchall()}
 
-        # Transfer history — used to resolve correct team per season
-        # For a player who transferred in year Y, to_team_id is their team for seasons >= Y.
-        # Take the most recent transfer at or before this season.
+        # Transfer history — to flag transfer-in players (career-level)
         cur.execute(
-            """SELECT player_id, transfer_year, to_team_id
+            """SELECT player_id, transfer_year
                FROM transfers
-               WHERE player_id = ANY(%s) AND transfer_year <= %s AND to_team_id IS NOT NULL
-               ORDER BY transfer_year DESC""",
-            (player_ids, season)
+               WHERE player_id = ANY(%s) AND to_team_id IS NOT NULL""",
+            (all_player_ids,)
         )
-        # Build {player_id: team_id_for_this_season}
-        transfer_team_map: dict = {}
-        transfer_set: set = set()
-        for pid, yr, to_tid in cur.fetchall():
-            if pid not in transfer_team_map:
-                transfer_team_map[pid] = to_tid
-            if yr == season:
-                transfer_set.add(pid)
+        transfer_seasons: dict[int, set] = {}
+        for pid, yr in cur.fetchall():
+            transfer_seasons.setdefault(pid, set()).add(yr)
 
     rows = []
-    for pid, name, team_id, year in player_rows:
-        raw_stats = stats_map.get(pid, {})
+    for ps_id, pid, name, team_id, year, s in player_season_rows:
+        raw_stats = stats_map.get(ps_id, {})
         rec       = rec_map.get(pid, {})
         stars     = int(rec.get("stars") or 0)
         cs        = rec.get("composite_score")
-        edge_info = edge_map.get(pid, {})
+        edge_info = edge_map.get(ps_id, {})
 
         feats = extract_features(raw_stats, pg)
+        if pg == "OL":
+            feats["experience"] = float(year or 2)
         feats["recruit_composite"] = _composite_to_100(cs)
-        feats["transfer_flag"]     = 1 if pid in transfer_set else 0
+        feats["transfer_flag"]     = 1 if s in transfer_seasons.get(pid, set()) else 0
         feats["stars"]             = stars
         feats["year"]              = int(year or 0)
-        # Use transfer-resolved team for this season; fall back to players.team_id
-        feats["team_id"]           = transfer_team_map.get(pid, team_id)
+        feats["team_id"]           = team_id
         feats["name"]              = name
-        # EDGE — may be None if insufficient plays
+        feats["player_season_id"]  = ps_id   # carry through for output upsert
         feats["edge_scaled"]       = edge_info.get("edge_scaled")
         plays_counted              = edge_info.get("plays_counted") or 0
         feats["plays_counted"]     = plays_counted
         feats["crunch_epa"]        = edge_info.get("crunch_epa") or 0.0
-        # Estimate games played from attributed plays (~15 plays/game for skill positions)
         feats["games_played"]      = min(plays_counted / 15.0, 15.0)
-        # Conference — used for G5 discount (resolved via season-correct team_id)
-        resolved_tid = transfer_team_map.get(pid, team_id)
-        feats["conference"]        = conf_map.get(resolved_tid, "")
+        feats["conference"]        = conf_map.get(team_id, "")
+        feats["_season"]           = s
         rows.append({"player_id": pid, **feats})
 
-    return pd.DataFrame(rows).set_index("player_id")
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # Compound row key: player_season_id is already unique per row.
+    # Keep using string key for backwards compat with rate_position logic.
+    df["_row_key"] = df["player_season_id"].astype(str)
+    return df.set_index("_row_key")
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +490,8 @@ def is_starter(row: pd.Series, pg: str) -> bool:
 
 
 def has_edge(row: pd.Series) -> bool:
-    return row.get("edge_scaled") is not None and not pd.isna(row.get("edge_scaled"))
+    v = row.get("edge_scaled")
+    return v is not None and not pd.isna(v)
 
 
 # ---------------------------------------------------------------------------
@@ -542,38 +573,54 @@ def compute_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
     return np.array(final_scores), final_contribs
 
 
-# P4 conferences — players in other conferences get a G5 discount
+# Conference discount — only applied to stat-only positions (non-EDGE).
+# EDGE positions (QB/RB) are opponent-adjusted at the play level via SP+,
+# so a G5 conference label would double-penalize what the model already handles.
+# For stat-only positions (WR/TE/OL/DL/LB/DB), raw counting stats don't carry
+# opponent context, so a modest discount still applies.
 P4_CONFERENCES = {"SEC", "Big Ten", "Big 12", "ACC", "Pac-12"}
-G5_DISCOUNT = 0.93   # G5 raw scores multiplied by this before normalization
+G5_DISCOUNT = 0.95   # reduced — stat-only positions only, lighter touch
 
 
-def scale_to_range(scores: np.ndarray, low=30, high=99) -> np.ndarray:
-    """Z-score → sigmoid normalization.
+def scale_to_range(scores: np.ndarray, low=30, high=99, pg: str = "") -> np.ndarray:
+    """Z-score sigmoid normalization across the full multi-season population.
 
-    Maps raw composite scores to 0–100 using the population's mean and std.
-    The sigmoid shape means a player needs to be genuinely elite (+3σ) to
-    reach 95+. Most seasons top out at 90–94; generational seasons hit 97–99.
-    A few 94–99 players per position per season is by design.
+    Sigmoid shifted so median starter (z=0) -> ~65. Per-position steepness
+    controls spread: higher steepness = more separation between best and average.
+
+    Because scores are computed against ALL seasons combined, the scale is
+    consistent year-over-year: a 90 in 2021 means the same thing as a 90 in 2025.
     """
     if len(scores) < 2:
-        return np.full(len(scores), 55.0)
+        return np.full(len(scores), 65.0)
     mu  = np.mean(scores)
     std = np.std(scores)
     if std < 1e-9:
-        return np.full(len(scores), 55.0)
+        return np.full(len(scores), 65.0)
     z = (scores - mu) / std
-    # Sigmoid: output ≈ 55 at z=0, 75 at z=1, 88 at z=2, 95 at z=3, 98 at z=4
-    raw = 100.0 / (1.0 + np.exp(-0.85 * z)) * 1.06 - 3.0
+    # Single steepness value for all positions.
+    # With a cross-season pool of 750–4500 starters, the natural z-score
+    # variance is already wide — no need to amplify it per-position.
+    # 0.9 maps median starter -> ~65 and top 1% -> ~90-95 naturally.
+    steepness = 0.9
+    raw = 100.0 / (1.0 + np.exp(-steepness * (z + 0.75))) * 1.08 - 4.0
     return np.clip(raw, low, high).round(2)
 
 
-def apply_conference_discount(scores: np.ndarray, df: pd.DataFrame) -> np.ndarray:
-    """Apply a small discount to G5 players before final scaling.
+def apply_conference_discount(scores: np.ndarray, df: pd.DataFrame, pg: str = "") -> np.ndarray:
+    """Apply a modest discount to G5 players at stat-only positions.
 
-    G5 players face weaker competition on average; their raw production
-    numbers are slightly inflated relative to P4 peers. Jeanty-level
-    seasons still rate elite — the discount only affects average G5 starters.
+    EDGE positions (QB/RB) skip this entirely — their raw scores are already
+    opponent-adjusted at the play level via SP+. Applying a conference penalty
+    on top would double-penalize G5 players for the same competition factor
+    that EDGE already accounts for.
+
+    For stat-only positions (WR/TE/OL/DL/LB/DB), counting stats carry no
+    opponent context, so a small conference-level adjustment still applies.
     """
+    if pg in EDGE_POSITIONS:
+        return scores.copy()   # EDGE handles opponent quality — no extra penalty
+
     result = scores.copy()
     for i, (_, row) in enumerate(df.iterrows()):
         conf = row.get("conference") or ""
@@ -601,7 +648,7 @@ def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame) -> np.ndarray:
     return result
 
 
-def fallback_rating(stars: int, position_avg: float = 60.0) -> float:
+def fallback_rating(stars: int, position_avg: float = 65.0) -> float:
     offset = STARS_FALLBACK.get(min(stars, 5), -33)
     return max(30.0, min(99.0, round(position_avg + offset, 2)))
 
@@ -652,67 +699,130 @@ def compute_breakout(df: pd.DataFrame, ratings: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def rate_position(season: int, pg: str) -> list[dict]:
+    """Rate all players at a position for a given season.
+
+    Normalization is cross-season: percentile ranks are computed against the
+    full 2021-2025 starter population, so ratings are consistent across years.
+    A player rated 85 in 2021 is genuinely comparable to an 85 in 2025.
+    """
     print(f"  {pg}...", end=" ", flush=True)
-    df = load_position_data(season, pg)
-    if df.empty:
+
+    # Load ALL seasons together so percentile ranks are cross-season stable
+    all_df = _load_seasons(ALL_SEASONS, pg)
+    if all_df.empty:
         print("no data")
         return []
 
-    starter_mask = df.apply(lambda r: is_starter(r, pg), axis=1)
-    starter_df   = df[starter_mask]
-    backup_df    = df[~starter_mask]
+    all_starter_mask = all_df.apply(lambda r: is_starter(r, pg), axis=1)
+    all_starter_df   = all_df[all_starter_mask]
+    all_backup_df    = all_df[~all_starter_mask]
 
-    edge_count = starter_df["edge_scaled"].notna().sum() if "edge_scaled" in starter_df.columns else 0
+    # Cross-season ratings_map: row_key -> float
+    ratings_map: dict[str, float] = {}
+    contrib_map: dict[str, dict]  = {}
 
-    ratings_map: dict[int, float] = {}
-    contrib_map: dict[int, dict]  = {}
+    edge_count = all_starter_df["edge_scaled"].notna().sum() if "edge_scaled" in all_starter_df.columns else 0
 
-    if len(starter_df) >= 5:
-        raw_scores, contribs = compute_ratings(starter_df, pg)
-        # Apply G5 discount before z-score normalization so the sigmoid
-        # naturally places G5 players slightly below equivalent P4 output
-        discounted = apply_conference_discount(raw_scores, starter_df)
-        scaled = scale_to_range(discounted)
-        # Only apply sample-size damping for EDGE positions (QB/RB/WR/TE)
-        # where plays_counted is meaningful; skip for stat-only positions
+    if len(all_starter_df) >= 5:
+        raw_scores, contribs = compute_ratings(all_starter_df, pg)
+        discounted = apply_conference_discount(raw_scores, all_starter_df, pg=pg)
+        scaled = scale_to_range(discounted, pg=pg)
         if pg in EDGE_POSITIONS:
-            scaled = apply_games_confidence(scaled, starter_df)
-        for i, pid in enumerate(starter_df.index):
-            ratings_map[pid] = float(scaled[i])
-            contrib_map[pid] = contribs[i]
+            scaled = apply_games_confidence(scaled, all_starter_df)
+        for i, rkey in enumerate(all_starter_df.index):
+            ratings_map[rkey] = float(scaled[i])
+            contrib_map[rkey] = contribs[i]
     else:
-        print(f"(only {len(starter_df)} starters — fallback only) ", end="")
-        for pid, row in df.iterrows():
-            ratings_map[pid] = fallback_rating(int(row.get("stars", 0)))
+        print(f"(only {len(all_starter_df)} starters across all seasons — fallback only) ", end="")
+        for rkey, row in all_df.iterrows():
+            ratings_map[rkey] = fallback_rating(int(row.get("stars", 0)))
 
-    # Fallback for backups / low-snap players
-    pos_avg = float(np.mean(list(ratings_map.values()))) if ratings_map else 60.0
-    for pid, row in backup_df.iterrows():
-        ratings_map[pid] = fallback_rating(int(row.get("stars", 0)), pos_avg)
-        contrib_map[pid] = {"recruit_composite": 0.5}  # 100% recruit-driven
+    # Fallback for backups / low-snap players.
+    # Sub-threshold players with high efficiency get a blended rating instead
+    # of pure recruiting fallback — prevents small-sample stars being buried.
+    pos_avg = float(np.mean(list(ratings_map.values()))) if ratings_map else 65.0
 
-    trajectory   = compute_trajectory(ratings_map, season - 1)
-    all_pids     = [pid for pid in df.index if pid in ratings_map]
-    all_ratings  = np.array([ratings_map[pid] for pid in all_pids])
-    breakout_arr = compute_breakout(df.loc[df.index.isin(all_pids)], all_ratings)
-    breakout_map = dict(zip(all_pids, breakout_arr))
+    # Compute an efficiency percentile across all starters for blending
+    eff_col = {
+        "QB": "yards_per_att", "RB": "yards_per_carry",
+        "WR": "yards_per_rec", "TE": "yards_per_rec",
+        "DL": "disruption_rate", "LB": "instinct_score", "DB": "instinct_score",
+    }.get(pg)
+
+    starter_eff_vals = None
+    if eff_col and eff_col in all_starter_df.columns:
+        starter_eff_vals = all_starter_df[eff_col].fillna(0).values
+
+    for rkey, row in all_backup_df.iterrows():
+        base = fallback_rating(int(row.get("stars", 0)), pos_avg)
+        # For players with meaningful efficiency (>= 50th pct of starters),
+        # blend 30% efficiency-implied rating with 70% recruiting fallback.
+        # This prevents 7.8 YPC players from rating the same as 3.0 YPC backups.
+        if eff_col and starter_eff_vals is not None:
+            eff_val = float(row.get(eff_col) or 0)
+            if eff_val > 0 and len(starter_eff_vals) >= 5:
+                pct = float(np.mean(starter_eff_vals <= eff_val))
+                if pct >= 0.5:
+                    # Map percentile to a rating in pos_avg±20 range
+                    eff_implied = pos_avg - 10 + pct * 20
+                    blend = round(0.70 * base + 0.30 * eff_implied, 2)
+                    ratings_map[rkey] = blend
+                    contrib_map[rkey] = {"recruit_composite": 0.35, eff_col: 0.15}
+                    continue
+        ratings_map[rkey] = base
+        contrib_map[rkey] = {"recruit_composite": 0.5}
+
+    # --- Filter down to the requested season ---
+    season_df = all_df[all_df["_season"] == season]
+    if season_df.empty:
+        print("no data for requested season")
+        return []
+
+    # Compute trajectory (needs per-player ratings from prior season)
+    # Build player_id -> rating map for this season's rows
+    season_pid_rating: dict[int, float] = {}
+    for rkey, row in season_df.iterrows():
+        pid = int(row["player_id"])
+        season_pid_rating[pid] = float(ratings_map.get(rkey, 50.0))
+
+    trajectory = compute_trajectory(season_pid_rating, season - 1)
+
+    # Breakout probability — use this season's subset only
+    season_pids  = list(season_pid_rating.keys())
+    season_rats  = np.array([season_pid_rating[p] for p in season_pids])
+    # Build a sub-df indexed by player_id for compute_breakout
+    sub_df = season_df.copy()
+    sub_df.index = sub_df["player_id"].astype(int)
+    breakout_arr = compute_breakout(sub_df.loc[sub_df.index.isin(season_pids)], season_rats)
+    breakout_map = dict(zip(season_pids, breakout_arr))
+
+    ceiling = POSITION_CEILING.get(pg)
+    starters_this_season = season_df.apply(lambda r: is_starter(r, pg), axis=1).sum()
+    edge_this_season = (
+        season_df["edge_scaled"].notna().sum()
+        if "edge_scaled" in season_df.columns else 0
+    )
 
     rows = []
-    for pid in df.index:
+    for rkey, row in season_df.iterrows():
+        pid    = int(row["player_id"])
+        ps_id  = int(row["player_season_id"])
+        ovr    = float(ratings_map.get(rkey, 50.0))
+        if ceiling:
+            ovr = min(ovr, ceiling)
         rows.append({
-            "player_id":            int(pid),
+            "player_season_id":     ps_id,
             "season":               int(season),
-            "overall_rating":       float(ratings_map.get(pid, 50.0)),
-            "position_rating":      float(ratings_map.get(pid, 50.0)),
+            "overall_rating":       ovr,
+            "position_rating":      ovr,
             "trajectory_score":     float(trajectory.get(pid, 0.0)),
             "breakout_probability": float(breakout_map.get(pid, 0.05)),
-            "shap_values":          json.dumps(contrib_map.get(pid, {})),
-            "team_id":              int(df.loc[pid, "team_id"]) if df.loc[pid, "team_id"] else None,
+            "shap_values":          json.dumps(contrib_map.get(rkey, {})),
             "model_version":        MODEL_VERSION,
         })
 
-    edge_info = f", EDGE: {edge_count}" if pg in EDGE_POSITIONS else ""
-    print(f"{len(rows)} players (starters: {len(starter_df)}{edge_info}, fallback: {len(backup_df)})")
+    edge_info = f", EDGE: {edge_this_season}" if pg in EDGE_POSITIONS else ""
+    print(f"{len(rows)} players this season (starters: {starters_this_season}{edge_info}, total pool: {len(all_starter_df)} starters across all seasons)")
     return rows
 
 
@@ -736,7 +846,7 @@ def main():
         for pg in positions:
             all_rows.extend(rate_position(season, pg))
         if all_rows:
-            bulk_upsert("ratings", all_rows, ["player_id", "season"])
+            bulk_upsert("ratings", all_rows, "player_season_id")
             print(f"  Upserted {len(all_rows)} rows")
 
     print("\nDone.")

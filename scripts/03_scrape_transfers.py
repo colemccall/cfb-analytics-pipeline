@@ -135,19 +135,28 @@ def _parse_on3_row(row, year: int) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def build_player_index() -> dict:
-    """Build {name_lower: [(player_id, team_lower)]} from all players."""
+    """Build {name_lower: [(player_id, team_lower)]} using player_seasons.
+
+    Each (player_id, team) pair comes from an actual player_seasons row,
+    so the index reflects every school a player has ever been rostered at.
+    This means two 'Sammy Brown' LBs at different schools are distinct entries.
+    """
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT p.id, p.name, t.school
+            SELECT DISTINCT p.id, p.name, t.school
             FROM players p
-            LEFT JOIN teams t ON t.id = p.team_id
+            JOIN player_seasons ps ON ps.player_id = p.id
+            LEFT JOIN teams t ON t.id = ps.team_id
         """)
         index: dict = {}
         for pid, name, school in cur.fetchall():
             key = name.lower().strip()
             team = (school or "").lower()
-            index.setdefault(key, []).append((pid, team))
+            entry = (pid, team)
+            lst = index.setdefault(key, [])
+            if entry not in lst:
+                lst.append(entry)
     return index
 
 
@@ -165,29 +174,49 @@ def fuzzy_match_player(
     player_index: dict,
     threshold: float = 0.85,
 ) -> int | None:
+    """Match a transfer portal entry to a player_id.
+
+    Critically: if from_school is provided and the name matches multiple players,
+    we ONLY accept a match where the player has a player_seasons row at from_school.
+    If no team-gated match is found, return None (don't fall back to the wrong player).
+    This prevents two players sharing a name at different schools from colliding.
+    """
     name_l = name.lower().strip()
     for suffix in [" jr.", " jr", " sr.", " sr", " ii", " iii", " iv"]:
         if name_l.endswith(suffix):
             name_l = name_l[: -len(suffix)].strip()
 
+    def _team_match(candidates: list, school_l: str) -> int | None:
+        for pid, team in candidates:
+            if team == school_l:
+                return pid
+        return None
+
+    # Exact name match
     if name_l in player_index:
         candidates = player_index[name_l]
         if from_school:
             school_l = from_school.lower()
-            for pid, team in candidates:
-                if team == school_l:
-                    return pid
-        return candidates[0][0]
+            hit = _team_match(candidates, school_l)
+            if hit:
+                return hit
+            # Name matches but no team match — ambiguous, do NOT guess
+            if len(candidates) > 1:
+                return None
+            # Only one candidate with this name; accept if no from_school conflict
+            return candidates[0][0]
+        return candidates[0][0] if len(candidates) == 1 else None
 
+    # Fuzzy name match — only accept with team confirmation
     matches = difflib.get_close_matches(name_l, player_index.keys(), n=3, cutoff=threshold)
     for match in matches:
         candidates = player_index[match]
         if from_school:
             school_l = from_school.lower()
-            for pid, team in candidates:
-                if team == school_l:
-                    return pid
-        if len(candidates) == 1:
+            hit = _team_match(candidates, school_l)
+            if hit:
+                return hit
+        elif len(candidates) == 1:
             return candidates[0][0]
 
     return None
@@ -225,17 +254,17 @@ def upsert_transfers(entries: list[dict], player_index: dict, team_index: dict) 
     for r in rows:
         r["portal_entry_count"] = pid_counts[r["player_id"]]
 
-    # Dedup by (player_id, transfer_year) — keep entry with portal_date if available
+    # Dedup by (player_id, transfer_year, from_team_id) — matches new unique constraint
     seen: dict = {}
     for r in rows:
-        key = (r["player_id"], r["transfer_year"])
+        key = (r["player_id"], r["transfer_year"], r["from_team_id"])
         existing = seen.get(key)
         if existing is None or (r.get("portal_date") and not existing.get("portal_date")):
             seen[key] = r
     rows = list(seen.values())
 
     if rows:
-        bulk_upsert("transfers", rows, ["player_id", "transfer_year"])
+        bulk_upsert("transfers", rows, ["player_id", "transfer_year", "from_team_id"])
     print(f"  Upserted {len(rows)} transfers ({unmatched} unmatched players)")
 
 

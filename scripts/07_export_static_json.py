@@ -75,23 +75,23 @@ def export_players(output_dir: Path, season: int) -> None:
     with get_connection() as conn:
         cur = conn.cursor()
 
-        # Ratings + player + team in one join
+        # Join: ratings → player_seasons → players + teams
+        # player_seasons.team_id is authoritative for this season (no COALESCE needed)
         cur.execute("""
             SELECT
-                r.player_id,
+                ps.player_id,
                 r.overall_rating,
                 r.position_rating,
                 r.trajectory_score,
                 r.breakout_probability,
                 r.shap_values,
                 p.name,
-                p.position,
-                p.position_group,
-                p.year,
+                ps.position,
+                ps.position_group,
+                ps.year,
                 p.height_in,
                 p.weight_lbs,
                 p.hometown_state,
-                COALESCE(r.team_id, p.team_id) AS resolved_team_id,
                 t.id   AS team_id,
                 t.school,
                 t.abbreviation,
@@ -99,15 +99,16 @@ def export_players(output_dir: Path, season: int) -> None:
                 t.color,
                 t.logo_url
             FROM ratings r
-            JOIN players p ON p.id = r.player_id
-            LEFT JOIN teams t ON t.id = COALESCE(r.team_id, p.team_id)
+            JOIN player_seasons ps ON ps.id = r.player_season_id
+            JOIN players p ON p.id = ps.player_id
+            LEFT JOIN teams t ON t.id = ps.team_id
             WHERE r.season = %s
             ORDER BY r.overall_rating DESC NULLS LAST
         """, (season,))
         rating_rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
 
-        # Recruiting — best record per player
+        # Recruiting — best record per player (career-level)
         cur.execute("""
             SELECT DISTINCT ON (player_id)
                 player_id, stars, composite_score, recruit_year
@@ -166,13 +167,13 @@ def export_teams(output_dir: Path, season: int) -> None:
 
         # Per-team rating aggregates for this season
         cur.execute("""
-            SELECT COALESCE(r.team_id, p.team_id) AS resolved_team_id,
+            SELECT ps.team_id AS resolved_team_id,
                    COUNT(r.overall_rating) AS player_count,
                    ROUND(AVG(r.overall_rating)::numeric, 2) AS avg_rating
             FROM ratings r
-            JOIN players p ON p.id = r.player_id
-            WHERE r.season = %s AND COALESCE(r.team_id, p.team_id) IS NOT NULL
-            GROUP BY COALESCE(r.team_id, p.team_id)
+            JOIN player_seasons ps ON ps.id = r.player_season_id
+            WHERE r.season = %s AND ps.team_id IS NOT NULL
+            GROUP BY ps.team_id
         """, (season,))
         team_stats = {row[0]: {"player_count": row[1], "avg_rating": float(row[2]) if row[2] else None}
                       for row in cur.fetchall()}
@@ -194,22 +195,23 @@ def export_ratings_by_position(output_dir: Path, season: int) -> None:
 
         cur.execute("""
             SELECT
-                r.player_id,
+                ps.player_id,
                 r.overall_rating,
                 r.position_rating,
                 r.trajectory_score,
                 r.breakout_probability,
                 r.shap_values,
                 p.name,
-                p.position_group,
-                p.year,
+                ps.position_group,
+                ps.year,
                 t.school,
                 t.abbreviation,
                 t.conference,
                 t.color
             FROM ratings r
-            JOIN players p ON p.id = r.player_id
-            LEFT JOIN teams t ON t.id = COALESCE(r.team_id, p.team_id)
+            JOIN player_seasons ps ON ps.id = r.player_season_id
+            JOIN players p ON p.id = ps.player_id
+            LEFT JOIN teams t ON t.id = ps.team_id
             WHERE r.season = %s
             ORDER BY r.overall_rating DESC NULLS LAST
         """, (season,))
@@ -285,7 +287,7 @@ def main():
     output_dir: Path = args.output
     season: int = args.season
 
-    print(f"Exporting season {season} → {output_dir}")
+    print(f"Exporting season {season} -> {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("players.json...")

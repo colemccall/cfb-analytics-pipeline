@@ -278,6 +278,31 @@ ALTER TABLE plays           ENABLE ROW LEVEL SECURITY;
 ALTER TABLE player_edge     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE research_cache  ENABLE ROW LEVEL SECURITY;
 
+-- ---------------------------------------------------------------------------
+-- Table 13: ea_ratings
+-- EA Sports CFB 25 / CFB 26 player ratings, scraped from TeamCrafters (CFB25)
+-- and EA's official ratings page (CFB26).
+-- source: 'ea_cfb25' | 'ea_cfb26'
+-- ea_season: roster year (2024 for CFB25, 2025 for CFB26)
+-- attributes: JSONB of individual ratings (spd, str, agi, etc.) — keys vary by source
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ea_ratings (
+    id          BIGSERIAL PRIMARY KEY,
+    player_id   BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    source      TEXT   NOT NULL,           -- 'ea_cfb25' | 'ea_cfb26'
+    ea_season   INT    NOT NULL,           -- 2024 (CFB25) | 2025 (CFB26)
+    ovr         INT,                       -- overall rating 0-99
+    position    TEXT,                      -- position as listed in EA
+    attributes  JSONB  DEFAULT '{}',       -- individual ratings (spd, str, agi, cod, awr, etc.)
+    scraped_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (player_id, source, ea_season)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ea_ratings_player   ON ea_ratings (player_id);
+CREATE INDEX IF NOT EXISTS idx_ea_ratings_source   ON ea_ratings (source, ea_season);
+
+ALTER TABLE ea_ratings ENABLE ROW LEVEL SECURITY;
+
 -- Public read policies (anon key can SELECT)
 CREATE POLICY "Public read teams"      ON teams           FOR SELECT USING (true);
 CREATE POLICY "Public read players"    ON players         FOR SELECT USING (true);
@@ -291,3 +316,4 @@ CREATE POLICY "Public read ratings"    ON ratings         FOR SELECT USING (true
 CREATE POLICY "Public read plays"       ON plays           FOR SELECT USING (true);
 CREATE POLICY "Public read edge"        ON player_edge     FOR SELECT USING (true);
 CREATE POLICY "Public read research"    ON research_cache  FOR SELECT USING (true);
+CREATE POLICY "Public read ea_ratings"  ON ea_ratings      FOR SELECT USING (true);

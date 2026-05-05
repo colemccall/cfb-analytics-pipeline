@@ -61,8 +61,8 @@ GARBAGE_WEIGHT = 0.25
 
 MEDIAN_SP = 0.0  # SP+ is centered around 0 by design; adjust multiplier accordingly
 
-# Positions we compute EDGE for (offensive skill only — EPA is meaningful here)
-EDGE_POSITIONS = {"QB", "RB", "WR", "TE"}
+# Positions we compute EDGE for — includes defenders (negated EPA on sack/INT/TFL)
+EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "DL", "LB", "DB"}
 
 # Minimum plays for a "valid" EDGE score (below this → NULL, use formula fallback)
 MIN_PLAYS = 15
@@ -174,12 +174,11 @@ def load_plays(season: int) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def load_player_positions(season: int) -> dict:
-    """Return {player_id: position_group} for players with stats this season."""
+    """Return {player_id: position_group} for players with a player_seasons row this season."""
     sql = """
-        SELECT DISTINCT pl.id, pl.position_group
-        FROM players pl
-        INNER JOIN stats s ON s.player_id = pl.id
-        WHERE s.season = %s AND s.game_id IS NULL
+        SELECT DISTINCT ps.player_id, ps.position_group
+        FROM player_seasons ps
+        WHERE ps.season = %s AND ps.position_group IS NOT NULL
     """
     with get_connection() as conn:
         cur = conn.cursor()
@@ -342,28 +341,49 @@ def scale_edge(agg: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def upsert_edge(agg: pd.DataFrame, season: int) -> None:
+    # Resolve player_season_id: {player_id: player_season_id} for this season
+    player_ids = [int(r["player_id"]) for _, r in agg.iterrows()]
+    ps_id_map: dict = {}
+    if player_ids:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT player_id, id FROM player_seasons WHERE season = %s AND player_id = ANY(%s)",
+                (season, player_ids)
+            )
+            for pid, ps_id in cur.fetchall():
+                ps_id_map[pid] = ps_id
+
     rows = []
+    skipped = 0
     for _, r in agg.iterrows():
         player_id = int(r["player_id"])
+        ps_id = ps_id_map.get(player_id)
+        if not ps_id:
+            skipped += 1
+            continue
         rows.append({
-            "player_id":       player_id,
-            "season":          season,
-            "edge_score":      float(r["edge_score"]) if pd.notna(r.get("edge_score")) else None,
-            "edge_scaled":     float(r["edge_scaled"]) if pd.notna(r.get("edge_scaled")) else None,
-            "crunch_epa":      float(r["crunch_epa"]) if pd.notna(r.get("crunch_epa")) else None,
-            "garbage_epa":     float(r["garbage_epa"]) if pd.notna(r.get("garbage_epa")) else None,
-            "plays_counted":   int(r["plays_counted"]) if pd.notna(r.get("plays_counted")) else 0,
-            "opponent_avg_sp": float(r["opponent_avg_sp"]) if pd.notna(r.get("opponent_avg_sp")) else None,
-            "model_version":   MODEL_VERSION,
+            "player_season_id": ps_id,
+            "season":           season,
+            "edge_score":       float(r["edge_score"]) if pd.notna(r.get("edge_score")) else None,
+            "edge_scaled":      float(r["edge_scaled"]) if pd.notna(r.get("edge_scaled")) else None,
+            "crunch_epa":       float(r["crunch_epa"]) if pd.notna(r.get("crunch_epa")) else None,
+            "garbage_epa":      float(r["garbage_epa"]) if pd.notna(r.get("garbage_epa")) else None,
+            "plays_counted":    int(r["plays_counted"]) if pd.notna(r.get("plays_counted")) else 0,
+            "opponent_avg_sp":  float(r["opponent_avg_sp"]) if pd.notna(r.get("opponent_avg_sp")) else None,
+            "model_version":    MODEL_VERSION,
         })
 
     if not rows:
         print("  No EDGE rows to upsert")
         return
 
-    seen = {r["player_id"]: r for r in rows}
+    if skipped:
+        print(f"  Skipped {skipped} players with no player_seasons row for {season}")
+
+    seen = {r["player_season_id"]: r for r in rows}
     rows = list(seen.values())
-    bulk_upsert("player_edge", rows, conflict_col=["player_id", "season"])
+    bulk_upsert("player_edge", rows, conflict_col="player_season_id")
     print(f"  Upserted {len(rows)} EDGE rows")
 
 
@@ -397,7 +417,7 @@ def run_season(season: int, api_key: str) -> None:
     if agg.empty:
         print("  No EDGE scores computed (check player attribution in plays table)")
         return
-    print(f"  {agg['edge_score'].notna().sum()} players with valid EDGE (≥{MIN_PLAYS} plays)")
+    print(f"  {agg['edge_score'].notna().sum()} players with valid EDGE (>={MIN_PLAYS} plays)")
 
     agg = scale_edge(agg)
     upsert_edge(agg, season)

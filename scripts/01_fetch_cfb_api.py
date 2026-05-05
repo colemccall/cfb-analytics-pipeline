@@ -192,40 +192,106 @@ def upsert_teams(teams_raw: list) -> dict:
     return {r["school"].lower(): r["id"] for r in result.data}
 
 
-def upsert_players(rosters_by_team: dict, team_id_map: dict) -> dict:
-    """Upsert all players for a season; return {cfb_api_id: db_id}."""
-    rows = []
+def upsert_players(rosters_by_team: dict, team_id_map: dict, season: int) -> tuple[dict, dict]:
+    """Upsert player identity rows and player_seasons rows.
+
+    Returns:
+        player_id_map: {cfb_api_id: db_player_id}
+        ps_id_map:     {db_player_id: player_season_id}  (for this season)
+    """
+    import psycopg2.extras
+
+    # --- Step 1: upsert identity rows (no team, no year) ---
+    identity_rows = []
     for team_name, players in rosters_by_team.items():
-        team_id = team_id_map.get(team_name.lower())
         for p in players:
-            raw_pos = p.get("position", "") or ""
-            rows.append({
-                "cfb_api_id":     p.get("id"),
-                "name":           f"{p.get('firstName', '')} {p.get('lastName', '')}".strip(),
-                "team_id":        team_id,
-                "position":       raw_pos,
-                "position_group": POSITION_GROUP_MAP.get(raw_pos.upper(), "ATH"),
-                "year":           p.get("year"),
-                "height_in":      p.get("height"),
-                "weight_lbs":     p.get("weight"),
-                "hometown":       p.get("homeCity"),
-                "hometown_state": p.get("homeState"),
-                "hometown_country": p.get("homeCountry"),
+            api_id = p.get("id")
+            name = f"{p.get('firstName', '')} {p.get('lastName', '')}".strip()
+            if not api_id or not name:
+                continue
+            identity_rows.append({
+                "cfb_api_id":        api_id,
+                "name":              name,
+                "height_in":         p.get("height"),
+                "weight_lbs":        p.get("weight"),
+                "hometown":          p.get("homeCity"),
+                "hometown_state":    p.get("homeState"),
+                "hometown_country":  p.get("homeCountry"),
             })
-    valid_rows = [r for r in rows if r.get("cfb_api_id") and r.get("name")]
-    # Deduplicate by cfb_api_id — a player can appear on multiple rosters (transfers)
-    seen = {}
-    for r in valid_rows:
-        seen[r["cfb_api_id"]] = r
-    valid_rows = list(seen.values())
-    if valid_rows:
-        bulk_upsert("players", valid_rows, "cfb_api_id")
-        print(f"  Upserted {len(valid_rows)} players")
+
+    # Deduplicate by cfb_api_id — keep last occurrence (most recent data)
+    seen_identity: dict = {}
+    for r in identity_rows:
+        seen_identity[r["cfb_api_id"]] = r
+    identity_rows = list(seen_identity.values())
+
+    if identity_rows:
+        bulk_upsert("players", identity_rows, "cfb_api_id")
+        print(f"  Upserted {len(identity_rows)} players (identity)")
 
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT id, cfb_api_id FROM players WHERE cfb_api_id IS NOT NULL")
-        return {row[1]: row[0] for row in cur.fetchall()}
+        player_id_map = {row[1]: row[0] for row in cur.fetchall()}
+
+    # --- Step 2: upsert player_seasons rows ---
+    ps_rows = []
+    for team_name, players in rosters_by_team.items():
+        team_id = team_id_map.get(team_name.lower())
+        for p in players:
+            api_id = p.get("id")
+            db_id  = player_id_map.get(int(api_id)) if api_id else None
+            if not db_id or not team_id:
+                continue
+            raw_pos = p.get("position", "") or ""
+            ps_rows.append({
+                "player_id":      db_id,
+                "season":         season,
+                "team_id":        team_id,
+                "position":       raw_pos,
+                "position_group": POSITION_GROUP_MAP.get(raw_pos.upper(), "ATH"),
+                "year":           p.get("year"),
+            })
+
+    # A player can appear on multiple teams in one season (mid-season transfers are rare
+    # but possible). Keep all unique (player_id, season, team_id) combos.
+    seen_ps: dict = {}
+    for r in ps_rows:
+        seen_ps[(r["player_id"], r["season"], r["team_id"])] = r
+    ps_rows = list(seen_ps.values())
+
+    if ps_rows:
+        sql = """
+            INSERT INTO player_seasons (player_id, season, team_id, position, position_group, year)
+            VALUES %s
+            ON CONFLICT (player_id, season, team_id) DO UPDATE
+                SET position       = EXCLUDED.position,
+                    position_group = EXCLUDED.position_group,
+                    year           = EXCLUDED.year,
+                    updated_at     = now()
+        """
+        tmpl = "(%(player_id)s, %(season)s, %(team_id)s, %(position)s, %(position_group)s, %(year)s)"
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, sql, ps_rows, template=tmpl, page_size=500)
+        print(f"  Upserted {len(ps_rows)} player_seasons rows")
+
+    # Return ps_id_map: {player_id: player_season_id} for this season
+    # For players on multiple teams this season, pick the one with the most stats (resolved later);
+    # here we just return the first/only match per player for this season.
+    ps_id_map: dict = {}
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT player_id, id FROM player_seasons WHERE season = %s",
+            (season,)
+        )
+        for player_id, ps_id in cur.fetchall():
+            # If a player transferred mid-season and has two rows, last one wins here.
+            # upsert_season_stats will resolve correctly via the ps lookup.
+            ps_id_map[player_id] = ps_id
+
+    return player_id_map, ps_id_map
 
 
 def upsert_games(games_raw: list, team_id_map: dict, season: int) -> dict:
@@ -258,23 +324,42 @@ def upsert_games(games_raw: list, team_id_map: dict, season: int) -> dict:
         return {row[1]: row[0] for row in cur.fetchall()}
 
 
+def _build_ps_lookup(season: int, team_id_map: dict) -> dict:
+    """Return {(player_id, team_id): player_season_id} for a given season."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT player_id, team_id, id FROM player_seasons WHERE season = %s",
+            (season,)
+        )
+        return {(pid, tid): ps_id for pid, tid, ps_id in cur.fetchall()}
+
+
 def upsert_season_stats(
     player_stats_raw: list,
     ppa_raw: list,
     usage_raw: list,
     awards_raw: list,
     player_id_map: dict,
+    ps_id_map: dict,
     rosters_by_team: dict,
+    team_id_map: dict,
     season: int,
 ) -> None:
     """Build season-aggregate stat rows per player and upsert into stats table."""
-    stat_lookup  = build_stat_lookup(player_stats_raw)
-    ppa_lookup   = build_ppa_lookup(ppa_raw)
-    usage_lookup = build_usage_lookup(usage_raw)
+    import psycopg2.extras
+
+    stat_lookup   = build_stat_lookup(player_stats_raw)
+    ppa_lookup    = build_ppa_lookup(ppa_raw)
+    usage_lookup  = build_usage_lookup(usage_raw)
     awards_lookup = build_awards_lookup(awards_raw)
+
+    # ps_lookup keyed by (player_id, team_id) for precise resolution
+    ps_lookup = _build_ps_lookup(season, team_id_map)
 
     rows = []
     for team_name, players in rosters_by_team.items():
+        team_id = team_id_map.get(team_name.lower())
         for p in players:
             pid = p.get("id")
             try:
@@ -284,46 +369,50 @@ def upsert_season_stats(
             db_id = player_id_map.get(pid_int)
             if not db_id:
                 continue
+
+            # Resolve player_season_id — prefer (player, team) exact match
+            ps_id = ps_lookup.get((db_id, team_id)) or ps_id_map.get(db_id)
+            if not ps_id:
+                continue
+
             first = p.get("firstName", "")
-            last = p.get("lastName", "")
-            stats = find_player_stats(stat_lookup, first, last, team_name)
-            ppa_val = find_player_ppa(ppa_lookup, first, last, team_name)
-            usage = usage_lookup.get(pid_int, {})
+            last  = p.get("lastName", "")
+            stats     = find_player_stats(stat_lookup, first, last, team_name)
+            ppa_val   = find_player_ppa(ppa_lookup, first, last, team_name)
+            usage     = usage_lookup.get(pid_int, {})
             award_tier = awards_lookup.get((f"{first} {last}".lower(), team_name.lower()), 0)
 
             if stats or ppa_val or usage:
                 data = {
                     **stats,
-                    "ppa": ppa_val,
-                    "snap_pct": usage.get("overall", 0),
+                    "ppa":          ppa_val,
+                    "snap_pct":     usage.get("overall", 0),
                     "snap_pct_pass": usage.get("pass", 0),
                     "snap_pct_rush": usage.get("rush", 0),
                     "games_played": usage.get("games", 0),
-                    "award_tier": award_tier,
+                    "award_tier":   award_tier,
                 }
                 rows.append({
-                    "player_id": db_id,
-                    "game_id":   None,
-                    "season":    season,
-                    "stat_type": "season_aggregate",
-                    "data":      json.dumps(data),
+                    "player_season_id": ps_id,
+                    "game_id":          None,
+                    "season":           season,
+                    "stat_type":        "season_aggregate",
+                    "data":             json.dumps(data),
                 })
 
     if rows:
-        # Deduplicate by (player_id, season, stat_type) — transfers can put a player on 2 rosters
         seen: dict = {}
         for r in rows:
-            seen[(r["player_id"], r["season"], r["stat_type"])] = r
+            seen[(r["player_season_id"], r["season"], r["stat_type"])] = r
         rows = list(seen.values())
 
         sql = """
-            INSERT INTO stats (player_id, game_id, season, stat_type, data)
+            INSERT INTO stats (player_season_id, game_id, season, stat_type, data)
             VALUES %s
-            ON CONFLICT (player_id, season, stat_type) WHERE game_id IS NULL
+            ON CONFLICT (player_season_id, season, stat_type) WHERE game_id IS NULL
             DO UPDATE SET data = EXCLUDED.data, updated_at = now()
         """
-        template = "(%(player_id)s, %(game_id)s, %(season)s, %(stat_type)s, %(data)s)"
-        import psycopg2.extras
+        template = "(%(player_season_id)s, %(game_id)s, %(season)s, %(stat_type)s, %(data)s)"
         with get_connection() as conn:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, sql, rows, template=template, page_size=500)
@@ -333,14 +422,20 @@ def upsert_season_stats(
 def upsert_postseason_stats(
     postseason_stats_raw: list,
     player_id_map: dict,
+    ps_id_map: dict,
     rosters_by_team: dict,
+    team_id_map: dict,
     season: int,
 ) -> None:
     """Build postseason-aggregate stat rows and upsert as stat_type='postseason_aggregate'."""
+    import psycopg2.extras
+
     stat_lookup = build_stat_lookup(postseason_stats_raw)
+    ps_lookup   = _build_ps_lookup(season, team_id_map)
 
     rows = []
     for team_name, players in rosters_by_team.items():
+        team_id = team_id_map.get(team_name.lower())
         for p in players:
             pid = p.get("id")
             try:
@@ -350,32 +445,34 @@ def upsert_postseason_stats(
             db_id = player_id_map.get(pid_int)
             if not db_id:
                 continue
+            ps_id = ps_lookup.get((db_id, team_id)) or ps_id_map.get(db_id)
+            if not ps_id:
+                continue
             first = p.get("firstName", "")
-            last = p.get("lastName", "")
+            last  = p.get("lastName", "")
             stats = find_player_stats(stat_lookup, first, last, team_name)
             if stats:
                 rows.append({
-                    "player_id": db_id,
-                    "game_id":   None,
-                    "season":    season,
-                    "stat_type": "postseason_aggregate",
-                    "data":      json.dumps(stats),
+                    "player_season_id": ps_id,
+                    "game_id":          None,
+                    "season":           season,
+                    "stat_type":        "postseason_aggregate",
+                    "data":             json.dumps(stats),
                 })
 
     if rows:
         seen: dict = {}
         for r in rows:
-            seen[(r["player_id"], r["season"], r["stat_type"])] = r
+            seen[(r["player_season_id"], r["season"], r["stat_type"])] = r
         rows = list(seen.values())
 
         sql = """
-            INSERT INTO stats (player_id, game_id, season, stat_type, data)
+            INSERT INTO stats (player_season_id, game_id, season, stat_type, data)
             VALUES %s
-            ON CONFLICT (player_id, season, stat_type) WHERE game_id IS NULL
+            ON CONFLICT (player_season_id, season, stat_type) WHERE game_id IS NULL
             DO UPDATE SET data = EXCLUDED.data, updated_at = now()
         """
-        template = "(%(player_id)s, %(game_id)s, %(season)s, %(stat_type)s, %(data)s)"
-        import psycopg2.extras
+        template = "(%(player_season_id)s, %(game_id)s, %(season)s, %(stat_type)s, %(data)s)"
         with get_connection() as conn:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, sql, rows, template=template, page_size=500)
@@ -448,12 +545,9 @@ def upsert_plays(plays_raw: list, game_id_map: dict, team_id_map: dict, player_i
     name_to_db_id: dict = {}
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT p.id, p.name FROM players p "
-            "INNER JOIN stats s ON s.player_id = p.id "
-            "WHERE s.season = %s AND s.game_id IS NULL LIMIT 50000",
-            (season,)
-        )
+        # Use ALL players in DB (not just those with stats) so defenders
+        # with 0 counting stats can still be attributed on sack/INT plays.
+        cur.execute("SELECT id, name FROM players LIMIT 100000")
         for db_id, name in cur.fetchall():
             name_to_db_id[name.lower()] = db_id
 
@@ -574,10 +668,10 @@ def run_year(api_key: str, season: int) -> None:
     team_id_map = upsert_teams(teams_raw)
     team_names = list(t.get("school") for t in teams_raw if t.get("school"))
 
-    # Rosters
+    # Rosters → players (identity) + player_seasons
     print("Rosters...")
     rosters_by_team = fetch_all_rosters(api_key, team_names, season)
-    player_id_map = upsert_players(rosters_by_team, team_id_map)
+    player_id_map, ps_id_map = upsert_players(rosters_by_team, team_id_map, season)
 
     # Games
     print("Games...")
@@ -587,15 +681,21 @@ def run_year(api_key: str, season: int) -> None:
     # Season stats
     print("Player stats...")
     player_stats_raw = fetch_player_stats(api_key, season)
-    ppa_raw = fetch_ppa(api_key, season)
+    ppa_raw   = fetch_ppa(api_key, season)
     usage_raw = fetch_player_usage(api_key, season)
     awards_raw = fetch_awards(api_key, season)
-    upsert_season_stats(player_stats_raw, ppa_raw, usage_raw, awards_raw, player_id_map, rosters_by_team, season)
+    upsert_season_stats(
+        player_stats_raw, ppa_raw, usage_raw, awards_raw,
+        player_id_map, ps_id_map, rosters_by_team, team_id_map, season,
+    )
 
-    # Postseason stats (bowl/CFP — stored separately, not used in ratings)
+    # Postseason stats (bowl/CFP)
     postseason_stats_raw = fetch_player_stats_postseason(api_key, season)
     if postseason_stats_raw:
-        upsert_postseason_stats(postseason_stats_raw, player_id_map, rosters_by_team, season)
+        upsert_postseason_stats(
+            postseason_stats_raw, player_id_map, ps_id_map,
+            rosters_by_team, team_id_map, season,
+        )
 
     # Transfer portal (raw entries; player linkage done in script 03)
     print("Transfer portal...")

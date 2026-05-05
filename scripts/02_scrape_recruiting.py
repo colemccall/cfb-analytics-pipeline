@@ -158,19 +158,27 @@ def _parse_247_row(row, year: int) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def build_player_name_index() -> dict:
-    """Build {name_lower: [(player_id, team_lower)]} from all players."""
+    """Build {name_lower: [(player_id, team_lower)]} from players + player_seasons.
+
+    A player can appear under multiple teams (one entry per team they've played for).
+    This lets fuzzy_match_player use committed_team as a tiebreaker correctly.
+    """
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT p.id, p.name, t.school
+            SELECT DISTINCT p.id, p.name, t.school
             FROM players p
-            LEFT JOIN teams t ON t.id = p.team_id
+            JOIN player_seasons ps ON ps.player_id = p.id
+            LEFT JOIN teams t ON t.id = ps.team_id
         """)
         index: dict = {}
         for pid, name, school in cur.fetchall():
             key = name.lower().strip()
             team = (school or "").lower()
-            index.setdefault(key, []).append((pid, team))
+            entry = (pid, team)
+            lst = index.setdefault(key, [])
+            if entry not in lst:
+                lst.append(entry)
     return index
 
 
@@ -266,7 +274,7 @@ def upsert_recruiting(recruits: list[dict], player_index: dict, team_index: dict
     rows = list(seen.values())
 
     if rows:
-        bulk_upsert("recruiting", rows, ["player_id", "recruit_year"])
+        bulk_upsert("recruiting", rows, ["player_id", "recruit_year", "source"])
     print(f"  Upserted {len(rows)} recruiting rows ({unmatched} unmatched players)")
 
 
