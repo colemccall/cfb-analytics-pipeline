@@ -274,7 +274,8 @@ def upsert_recruiting(recruits: list[dict], player_index: dict, team_index: dict
     rows = list(seen.values())
 
     if rows:
-        bulk_upsert("recruiting", rows, ["player_id", "recruit_year", "source"])
+        bulk_upsert("recruiting", rows, ["player_id", "recruit_year", "source"],
+                    conflict_where="player_id IS NOT NULL")
     print(f"  Upserted {len(rows)} recruiting rows ({unmatched} unmatched players)")
 
 

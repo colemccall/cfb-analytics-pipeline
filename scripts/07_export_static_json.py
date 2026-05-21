@@ -188,6 +188,39 @@ def export_teams(output_dir: Path, season: int) -> None:
     write_json(output_dir / "teams.json", teams)
 
 
+def export_team_ratings(output_dir: Path, season: int) -> None:
+    """Export team_ratings table rows for the given season to team_ratings.json."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT tr.team_id, tr.season,
+                   tr.overall_rating, tr.offense_rating, tr.defense_rating,
+                   tr.sp_overall, tr.sp_offense, tr.sp_defense,
+                   tr.recruiting_score, tr.avg_starter_rating, tr.sub_ratings,
+                   t.school, t.conference, t.color, t.logo_url
+            FROM team_ratings tr
+            JOIN teams t ON t.id = tr.team_id
+            WHERE tr.season = %s
+            ORDER BY tr.overall_rating DESC NULLS LAST
+        """, (season,))
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    # Convert Decimal to float; parse sub_ratings JSON string
+    import json as _json
+    for r in rows:
+        for k in ("overall_rating", "offense_rating", "defense_rating",
+                  "sp_overall", "sp_offense", "sp_defense",
+                  "recruiting_score", "avg_starter_rating"):
+            if r.get(k) is not None:
+                r[k] = float(r[k])
+        if r.get("sub_ratings") and isinstance(r["sub_ratings"], str):
+            r["sub_ratings"] = _json.loads(r["sub_ratings"])
+
+    write_json(output_dir / "team_ratings.json", rows)
+    print(f"  {len(rows)} team_ratings rows exported")
+
+
 def export_ratings_by_position(output_dir: Path, season: int) -> None:
     """Export top-N players per position group for the ratings dashboard."""
     with get_connection() as conn:
@@ -255,6 +288,146 @@ def export_ratings_by_position(output_dir: Path, season: int) -> None:
     write_json(output_dir / "ratings_by_position.json", by_position)
 
 
+def export_similar_players(output_dir: Path) -> None:
+    """Precompute cosine similarity between player-seasons and export to similar_players.json.
+
+    For each rated player-season with OVR >= 55, finds the top 5 most similar
+    player-seasons across all years using a normalized feature vector per position group.
+    Stored as { player_season_id: [{id, name, season, team, ovr, similarity}] }.
+    Only players with OVR >= 55 are indexed to keep the file size manageable.
+    """
+    import math
+    from collections import defaultdict
+
+    print("  Fetching rated player-seasons for similarity computation...")
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                ps.id            AS player_season_id,
+                ps.player_id,
+                ps.season,
+                ps.position_group,
+                p.name,
+                t.school         AS team,
+                r.overall_rating AS ovr,
+                r.edge_score,
+                r.composite_score,
+                r.trajectory,
+                s.data           AS stat_data
+            FROM ratings r
+            JOIN player_seasons ps ON ps.id = r.player_season_id
+            JOIN players p ON p.id = ps.player_id
+            LEFT JOIN teams t ON t.id = ps.team_id
+            LEFT JOIN stats s ON s.player_season_id = ps.id
+                AND s.game_id IS NULL
+                AND s.stat_type = ps.position_group
+            WHERE r.overall_rating >= 55
+              AND r.engine = 'edge'
+            ORDER BY ps.position_group, r.overall_rating DESC
+        """)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    print(f"  {len(rows)} player-seasons eligible for similarity")
+
+    def _f(stats, key):
+        if not stats:
+            return 0.0
+        v = stats.get(key)
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    CONF_TIER = {"SEC": 1.0, "Big Ten": 1.0, "ACC": 0.9, "Big 12": 0.9,
+                 "Pac-12": 0.85, "Sun Belt": 0.5, "MAC": 0.5, "C-USA": 0.5,
+                 "Mountain West": 0.55, "American": 0.55}
+
+    def make_vector(row: dict) -> list[float]:
+        pg = row["position_group"] or "ATH"
+        sd = row["stat_data"] or {}
+        ovr = float(row["ovr"] or 50)
+        edge = float(row["edge_score"] or 0)
+        conf = CONF_TIER.get(row.get("team") or "", 0.6)
+
+        if pg == "QB":
+            att = max(_f(sd, "passingATT"), 1)
+            return [ovr, edge,
+                    _f(sd, "passingYDS") / att,
+                    (_f(sd, "passingTD") + 1) / (_f(sd, "passingINT") + 1),
+                    _f(sd, "passingCOMPLETIONS") / att,
+                    _f(sd, "rushingYDS"),
+                    float(row.get("composite_score") or 0),
+                    conf]
+        if pg == "RB":
+            car = max(_f(sd, "rushingCAR"), 1)
+            return [ovr, edge, _f(sd, "rushingYDS") / car,
+                    _f(sd, "rushingYDS"), _f(sd, "receivingYDS"),
+                    float(row.get("composite_score") or 0), conf, 0.0]
+        if pg in ("WR", "TE"):
+            rec = max(_f(sd, "receivingREC"), 1)
+            return [ovr, edge, _f(sd, "receivingYDS") / rec,
+                    _f(sd, "receivingYDS"), _f(sd, "receivingTD"),
+                    float(row.get("composite_score") or 0), conf, 0.0]
+        # Default for defensive / other
+        return [ovr, edge, float(row.get("composite_score") or 0),
+                float(row.get("trajectory") or 0), conf, 0.0, 0.0, 0.0]
+
+    # Group by position group
+    by_pos: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_pos[row["position_group"] or "ATH"].append(row)
+
+    similar: dict[int, list[dict]] = {}
+
+    for pg, group in by_pos.items():
+        if len(group) < 2:
+            continue
+
+        vectors = [make_vector(r) for r in group]
+        dim = max(len(v) for v in vectors)
+        # Pad short vectors
+        vectors = [v + [0.0] * (dim - len(v)) for v in vectors]
+        arr = [v[:] for v in vectors]
+
+        # Normalize each dimension to [0, 1] within position group
+        for d in range(dim):
+            col = [arr[i][d] for i in range(len(arr))]
+            mn, mx = min(col), max(col)
+            rng = mx - mn
+            for i in range(len(arr)):
+                arr[i][d] = (arr[i][d] - mn) / rng if rng > 0 else 0.0
+
+        def cosine(a, b):
+            dot = sum(x * y for x, y in zip(a, b))
+            na  = math.sqrt(sum(x * x for x in a))
+            nb  = math.sqrt(sum(x * x for x in b))
+            return dot / (na * nb) if na * nb > 0 else 0.0
+
+        for i, row in enumerate(group):
+            sims = []
+            for j, other in enumerate(group):
+                if i == j:
+                    continue
+                s = cosine(arr[i], arr[j])
+                sims.append({
+                    "id":         other["player_id"],
+                    "ps_id":      other["player_season_id"],
+                    "name":       other["name"],
+                    "season":     other["season"],
+                    "team":       other["team"],
+                    "ovr":        round(float(other["ovr"]), 1),
+                    "similarity": round(s, 3),
+                })
+            sims.sort(key=lambda x: x["similarity"], reverse=True)
+            similar[row["player_season_id"]] = sims[:5]
+
+    write_json(output_dir / "similar_players.json", similar)
+    print(f"  {len(similar)} player-seasons with similarity data")
+
+
 def export_research(output_dir: Path) -> None:
     """Export any precomputed research findings from research_cache table."""
     with get_connection() as conn:
@@ -296,8 +469,14 @@ def main():
     print("teams.json...")
     export_teams(output_dir, season)
 
+    print("team_ratings.json...")
+    export_team_ratings(output_dir, season)
+
     print("ratings_by_position.json...")
     export_ratings_by_position(output_dir, season)
+
+    print("similar_players.json...")
+    export_similar_players(output_dir)
 
     print("research/*.json...")
     export_research(output_dir)

@@ -317,3 +317,50 @@ CREATE POLICY "Public read plays"       ON plays           FOR SELECT USING (tru
 CREATE POLICY "Public read edge"        ON player_edge     FOR SELECT USING (true);
 CREATE POLICY "Public read research"    ON research_cache  FOR SELECT USING (true);
 CREATE POLICY "Public read ea_ratings"  ON ea_ratings      FOR SELECT USING (true);
+
+-- ============================================================
+-- MIGRATION: v4.0 → v5.0
+-- Run in Supabase SQL Editor after initial schema is applied.
+-- ============================================================
+
+-- 14. Add player_season_id to ratings (v2 schema)
+-- player_seasons was added in the v1→v2 migration; ratings now reference it.
+ALTER TABLE ratings ADD COLUMN IF NOT EXISTS player_season_id INTEGER REFERENCES player_seasons(id);
+ALTER TABLE ratings ADD COLUMN IF NOT EXISTS composite_score NUMERIC(8,6);
+ALTER TABLE ratings ADD COLUMN IF NOT EXISTS stars NUMERIC(3,1);
+ALTER TABLE ratings ADD COLUMN IF NOT EXISTS edge_score NUMERIC(8,4);
+ALTER TABLE ratings ADD COLUMN IF NOT EXISTS breakout_prob NUMERIC(5,4);
+ALTER TABLE ratings ADD COLUMN IF NOT EXISTS trajectory NUMERIC(6,2);
+
+-- 15. Multi-engine support: add engine column to ratings
+ALTER TABLE ratings ADD COLUMN IF NOT EXISTS engine TEXT NOT NULL DEFAULT 'edge';
+
+-- Update unique constraint to include engine (allows same player+season under different engines)
+ALTER TABLE ratings DROP CONSTRAINT IF EXISTS ratings_player_id_season_key;
+ALTER TABLE ratings DROP CONSTRAINT IF EXISTS ratings_player_season_id_season_key;
+ALTER TABLE ratings ADD CONSTRAINT ratings_player_season_engine_key
+    UNIQUE (player_season_id, season, engine);
+
+CREATE INDEX IF NOT EXISTS idx_ratings_engine ON ratings(engine, season);
+
+-- 16. team_ratings table (populated by scripts/10_compute_team_ratings.py)
+CREATE TABLE IF NOT EXISTS team_ratings (
+    id              SERIAL PRIMARY KEY,
+    team_id         INTEGER REFERENCES teams(id),
+    season          INTEGER NOT NULL,
+    overall_rating  NUMERIC(5,2),
+    pass_off        NUMERIC(5,2),
+    run_off         NUMERIC(5,2),
+    pass_def        NUMERIC(5,2),
+    run_def         NUMERIC(5,2),
+    special_teams   NUMERIC(5,2),
+    sp_plus         NUMERIC(6,2),
+    recruit_score   NUMERIC(6,2),
+    generated_at    TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(team_id, season)
+);
+
+CREATE INDEX IF NOT EXISTS idx_team_ratings_season ON team_ratings(season, overall_rating DESC);
+
+ALTER TABLE team_ratings ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Public read team_ratings" ON team_ratings FOR SELECT USING (true);

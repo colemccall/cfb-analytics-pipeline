@@ -216,3 +216,26 @@ def fetch_sp_ratings_all(api_key: str, year: int) -> dict:
         if team:
             result[team] = float(rating)
     return result
+
+
+def fetch_sp_ratings_breakdown(api_key: str, year: int) -> dict:
+    """Return {team_lower: {overall, offense, defense}} SP+ ratings for a year.
+
+    Used by EDGE: defenders are quality-adjusted by opp's *offensive* SP+,
+    offensive players by opp's *defensive* SP+. Overall is a fallback.
+    """
+    raw = fetch_sp_ratings(api_key, year)
+    result: dict = {}
+    for r in raw:
+        team = (r.get("team") or "").lower()
+        if not team:
+            continue
+        overall = r.get("rating") or r.get("sp") or 0
+        off = (r.get("offense") or {}).get("rating", 0)
+        deff = (r.get("defense") or {}).get("rating", 0)
+        result[team] = {
+            "overall": float(overall or 0),
+            "offense": float(off or 0),
+            "defense": float(deff or 0),
+        }
+    return result

@@ -264,7 +264,8 @@ def upsert_transfers(entries: list[dict], player_index: dict, team_index: dict) 
     rows = list(seen.values())
 
     if rows:
-        bulk_upsert("transfers", rows, ["player_id", "transfer_year", "from_team_id"])
+        bulk_upsert("transfers", rows, ["player_id", "transfer_year", "from_team_id"],
+                    conflict_where="player_id IS NOT NULL AND from_team_id IS NOT NULL")
     print(f"  Upserted {len(rows)} transfers ({unmatched} unmatched players)")
 
 

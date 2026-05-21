@@ -30,22 +30,43 @@ from utils.api_client import (
     fetch_games,
     fetch_all_game_player_stats,
     fetch_transfer_portal,
-    fetch_plays,
 )
 from utils.db import bulk_upsert, get_connection
 
-SEASONS_PRIMARY    = list(range(2021, 2026))   # 2021–2025
-SEASONS_HISTORICAL = list(range(2005, 2021))   # 2005–2020 backfill
+SEASONS_PRIMARY    = list(range(2021, 2026))   # 2021–2025 (default run)
+SEASONS_HISTORICAL = list(range(2008, 2021))   # 2008–2020 backfill (--historical flag)
 
 # Position group normalization (raw API position → canonical group)
+# v2.0: 12 groups + DB. EDGE split from LB/DL. CB and S split from known DB subtypes.
+# Generic "DB" stays as DB — unknown alignment (may be corner, safety, or nickel).
+# Rationale lives in docs/AUDIT_FINDINGS.md.
 POSITION_GROUP_MAP = {
-    "QB": "QB", "RB": "RB", "FB": "RB",
-    "WR": "WR", "TE": "TE",
-    "OL": "OL", "OT": "OL", "OG": "OL", "C": "OL",
-    "DL": "DL", "DE": "DL", "DT": "DL", "NT": "DL",
-    "LB": "LB", "ILB": "LB", "OLB": "LB",
-    "DB": "DB", "CB": "DB", "S": "DB", "SAF": "DB", "FS": "DB", "SS": "DB",
-    "K": "K", "P": "P", "LS": "LS",
+    # Offense
+    "QB":  "QB",
+    "RB":  "RB",  "HB":  "RB",  "FB":  "RB",
+    "WR":  "WR",  "FL":  "WR",  "SE":  "WR",
+    "TE":  "TE",  "H":   "TE",
+    "OL":  "OL",  "OT":  "OL",  "OG":  "OL",
+    "G":   "OL",  "T":   "OL",  "C":   "OL",
+    "LT":  "OL",  "RT":  "OL",  "LG":  "OL",  "RG":  "OL",
+    "LS":  "OL",  # long snapper — special teams blocking unit
+    # Edge rushers (modern OLB/DE)
+    "EDGE": "EDGE",
+    "OLB":  "EDGE",
+    "DE":   "EDGE",
+    # Interior defensive line
+    "DL":  "DL",   "DT":  "DL",
+    "NT":  "DL",   "NG":  "DL",
+    # Interior linebackers
+    "LB":  "LB",   "ILB": "LB",  "MLB": "LB",
+    # Defensive backs — known subtypes get specific groups; generic DB stays as DB
+    "CB":  "CB",   "NB":  "CB",
+    "DB":  "DB",   # unknown alignment — blended CB/S formula
+    "S":   "S",    "FS":  "S",   "SS":  "S",   "SAF": "S",
+    # Specialists
+    "K":   "K",    "PK":  "K",
+    "P":   "P",
+    # Catch-all
     "ATH": "ATH",
 }
 
@@ -409,7 +430,8 @@ def upsert_season_stats(
         sql = """
             INSERT INTO stats (player_season_id, game_id, season, stat_type, data)
             VALUES %s
-            ON CONFLICT (player_season_id, season, stat_type) WHERE game_id IS NULL
+            ON CONFLICT (player_season_id, season, stat_type)
+                WHERE game_id IS NULL AND player_season_id IS NOT NULL
             DO UPDATE SET data = EXCLUDED.data, updated_at = now()
         """
         template = "(%(player_season_id)s, %(game_id)s, %(season)s, %(stat_type)s, %(data)s)"
@@ -469,7 +491,8 @@ def upsert_postseason_stats(
         sql = """
             INSERT INTO stats (player_season_id, game_id, season, stat_type, data)
             VALUES %s
-            ON CONFLICT (player_season_id, season, stat_type) WHERE game_id IS NULL
+            ON CONFLICT (player_season_id, season, stat_type)
+                WHERE game_id IS NULL AND player_season_id IS NOT NULL
             DO UPDATE SET data = EXCLUDED.data, updated_at = now()
         """
         template = "(%(player_season_id)s, %(game_id)s, %(season)s, %(stat_type)s, %(data)s)"
@@ -477,6 +500,97 @@ def upsert_postseason_stats(
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, sql, rows, template=template, page_size=500)
         print(f"  Upserted {len(rows)} postseason-aggregate stat rows")
+
+
+def upsert_game_stats(
+    game_stats_raw: list,
+    player_id_map: dict,
+    team_id_map: dict,
+    game_id_map: dict,
+    season: int,
+) -> None:
+    """Flatten /games/players response and upsert as stat_type='game_aggregate'.
+
+    Per-game stats power per-game opponent-adjusted EDGE in script 08.
+    Each row: (player_season_id, game_id, season, 'game_aggregate', JSONB).
+    """
+    import psycopg2.extras
+
+    ps_lookup = _build_ps_lookup(season, team_id_map)
+
+    # Flatten nested structure: game → team → categories → types → athletes
+    # Build {(api_player_id, game_id_api, team_id): {stat_name: value}}
+    rows_dict: dict = {}
+    for game in game_stats_raw:
+        gid_api = game.get("id")
+        gid_db = game_id_map.get(gid_api)
+        if not gid_db:
+            continue
+        for team_block in game.get("teams", []):
+            # API uses "team" key (not "school") in /games/players response
+            school = team_block.get("team") or team_block.get("school", "")
+            tid = team_id_map.get(school.lower())
+            if not tid:
+                continue
+            for cat in team_block.get("categories", []):
+                cat_name = cat.get("name", "")
+                for stype in cat.get("types", []):
+                    stat_label = stype.get("name", "")
+                    # Build canonical stat name matching season_aggregate keys
+                    # e.g. category=passing, type=YDS → passingYDS
+                    stat_key = f"{cat_name}{stat_label}"
+                    for ath in stype.get("athletes", []):
+                        api_pid = ath.get("id")
+                        try:
+                            api_pid_int = int(api_pid) if api_pid is not None else None
+                        except (ValueError, TypeError):
+                            api_pid_int = None
+                        if api_pid_int is None:
+                            continue
+                        db_id = player_id_map.get(api_pid_int)
+                        if not db_id:
+                            continue
+                        ps_id = ps_lookup.get((db_id, tid))
+                        if not ps_id:
+                            continue
+                        key = (ps_id, gid_db)
+                        if key not in rows_dict:
+                            rows_dict[key] = {}
+                        rows_dict[key][stat_key] = ath.get("stat", 0)
+
+    rows = [
+        {
+            "player_season_id": ps_id,
+            "game_id":          gid,
+            "season":           season,
+            "stat_type":        "game_aggregate",
+            "data":             json.dumps(stats),
+        }
+        for (ps_id, gid), stats in rows_dict.items()
+        if stats
+    ]
+    if not rows:
+        print("  No game-aggregate stat rows to upsert")
+        return
+
+    # Dedup by partial-index key
+    seen: dict = {}
+    for r in rows:
+        seen[(r["player_season_id"], r["game_id"], r["season"], r["stat_type"])] = r
+    rows = list(seen.values())
+
+    sql = """
+        INSERT INTO stats (player_season_id, game_id, season, stat_type, data)
+        VALUES %s
+        ON CONFLICT (player_season_id, game_id, season, stat_type)
+            WHERE game_id IS NOT NULL AND player_season_id IS NOT NULL
+        DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+    """
+    template = "(%(player_season_id)s, %(game_id)s, %(season)s, %(stat_type)s, %(data)s)"
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, rows, template=template, page_size=500)
+    print(f"  Upserted {len(rows)} game-aggregate stat rows")
 
 
 def _parse_clock(clock_str) -> int | None:
@@ -697,15 +811,18 @@ def run_year(api_key: str, season: int) -> None:
             rosters_by_team, team_id_map, season,
         )
 
+    # Per-game player stats (powers per-game opp-adj EDGE in script 08)
+    print("Per-game player stats...")
+    game_stats_raw = fetch_all_game_player_stats(api_key, team_names, season)
+    if game_stats_raw:
+        upsert_game_stats(
+            game_stats_raw, player_id_map, team_id_map, game_id_map, season,
+        )
+
     # Transfer portal (raw entries; player linkage done in script 03)
     print("Transfer portal...")
     portal_raw = fetch_transfer_portal(api_key, season)
     upsert_transfers(portal_raw, player_id_map, team_id_map, season)
-
-    # Play-by-play (large — ~40k plays/season; feeds EDGE computation in script 08)
-    print("Play-by-play...")
-    plays_raw = fetch_plays(api_key, season)
-    upsert_plays(plays_raw, game_id_map, team_id_map, player_id_map, season)
 
     print(f"Season {season} complete.")
 

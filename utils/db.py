@@ -45,8 +45,17 @@ def get_connection():
         conn.close()
 
 
-def bulk_upsert(table: str, rows: list[dict], conflict_col: str | list[str]) -> int:
-    """Insert rows, updating on conflict. Returns number of rows affected."""
+def bulk_upsert(
+    table: str,
+    rows: list[dict],
+    conflict_col: str | list[str],
+    conflict_where: str | None = None,
+) -> int:
+    """Insert rows, updating on conflict. Returns number of rows affected.
+
+    conflict_where: optional WHERE clause for partial unique indexes, e.g.
+        "player_season_id IS NOT NULL"
+    """
     if not rows:
         return 0
 
@@ -57,12 +66,13 @@ def bulk_upsert(table: str, rows: list[dict], conflict_col: str | list[str]) -> 
     col_str = ", ".join(cols)
     placeholder = "(" + ", ".join(f"%({c})s" for c in cols) + ")"
     conflict_str = ", ".join(conflict_cols)
+    where_clause = f" WHERE {conflict_where}" if conflict_where else ""
 
     if update_cols:
         update_str = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
-        on_conflict = f"ON CONFLICT ({conflict_str}) DO UPDATE SET {update_str}"
+        on_conflict = f"ON CONFLICT ({conflict_str}){where_clause} DO UPDATE SET {update_str}"
     else:
-        on_conflict = f"ON CONFLICT ({conflict_str}) DO NOTHING"
+        on_conflict = f"ON CONFLICT ({conflict_str}){where_clause} DO NOTHING"
 
     sql = f"INSERT INTO {table} ({col_str}) VALUES %s {on_conflict}"
 

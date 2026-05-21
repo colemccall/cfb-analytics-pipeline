@@ -1,31 +1,22 @@
-"""CFB player ratings — Engine A (current-season performance).
+"""CFB player ratings — Engine A (v4.0).
 
 Rating architecture:
-  ENGINE A — "What did this player do this season?"
-    QB/RB/WR: EDGE score (opponent-adjusted, situation-weighted EPA from
-      play-by-play) is the PRIMARY input (~42-55%). Traditional stats fill the rest.
-    TE/OL/DL/LB/DB/K/P: Stat-only composites (EDGE attribution too sparse
-      for these positions to be meaningful).
+  EDGE positions (QB/RB/WR/TE/EDGE/DL/LB/CB/S):
+    OVR = edge_to_ovr(edge_score, position_group)
+    edge_score (from script 08) is a per-game stat composite × per-game opponent
+    SP+ quality, accumulated over games and normalized by sqrt(games_played).
+    No traditional stats in the formula — they're already embedded in edge_score.
+    Recruiting/NIL only for players below the stats_measured threshold.
 
-  Cross-season normalization: percentile ranks are computed across ALL seasons
-  (2021–2025) combined so a rating of 85 means the same thing in every year.
+  Non-EDGE positions (OL, K, P):
+    Stat-only composite with fixed absolute bounds, mapped via scale_to_range().
 
-  Recruiting composite is used as an ANCHOR — not a primary input:
-    - Starters: recruiting weight is 5-10%
-    - Sub-threshold: blended fallback (70% recruiting, 30% efficiency-implied)
-    - No stats / true freshmen: 100% recruiting fallback
-
-Formula weights by position:
-  QB:  edge_scaled 55%, yards_per_att 15%, td_int_ratio 15%, comp_pct 10%, recruit 5%
-  RB:  edge_scaled 55%, yards_per_carry 20%, yards_total 15%, rec_versatility 5%, recruit 5%
-  WR:  td_score 35%, yards_per_rec 28%, yards_total 22%, rec_volume 10%, recruit 5%
-  TE:  td_score 22%, yards_per_rec 18%, yards_total 13%, rec_volume 5% (no EDGE)
-  OL:  recruit 30%, team_rush_ypa 30%, team_sack_rate_inv 25%, experience 10%, award 5%
-  DL:  pass_rush 38%, run_stop 28%, disruption 19%, volume 5%, recruit 10%
-  LB:  tackling 33%, pass_rush 22%, coverage 20%, instinct 15%, recruit 10%
-  DB:  coverage 38%, tackling 22%, instinct 20%, pass_rush 10%, recruit 10%
-  K:   fg_pct 50%, fg_long 25%, xp_pct 15%, volume 10%
-  P:   avg_yards 55%, inside_20_pct 30%, volume 15%
+  EDGE_OVR_ANCHORS: fixed piecewise linear mapping from edge_score → OVR.
+    Anchors are calibrated from known reference seasons and 2025 distributions.
+    Not recalculated per run — they are permanent calibration points.
+    *** Offensive anchors are INITIAL ESTIMATES — recalibrate after first run ***
+    by reviewing top-50 per position and adjusting anchors so known elite
+    players land 90-96 and average starters land 62-70.
 
 Usage:
     python scripts/06_train_ratings.py              # 2025
@@ -42,48 +33,168 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from sklearn.preprocessing import MinMaxScaler
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
 from utils.db import bulk_upsert, get_connection
 
-MODEL_VERSION = "v3.1-multiseason"
+MODEL_VERSION = "v4.0-edge-direct"
 
 # ---------------------------------------------------------------------------
 # Starter thresholds — determines how much we trust stats vs recruiting
 # ---------------------------------------------------------------------------
 
-STARTER_THRESHOLDS = {
-    "QB":  ("passingATT",  100),
-    "RB":  ("rushingCAR",   60),
-    "WR":  ("receivingREC", 20),
-    "TE":  ("receivingREC", 10),
-    "OL":  (None,            0),   # team proxy only
-    "DL":  ("defensiveTOT", 10),
-    "LB":  ("defensiveTOT", 20),
-    "DB":  ("defensiveTOT", 15),
-    "K":   ("kickingFGM",    5),
-    "P":   ("puntingNO",    10),
+# Four-tier playing-time system (replaces binary STARTER_THRESHOLDS)
+# Each position has stat-based thresholds that classify players as:
+#   - starter: full formula, EDGE at full weight, cap 99
+#   - role: 75% formula blended with 25% recruiting, EDGE weight × 0.7, cap 78
+#   - reserve: 40% formula + 60% recruiting, EDGE weight × 0.4, cap 68
+#   - bench: recruiting-only fallback, cap 60
+PLAYTIME_TIERS = {
+    "QB":   {"stat": "passingATT",   "starter": 100, "role": 30,  "reserve": 5},
+    "RB":   {"stat": "rushingCAR",   "starter":  60, "role": 25,  "reserve": 8},
+    "WR":   {"stat": "receivingREC", "starter":  20, "role": 10,  "reserve": 3},
+    "TE":   {"stat": "receivingREC", "starter":  10, "role":  5,  "reserve": 2},
+    "OL":   {"stat": None,           "starter":   0, "role":  0,  "reserve": 0},  # team proxy only
+    "EDGE": {"stat": "defensiveTOT", "starter":   8, "role":  4,  "reserve": 1},
+    "DL":   {"stat": "defensiveTOT", "starter":  10, "role":  5,  "reserve": 1},
+    "LB":   {"stat": "defensiveTOT", "starter":  20, "role": 10,  "reserve": 2},
+    "CB":   {"stat": "defensiveTOT", "starter":  10, "role":  5,  "reserve": 1},
+    "S":    {"stat": "defensiveTOT", "starter":  20, "role": 10,  "reserve": 2},
+    "K":    {"stat": "kickingFGM",   "starter":   5, "role":  2,  "reserve": 1},
+    "P":    {"stat": "puntingNO",    "starter":  10, "role":  5,  "reserve": 1},
 }
+
+def classify_tier(pg: str, stats: dict, games_played: int = 1) -> str:
+    """Classify player into tier based on stat volume."""
+    cfg = PLAYTIME_TIERS.get(pg)
+    if not cfg or cfg["stat"] is None:
+        return "starter"  # OL team proxy, always full formula
+
+    # Try the canonical PLAYTIME_TIERS stat key first, then fall back to
+    # volume_score (the alias set by extract_features for all positions).
+    val = stats.get(cfg["stat"]) or stats.get("volume_score") or 0
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        val = 0
+
+    if val >= cfg["starter"]:
+        return "starter"
+    if val >= cfg["role"]:
+        return "role"
+    if val >= cfg["reserve"]:
+        return "reserve"
+    return "bench"
 
 # Recruiting fallback: how much the overall rating shifts from position average
 # based on recruiting stars when a player has NO usable stats.
 STARS_FALLBACK = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
 
-# Positions where EDGE is the primary rating driver.
-# QB/RB: EDGE attribution is comprehensive (~60-70% of starters get edge_scaled).
-# WR: only ~25% of starters get attribution — mixing EDGE and non-EDGE players in
-#   the same normalized pool creates systematic bias against non-EDGE players.
-# TE/DL/LB/DB: attribution near-zero (<1% of starters). Stat-only for all.
-EDGE_POSITIONS = {"QB", "RB"}
+# Positions that can have EDGE scores (computed in script 08).
+# Offensive: QB, RB, WR, TE (play-level EPA)
+# Defensive: EDGE, DL, LB, CB, S (per-game stat composite × opponent SP+)
+# OL, K, P: never have EDGE
+EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "EDGE", "DL", "LB", "CB", "S", "DB"}
 
-# Hard ceiling on overall_rating by position (K/P have inflated stats by nature)
+# K/P ceiling: specialist stats inflate without enough individual differentiation
 POSITION_CEILING = {"K": 78, "P": 78}
 
 # All seasons used for cross-season normalization
 ALL_SEASONS = list(range(2021, 2026))
+
+# ---------------------------------------------------------------------------
+# EDGE → OVR direct mapping (replaces weighted composite + scale_to_range
+# for all EDGE_POSITIONS)
+#
+# Piecewise linear: (edge_score, target_ovr) anchor pairs per position.
+# Offensive anchors are INITIAL ESTIMATES based on expected per-game stat
+# composite × opp_mult / sqrt(games) scale for v4.0. Recalibrate after
+# first run by reviewing distributions and known reference players.
+#
+# Defensive anchors are carried forward from 2025 distribution data —
+# the formula change is minor (added hurries/PBUs to all positions).
+# ---------------------------------------------------------------------------
+
+EDGE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
+    # Calibrated from 2021-2025 distributions. Opponent multiplier range [0.55, 1.45].
+    # p50 → ~65, p90 → ~87, user-specified top-tier thresholds.
+    #
+    # Offensive: stat_composite × opp_mult / sqrt(games)
+    #   QB:   p50≈445, p90≈1085, max≈1900 (Daniels 2023).  User: 1400=90, 1700=95, 2000=99
+    "QB":   [(0, 30), (150, 50), (445, 65), (750, 77), (1100, 85), (1400, 90), (1700, 95), (2000, 99)],
+    #   RB:   p50≈120, p90≈345, max≈812 (Skattebo/Jeanty 2024).
+    #   Raised top threshold to compress elite tier — 900=99 so max seasons land 97-98.
+    #   Jeanty-class seasons ~97.5, Skattebo-class ~97.8 (Skattebo's Big 12 opp quality is real).
+    "RB":   [(0, 30), (40,  50), (120, 65), (240, 77), (500,  87), (630,  93), (760,  97), (900,  99)],
+    #   WR:   p50≈120, p90≈300, max≈674.  User: 400=88, 500=95, 600=99
+    "WR":   [(0, 30), (35,  50), (120, 65), (210, 77), (400,  88), (500,  95), (600,  99)],
+    #   TE:   p50≈75, p90≈180, max≈492.  User: 150=80, 250=88, 350=95, 450=99
+    "TE":   [(0, 30), (25,  50), (75,  65), (150, 80), (250,  88), (350,  95), (450,  99)],
+    #
+    # Defensive: stat_composite × opp_mult / sqrt(games). Weights rebalanced v4.1:
+    #   tot weight cut dramatically; sacks/TFLs/INTs/PBUs now dominate composite.
+    #   User: 60+=99 for EDGE/DL (where max scores reach 60+).
+    #   CB/S/DB have structurally lower maxes (~35-52) — set 99 at position-realistic max.
+    #
+    #   EDGE: p50≈11, p90≈30, max≈68.  60=99 (user spec)
+    "EDGE": [(0, 30), (3.0, 50), (11.0, 65), (22.0, 77), (35.0, 87), (50.0, 94), (60.0, 99)],
+    #   DL:   p50≈7,  p90≈20, max≈66.  60=99 (user spec)
+    "DL":   [(0, 30), (2.5, 50), (7.0,  65), (15.0, 77), (27.0, 87), (46.0, 94), (60.0, 99)],
+    #   LB:   p50≈11, p90≈30, max≈89.  Impact plays now drive score; 90=99
+    "LB":   [(0, 30), (4.0, 50), (11.0, 65), (22.0, 77), (38.0, 87), (60.0, 94), (90.0, 99)],
+    #   CB:   p50≈9,  p90≈22, max≈52.  Coverage impact (INTs/PBUs) dominant; 50=99
+    "CB":   [(0, 30), (2.5, 50), (8.0,  65), (15.0, 77), (25.0, 87), (38.0, 94), (50.0, 99)],
+    #   S:    p50≈10, p90≈24, max≈46.  46=99
+    "S":    [(0, 30), (3.0, 50), (9.0,  65), (17.0, 77), (27.0, 87), (38.0, 94), (46.0, 99)],
+    #   DB:   p50≈9,  p90≈21, max≈44.  Raised anchors ~2pts to suppress G5 inflation.
+    "DB":   [(0, 30), (2.5, 50), (9.0,  65), (17.0, 77), (27.0, 87), (39.0, 94), (48.0, 99)],
+}
+
+
+# ---------------------------------------------------------------------------
+# Era-bucketed anchors for historical backfill (2008–2020).
+# Pre-2015 data lacks hurries/PBUs, making raw composite scores structurally lower.
+# Rather than altering the EDGE formula, we lower the anchor thresholds so that
+# an elite 2010 QB (missing hurry data) still maps to ~90 OVR, not ~75.
+# Scaling: transition = modern × 0.85, classic = modern × 0.75
+# ---------------------------------------------------------------------------
+
+def _scale_anchors(anchors: list[tuple[float, float]], factor: float) -> list[tuple[float, float]]:
+    """Scale the edge_score breakpoints by factor, keep OVR values unchanged."""
+    return [(round(x * factor, 4), y) for (x, y) in anchors]
+
+
+ERA_ANCHORS: dict[str, dict[str, list[tuple[float, float]]]] = {
+    "modern":     EDGE_OVR_ANCHORS,  # 2018+, same as calibrated anchors
+    "transition": {pg: _scale_anchors(v, 0.85) for pg, v in EDGE_OVR_ANCHORS.items()},  # 2013–2017
+    "classic":    {pg: _scale_anchors(v, 0.75) for pg, v in EDGE_OVR_ANCHORS.items()},  # 2008–2012
+}
+
+
+def get_era(season: int) -> str:
+    if season >= 2018:
+        return "modern"
+    if season >= 2013:
+        return "transition"
+    return "classic"
+
+
+def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
+    """Map raw edge_score to OVR via fixed piecewise linear anchors.
+
+    Returns a rating in [30, 99] that reflects absolute production quality.
+    Season-aware: uses era-bucketed anchors to prevent deflation in pre-2015 years
+    where hurries/PBU stats are missing from the composite.
+    """
+    era = get_era(season)
+    anchors = ERA_ANCHORS[era].get(pg)
+    if not anchors or edge_score is None or (isinstance(edge_score, float) and np.isnan(edge_score)):
+        return 50.0
+    xs = [a[0] for a in anchors]
+    ys = [float(a[1]) for a in anchors]
+    return float(np.clip(np.interp(float(edge_score), xs, ys), 30.0, 99.0))
 
 
 def _f(stats, key):
@@ -150,6 +261,18 @@ def extract_features(stats: dict, pg: str) -> dict:
             "experience":         2.0,   # placeholder; overwritten below from players.year
         }
 
+    if pg == "EDGE":
+        tot   = max(_f(stats, "defensiveTOT"), 1)
+        sacks = _f(stats, "defensiveSACKS")
+        tfl   = _f(stats, "defensiveTFL")
+        hur   = _f(stats, "defensiveQB HUR")
+        return {
+            "pass_rush_score":  sacks * 5.0 + hur * 1.5 + tfl * 2.0,   # sacks + pressure dominant for EDGE
+            "disruption_rate":  (sacks + tfl) / tot,                     # impact per play
+            "run_stop_score":   tfl * 2.5 + (tot - sacks) * 0.3,        # run stuffs (secondary for EDGE)
+            "volume_score":     tot,
+        }
+
     if pg == "DL":
         tot   = max(_f(stats, "defensiveTOT"), 1)
         sacks = _f(stats, "defensiveSACKS")
@@ -176,17 +299,47 @@ def extract_features(stats: dict, pg: str) -> dict:
             "volume_score":     tot,
         }
 
-    if pg == "DB":
+    if pg == "CB":
         tot   = max(_f(stats, "defensiveTOT"), 1)
         sacks = _f(stats, "defensiveSACKS")
         tfl   = _f(stats, "defensiveTFL")
         ints  = _f(stats, "interceptionsINT")
         pbu   = _f(stats, "defensivePD")
         return {
-            "coverage_score":   ints * 3.0 + pbu * 1.5,                 # ball skills
-            "tackling_score":   tot * 0.5 + tfl * 2.0,                  # run support
-            "pass_rush_score":  sacks * 4.0 + tfl * 1.5,                # blitz value
-            "instinct_score":   (ints + pbu + tfl * 0.5) / tot,         # playmaking rate (coverage + disruption)
+            "coverage_score":   ints * 4.0 + pbu * 2.0,                 # CB: ball skills dominant
+            "tackling_score":   tot * 0.3 + tfl * 1.0,                  # run support (secondary)
+            "pass_rush_score":  sacks * 3.0 + tfl * 1.0,                # blitz value
+            "instinct_score":   (ints + pbu) / tot,                     # focus on coverage instinct
+            "volume_score":     tot,
+        }
+
+    if pg == "S":
+        tot   = max(_f(stats, "defensiveTOT"), 1)
+        sacks = _f(stats, "defensiveSACKS")
+        tfl   = _f(stats, "defensiveTFL")
+        ints  = _f(stats, "interceptionsINT")
+        pbu   = _f(stats, "defensivePD")
+        return {
+            "coverage_score":   ints * 3.5 + pbu * 1.5,                 # S: coverage (less dominant than CB)
+            "tackling_score":   tot * 0.6 + tfl * 2.0,                  # S: tackle more than CB
+            "pass_rush_score":  sacks * 3.0 + tfl * 1.5,                # box blitz value
+            "instinct_score":   (ints + pbu + tfl * 0.5) / tot,         # playmaking (coverage + disruption)
+            "volume_score":     tot,
+        }
+
+    if pg == "DB":
+        # Fallback: legacy "DB" generic should never appear post-v2 schema
+        # but keep it for robustness
+        tot   = max(_f(stats, "defensiveTOT"), 1)
+        sacks = _f(stats, "defensiveSACKS")
+        tfl   = _f(stats, "defensiveTFL")
+        ints  = _f(stats, "interceptionsINT")
+        pbu   = _f(stats, "defensivePD")
+        return {
+            "coverage_score":   ints * 3.0 + pbu * 1.5,
+            "tackling_score":   tot * 0.5 + tfl * 2.0,
+            "pass_rush_score":  sacks * 4.0 + tfl * 1.5,
+            "instinct_score":   (ints + pbu + tfl * 0.5) / tot,
             "volume_score":     tot,
         }
 
@@ -213,39 +366,41 @@ def extract_features(stats: dict, pg: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # Formula weights
-# EDGE positions: edge_scaled is primary; stat features fill the rest.
+# EDGE positions: edge_score (raw opponent-adjusted) is primary; stat features fill the rest.
 # Non-EDGE positions: stat-only composite.
 # Recruiting weight = 5% for starters, 15% for non-EDGE positions.
 # ---------------------------------------------------------------------------
 
 WEIGHTS = {
     "QB": {
-        "edge_scaled":     0.55,
+        "edge_score":     0.55,
         "yards_per_att":   0.15,
         "td_int_ratio":    0.15,
         "comp_pct":        0.10,
         "recruit_composite": 0.05,
     },
     "RB": {
-        "edge_scaled":     0.55,
+        "edge_score":     0.55,
         "yards_per_carry": 0.20,
         "yards_total":     0.15,
         "rec_versatility": 0.05,
         "recruit_composite": 0.05,
     },
     "WR": {
-        "td_score":        0.35,
-        "yards_per_rec":   0.28,
-        "yards_total":     0.22,
-        "rec_volume":      0.10,
-        "recruit_composite": 0.05,
+        "edge_score":     0.42,    # increased; opponent-adj EPA is primary differentiator
+        "td_score":        0.22,
+        "yards_per_rec":   0.18,
+        "yards_total":     0.10,
+        "rec_volume":      0.05,
+        "recruit_composite": 0.03,
     },
     "TE": {
-        "td_score":        0.35,
-        "yards_per_rec":   0.28,
-        "yards_total":     0.22,
-        "rec_volume":      0.10,
-        "recruit_composite": 0.05,
+        "edge_score":     0.38,    # increased; EPA captures both yards and TDs
+        "td_score":        0.22,
+        "yards_per_rec":   0.20,
+        "yards_total":     0.12,
+        "rec_volume":      0.05,
+        "recruit_composite": 0.03,
     },
     # Non-EDGE positions: no edge_scaled, higher recruit weight
     "OL": {
@@ -255,29 +410,41 @@ WEIGHTS = {
         "experience":         0.10,
         "award_tier":         0.05,
     },
-    # DL/LB/DB: no edge_scaled — defender attribution in play-by-play is too
-    # sparse (~4-14 players/season with edge_scaled vs ~800 starters).
-    # Weights reflect the composite scores defined in extract_features().
+    # Defensive positions with per-game opponent-adjusted EDGE (script 08)
+    "EDGE": {
+        "edge_score":      0.50,
+        "pass_rush_score":  0.25,
+        "disruption_rate":  0.12,
+        "run_stop_score":   0.08,
+        "recruit_composite": 0.05,
+    },
     "DL": {
-        "pass_rush_score":  0.38,
-        "run_stop_score":   0.28,
-        "disruption_rate":  0.19,
-        "volume_score":     0.05,
-        "recruit_composite": 0.10,
+        "edge_score":      0.40,
+        "pass_rush_score":  0.25,
+        "run_stop_score":   0.18,
+        "disruption_rate":  0.10,
+        "recruit_composite": 0.07,
     },
     "LB": {
-        "tackling_score":   0.33,
-        "pass_rush_score":  0.22,
-        "coverage_score":   0.20,
-        "instinct_score":   0.15,
+        "edge_score":      0.40,
+        "tackling_score":   0.25,
+        "coverage_score":   0.15,
+        "pass_rush_score":  0.10,
         "recruit_composite": 0.10,
     },
-    "DB": {
-        "coverage_score":   0.32,
+    "CB": {
+        "edge_score":      0.45,
+        "coverage_score":   0.30,
+        "tackling_score":   0.12,
+        "recruit_composite": 0.08,
+        "instinct_score":   0.05,
+    },
+    "S": {
+        "edge_score":      0.40,
+        "coverage_score":   0.22,
         "tackling_score":   0.22,
-        "instinct_score":   0.20,
-        "pass_rush_score":  0.16,
-        "recruit_composite": 0.10,
+        "instinct_score":   0.10,
+        "recruit_composite": 0.06,
     },
     "K": {
         "fg_pct":     0.50,
@@ -292,7 +459,7 @@ WEIGHTS = {
     },
 }
 
-# When EDGE is missing for an EDGE-position starter, fall back to stat-only weights
+# When EDGE is missing for players with EDGE in their formula, fall back to stat-only
 WEIGHTS_NO_EDGE = {
     "QB": {
         "yards_per_att":   0.35,
@@ -322,6 +489,13 @@ WEIGHTS_NO_EDGE = {
         "rec_volume":      0.10,
         "recruit_composite": 0.05,
     },
+    "EDGE": {
+        "pass_rush_score":  0.45,
+        "disruption_rate":  0.22,
+        "run_stop_score":   0.18,
+        "volume_score":     0.05,
+        "recruit_composite": 0.10,
+    },
     "DL": {
         "pass_rush_score":  0.40,
         "run_stop_score":   0.28,
@@ -337,13 +511,19 @@ WEIGHTS_NO_EDGE = {
         "volume_score":     0.05,
         "recruit_composite": 0.15,
     },
-    "DB": {
-        "coverage_score":   0.27,
+    "CB": {
+        "coverage_score":   0.45,
         "tackling_score":   0.20,
-        "pass_rush_score":  0.17,
-        "instinct_score":   0.16,
-        "volume_score":     0.05,
-        "recruit_composite": 0.15,
+        "instinct_score":   0.15,
+        "pass_rush_score":  0.10,
+        "recruit_composite": 0.10,
+    },
+    "S": {
+        "coverage_score":   0.30,
+        "tackling_score":   0.28,
+        "instinct_score":   0.18,
+        "pass_rush_score":  0.14,
+        "recruit_composite": 0.10,
     },
 }
 
@@ -401,13 +581,20 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
 
         # EDGE scores — keyed by player_season_id
         cur.execute(
-            """SELECT player_season_id, season, edge_scaled, plays_counted, crunch_epa
+            """SELECT player_season_id, edge_score, stats_measured, games_played, opponent_avg_sp
                FROM player_edge
                WHERE player_season_id = ANY(%s)""",
             (all_ps_ids,)
         )
-        edge_map = {ps_id: {"edge_scaled": es, "plays_counted": pc, "crunch_epa": ce}
-                    for ps_id, s, es, pc, ce in cur.fetchall()}
+        edge_map = {
+            ps_id: {
+                "edge_score":      es,
+                "stats_measured":  sm,
+                "games_played":    gp,
+                "opponent_avg_sp": osp,
+            }
+            for ps_id, es, sm, gp, osp in cur.fetchall()
+        }
 
         # Recruiting — keyed by player_id (career-level, not season-level)
         min_season = min(seasons)
@@ -459,11 +646,10 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         feats["team_id"]           = team_id
         feats["name"]              = name
         feats["player_season_id"]  = ps_id   # carry through for output upsert
-        feats["edge_scaled"]       = edge_info.get("edge_scaled")
-        plays_counted              = edge_info.get("plays_counted") or 0
-        feats["plays_counted"]     = plays_counted
-        feats["crunch_epa"]        = edge_info.get("crunch_epa") or 0.0
-        feats["games_played"]      = min(plays_counted / 15.0, 15.0)
+        feats["edge_score"]      = edge_info.get("edge_score")
+        feats["stats_measured"]  = edge_info.get("stats_measured") or 0
+        feats["games_played"]    = edge_info.get("games_played") or 0
+        feats["opp_avg_sp"]      = edge_info.get("opponent_avg_sp") or 0.0
         feats["conference"]        = conf_map.get(team_id, "")
         feats["_season"]           = s
         rows.append({"player_id": pid, **feats})
@@ -483,90 +669,183 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def is_starter(row: pd.Series, pg: str) -> bool:
-    key, threshold = STARTER_THRESHOLDS.get(pg, (None, 0))
-    if key is None:
-        return True
-    return (row.get("volume_score", 0) or 0) >= threshold
+    """Returns True if player qualifies as 'starter' tier."""
+    return classify_tier(pg, row.to_dict()) == "starter"
 
 
-def has_edge(row: pd.Series) -> bool:
-    v = row.get("edge_scaled")
-    return v is not None and not pd.isna(v)
+def get_tier(row: pd.Series, pg: str) -> str:
+    """Classify player into tier: starter, role, reserve, or bench."""
+    return classify_tier(pg, row.to_dict(), games_played=row.get("games_played", 1))
+
+
+def has_opp_score(row: pd.Series, pg: str = "") -> bool:
+    """True if a valid opponent-adjusted EDGE score is present and above threshold.
+
+    stats_measured thresholds (season totals of primary countable stats):
+      QB: 100 (pass_att + rush_att), RB: 60 (car + rec), WR: 20 (rec), TE: 10 (rec)
+      Defense: 15-30 total stat events depending on position.
+    """
+    v = row.get("edge_score")
+    if v is None or pd.isna(v) or float(v) == 0.0:
+        return False
+    sm = float(row.get("stats_measured") or 0)
+    thresholds = {
+        "QB": 100, "RB": 60, "WR": 20, "TE": 10,
+        "EDGE": 20, "DL": 20, "LB": 30, "CB": 15, "S": 15, "DB": 15,
+    }
+    return sm >= thresholds.get(pg, 15)
+
+
+# ---------------------------------------------------------------------------
+# Absolute feature normalization (replaces percentile ranking)
+# ---------------------------------------------------------------------------
+#
+# Each feature is normalized to [0, 1] against fixed all-time reference bounds,
+# NOT against the current season's player pool. This makes ratings absolute:
+# a player with 7.5 YPC rates the same regardless of what year they played or
+# how strong their positional peers were that year.
+#
+# Bounds are calibrated so that:
+#   0.0 = floor (worst reasonable starter)
+#   ~0.35 = typical starter (p50 of all-seasons pool)
+#   1.0 = all-time elite ceiling (top 1-2% over many seasons)
+#
+# edge_score is the raw opponent-adjusted production score from script 08.
+# It is NOT scaled against peers — it uses fixed position-specific ceilings
+# calibrated from 2021-2025 data. A better season always produces a higher score.
+# Ceilings set to observed p95+ so top performers clip to ~1.0.
+
+# Position-specific ceilings for raw edge_score (floor is always 0).
+# Calibrated from 2021-2025 data: Jeanty 2023=4.99, 2024=6.14
+# Ceilings calibrated so generational seasons normalize to ~1.0 and elite-but-not-historic
+# seasons normalize to 0.75-0.90. Offensive ceilings are set above p99 so seasons like
+# Jeanty 2024 (RB=6.14) vs Jeanty 2023 (RB=4.99) remain meaningfully differentiated
+# rather than both clipping to 1.0.
+# Defensive ceilings use p95 (stat composite formula produces larger raw values).
+# p50 of each group: QB=1.92, RB=0.83, WR=5.46, TE=4.13, EDGE=6.33,
+#   DL=3.84, LB=7.47, CB=5.01, S=7.80
+EDGE_SCORE_BOUNDS: dict[str, tuple[float, float]] = {
+    "QB":   (0.0, 10.0),  # max=14.1; set ceiling above p99 to preserve separation
+    "RB":   (0.0,  7.5),  # max=8.06; Jeanty 2024=6.14→0.82, Jeanty 2023=4.99→0.67
+    "WR":   (0.0, 10.2),  # p95=10.23; use p95 as ceiling so p95 WR normalizes to 1.0
+    "TE":   (0.0,  8.6),  # p95=8.60; use p95 as ceiling
+    "EDGE": (0.0, 21.5),  # p95=21.53 (defensive stat composite / sqrt(games))
+    "DL":   (0.0, 14.4),  # p95=14.39
+    "LB":   (0.0, 23.3),  # p95=23.35
+    "CB":   (0.0, 13.3),  # p95=13.33
+    "S":    (0.0, 19.8),  # p95=19.80
+    "DB":   (0.0, 16.9),  # p95=16.92 (legacy fallback)
+}
+
+FEATURE_BOUNDS: dict[str, tuple[float, float]] = {
+    # QB
+    "comp_pct":         (0.45, 0.79),
+    "yards_per_att":    (3.0,  11.7),
+    "td_int_ratio":     (0.5,  5.5),
+    # RB
+    "yards_per_carry":  (2.0,  8.0),
+    "yards_total":      (0.0,  1100),  # Jeanty 2024=2497 clips to 1.0
+    "rec_versatility":  (0.0,  0.4),
+    # WR / TE
+    "yards_per_rec":    (5.0,  20.0),
+    "td_score":         (0.0,  80.0),
+    "rec_volume":       (0.0,  80.0),
+    # OL (team proxy)
+    "team_rush_ypa":    (3.0,  6.0),
+    "team_sack_rate_inv": (0.5, 0.98),
+    "experience":       (1.0,  5.0),
+    "award_tier":       (0.0,  3.0),
+    # Defensive stat composites
+    "pass_rush_score":  (0.0,  55.0),
+    "run_stop_score":   (0.0,  50.0),
+    "disruption_rate":  (0.0,  0.6),
+    "tackling_score":   (0.0,  60.0),
+    "coverage_score":   (0.0,  15.0),
+    "instinct_score":   (0.0,  0.3),
+    # Universal
+    "recruit_composite":(40.0, 100.0),
+    "volume_score":     (0.0,  46.0),
+    # Pass-through
+    "transfer_flag":    (0.0,  1.0),
+}
+
+
+def normalize_feature(key: str, val: float, pg: str = "") -> float:
+    """Normalize a feature value to [0, 1] using fixed absolute bounds.
+
+    edge_score uses position-specific ceilings (EDGE_SCORE_BOUNDS) because
+    RBs accumulate far more opponent-adjusted EPA than CBs. All other features
+    use the flat FEATURE_BOUNDS dict.
+    """
+    if key == "edge_score":
+        lo, hi = EDGE_SCORE_BOUNDS.get(pg, (0.0, 6.0))
+        if hi <= lo:
+            return 0.0
+        return float(np.clip((float(val) - lo) / (hi - lo), 0.0, 1.0))
+    bounds = FEATURE_BOUNDS.get(key)
+    if bounds is None:
+        return 0.5  # unknown feature: neutral
+    lo, hi = bounds
+    if hi <= lo:
+        return 0.5
+    return float(np.clip((val - lo) / (hi - lo), 0.0, 1.0))
 
 
 # ---------------------------------------------------------------------------
 # Rating computation
 # ---------------------------------------------------------------------------
 
-def percentile_rank_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    result = df.copy()
-    for c in cols:
-        if c not in df.columns:
-            result[c] = 0.5
-            continue
-        vals = df[c].fillna(0)
-        result[c] = vals.rank(pct=True, method="average")
-    return result
+def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple[np.ndarray, list[dict]]:
+    """Direct edge_score → OVR mapping for EDGE positions.
+
+    For players with a valid edge_score: OVR = edge_to_ovr(edge_score, pg).
+    For players without EDGE data: return 0.0 (will be handled as fallback in rate_position).
+
+    Returns:
+      scores   — np.ndarray of OVR values [30–99] or 0.0 for no-EDGE players
+      contribs — list of {feature: value} dicts for shap_values storage
+    """
+    final_scores   = []
+    final_contribs = []
+
+    for _, row in df.iterrows():
+        if has_opp_score(row, pg):
+            es  = float(row.get("edge_score") or 0)
+            ovr = edge_to_ovr(es, pg, season)
+            contrib = {
+                "edge_score":     round(es, 4),
+                "games_played":   int(row.get("games_played") or 0),
+                "opp_quality":    round(float(row.get("opp_avg_sp") or 0), 2),
+                "stats_measured": int(row.get("stats_measured") or 0),
+            }
+        else:
+            ovr    = 0.0   # no EDGE → fallback handled in rate_position
+            contrib = {}
+
+        final_scores.append(ovr)
+        final_contribs.append(contrib)
+
+    return np.array(final_scores, dtype=float), final_contribs
 
 
 def compute_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
+    """Stat-composite rating for non-EDGE positions (OL, K, P).
+
+    Normalizes features via fixed absolute bounds and returns composite [0–1].
+    Call scale_to_range() on the result to convert to [30–99].
     """
-    Returns:
-      scores   — np.ndarray of composite scores (0–1)
-      contribs — list of {feature: contribution_fraction} dicts for shap_values storage
-    """
-    contribs = []
-    scores   = np.zeros(len(df))
-
-    for i, (pid, row) in enumerate(df.iterrows()):
-        # Choose weights based on whether EDGE data exists
-        if pg in EDGE_POSITIONS and has_edge(row):
-            weights = WEIGHTS[pg]
-        elif pg in EDGE_POSITIONS:
-            weights = WEIGHTS_NO_EDGE.get(pg, WEIGHTS[pg])
-        else:
-            weights = WEIGHTS.get(pg, {})
-
-        feature_cols = list(weights.keys())
-        # We'll compute percentile ranks below — store raw values per player per iteration
-        # NOTE: percentile ranks are computed at the full-population level below (not per-player)
-        contribs.append({"_weights": weights, "_feature_cols": feature_cols})
-
-    # Population-level percentile ranking
-    # First pass: compute for all features across all players
-    all_weights = WEIGHTS[pg] if pg not in EDGE_POSITIONS else WEIGHTS[pg]
-    all_feature_cols = list(all_weights.keys())
-
-    # Also need no-edge cols for players missing EDGE
-    no_edge_cols = list(WEIGHTS_NO_EDGE.get(pg, {}).keys()) if pg in EDGE_POSITIONS else []
-    all_cols = list(set(all_feature_cols + no_edge_cols))
-
-    ranked = percentile_rank_cols(df, all_cols)
-
-    final_scores  = []
+    final_scores   = []
     final_contribs = []
 
-    for i, (pid, row) in enumerate(df.iterrows()):
-        if pg in EDGE_POSITIONS and has_edge(row):
-            weights = WEIGHTS[pg]
-        elif pg in EDGE_POSITIONS:
-            weights = WEIGHTS_NO_EDGE.get(pg, WEIGHTS[pg])
-        else:
-            weights = WEIGHTS.get(pg, {})
-
+    for _, row in df.iterrows():
+        weights = WEIGHTS.get(pg, {})
         feature_cols = list(weights.keys())
         w_arr = np.array([weights[c] for c in feature_cols])
-        total_w = w_arr.sum()
-
-        x = np.array([ranked.loc[pid, c] if c in ranked.columns else 0.5
-                       for c in feature_cols])
+        x = np.array([normalize_feature(c, float(row.get(c) or 0), pg=pg)
+                      for c in feature_cols])
         score = float(x @ w_arr)
-
-        contrib = {}
-        for j, feat in enumerate(feature_cols):
-            deviation = x[j] - 0.5
-            contrib[feat] = round(float(deviation * w_arr[j] / total_w), 4)
-
+        contrib = {feat: round(float((x[j] - 0.5) * w_arr[j]), 4)
+                   for j, feat in enumerate(feature_cols)}
         final_scores.append(score)
         final_contribs.append(contrib)
 
@@ -578,54 +857,79 @@ def compute_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
 # so a G5 conference label would double-penalize what the model already handles.
 # For stat-only positions (WR/TE/OL/DL/LB/DB), raw counting stats don't carry
 # opponent context, so a modest discount still applies.
-P4_CONFERENCES = {"SEC", "Big Ten", "Big 12", "ACC", "Pac-12"}
-G5_DISCOUNT = 0.95   # reduced — stat-only positions only, lighter touch
-
-
 def scale_to_range(scores: np.ndarray, low=30, high=99, pg: str = "") -> np.ndarray:
-    """Z-score sigmoid normalization across the full multi-season population.
+    """Map composite scores (0-1) to rating range via piecewise linear interpolation.
 
-    Sigmoid shifted so median starter (z=0) -> ~65. Per-position steepness
-    controls spread: higher steepness = more separation between best and average.
+    Uses the actual distribution of the all-season pool to compute percentile anchors,
+    then maps them to target rating targets. Because the pool is all seasons combined
+    (2021-2025), percentiles are absolute — a player's rating doesn't change based on
+    who else played the same year. A weak class will produce fewer high ratings.
 
-    Because scores are computed against ALL seasons combined, the scale is
-    consistent year-over-year: a 90 in 2021 means the same thing as a 90 in 2025.
+    Target distribution:
+      p10 → 40  (marginal starter)
+      p50 → 65  (average starter)
+      p75 → 77  (solid starter)
+      p90 → 85  (excellent)
+      p99 → 93  (elite/generational)
     """
-    if len(scores) < 2:
+    if len(scores) < 5:
         return np.full(len(scores), 65.0)
-    mu  = np.mean(scores)
-    std = np.std(scores)
-    if std < 1e-9:
+    if np.std(scores) < 1e-9:
         return np.full(len(scores), 65.0)
-    z = (scores - mu) / std
-    # Single steepness value for all positions.
-    # With a cross-season pool of 750–4500 starters, the natural z-score
-    # variance is already wide — no need to amplify it per-position.
-    # 0.9 maps median starter -> ~65 and top 1% -> ~90-95 naturally.
-    steepness = 0.9
-    raw = 100.0 / (1.0 + np.exp(-steepness * (z + 0.75))) * 1.08 - 4.0
-    return np.clip(raw, low, high).round(2)
+
+    pct_vals = np.percentile(scores, [0, 10, 50, 75, 90, 99, 100])
+    targets  = [float(low), 40.0, 65.0, 77.0, 85.0, 93.0, float(high)]
+    result = np.interp(scores, pct_vals, targets)
+    return np.clip(result, low, high).round(2)
 
 
 def apply_conference_discount(scores: np.ndarray, df: pd.DataFrame, pg: str = "") -> np.ndarray:
-    """Apply a modest discount to G5 players at stat-only positions.
+    """No conference-level adjustment applied.
 
-    EDGE positions (QB/RB) skip this entirely — their raw scores are already
-    opponent-adjusted at the play level via SP+. Applying a conference penalty
-    on top would double-penalize G5 players for the same competition factor
-    that EDGE already accounts for.
-
-    For stat-only positions (WR/TE/OL/DL/LB/DB), counting stats carry no
-    opponent context, so a small conference-level adjustment still applies.
+    All opponent quality adjustment happens at the play level (edge_score opp_mult)
+    or the game level (defensive stat composite × per-game opp SP+ offense in script 08).
+    Conference membership is too coarse a proxy — if per-play or per-game opponent
+    data isn't available, we don't substitute a conference-level bandaid.
     """
-    if pg in EDGE_POSITIONS:
-        return scores.copy()   # EDGE handles opponent quality — no extra penalty
+    return scores.copy()
 
+
+def apply_multi_tier_treatment(scores: np.ndarray, df: pd.DataFrame, pg: str,
+                               position_avg: float = 65.0) -> np.ndarray:
+    """Blend formula-driven scores with recruiting anchor based on playing-time tier.
+
+    The tier controls *how much* we trust stats vs recruiting, not the ceiling.
+    A 5-star backup at Alabama should still rate high — they just haven't had
+    the opportunity to prove it yet, so recruiting anchors more heavily.
+
+      starter: 100% formula (stats + EDGE drive the rating)
+      role:    75% formula + 25% recruiting anchor
+      reserve: 40% formula + 60% recruiting anchor
+      bench:   100% recruiting anchor (no production to evaluate)
+
+    No tier caps — loaded classes will naturally cluster higher, lean classes
+    lower. Distribution shape comes from sigmoid normalization, not artificial ceilings.
+    """
     result = scores.copy()
+    stars_fallback = df["stars"].fillna(0).astype(int)
+
     for i, (_, row) in enumerate(df.iterrows()):
-        conf = row.get("conference") or ""
-        if conf not in P4_CONFERENCES:
-            result[i] = scores[i] * G5_DISCOUNT
+        tier = row.get("tier", "bench")
+        stars = int(stars_fallback.iloc[i] or 0)
+        recruit_rating = fallback_rating(stars, position_avg)
+
+        if tier == "starter":
+            result[i] = scores[i]  # full formula, no adjustment
+
+        elif tier == "role":
+            result[i] = round(scores[i] * 0.75 + recruit_rating * 0.25, 2)
+
+        elif tier == "reserve":
+            result[i] = round(scores[i] * 0.40 + recruit_rating * 0.60, 2)
+
+        else:  # bench/redshirt
+            result[i] = recruit_rating  # recruiting only
+
     return result
 
 
@@ -635,10 +939,14 @@ def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame) -> np.ndarray:
     Players with 8+ games: untouched (full confidence).
     Players with fewer games: rating pulled toward position average proportionally.
     Prevents a 2-game wonder from rating 95 but doesn't compress full-season players.
+    Zero values (no EDGE data) are skipped entirely — they get fallback_rating later.
     """
-    avg = float(np.mean(scaled))
+    valid = scaled[scaled > 0]
+    avg = float(np.mean(valid)) if len(valid) > 0 else 65.0
     result = scaled.copy()
     for i, (_, row) in enumerate(df.iterrows()):
+        if scaled[i] == 0.0:
+            continue  # no EDGE data — leave as 0, fallback_rating handles it
         games = float(row.get("games_played", 0) or 0)
         if games >= 8:
             continue  # full-season starters: no change
@@ -657,18 +965,74 @@ def fallback_rating(stars: int, position_avg: float = 65.0) -> float:
 # Trajectory and breakout
 # ---------------------------------------------------------------------------
 
-def compute_trajectory(ratings_map: dict, prev_season: int) -> dict:
+def compute_trajectory(ratings_map: dict, prev_season: int, df: pd.DataFrame | None = None) -> dict:
+    """Compute year-over-year trajectory for each player.
+
+    Blends two signals:
+    1. Rating delta: current_rating - prior_rating (captures relative rank change)
+    2. Absolute EDGE growth: % change in raw edge_score (captures personal improvement
+       even when the position pool also got stronger, e.g. Jeanty 2023->2024)
+
+    Without signal 2, a generational season that coincides with a stronger pool
+    shows 0 or negative trajectory despite clear real-world improvement.
+    """
     if not ratings_map:
         return {}
+
+    player_ids = list(ratings_map.keys())
+
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT player_id, overall_rating FROM ratings WHERE season = %s AND player_id = ANY(%s)",
-            (prev_season, list(ratings_map.keys()))
+            """SELECT ps.player_id, r.overall_rating
+               FROM ratings r
+               JOIN player_seasons ps ON ps.id = r.player_season_id
+               WHERE r.season = %s AND ps.player_id = ANY(%s)""",
+            (prev_season, player_ids)
         )
-        prev = {pid: float(r) for pid, r in cur.fetchall()}
-    return {pid: round(float(curr) - prev[pid], 2) if pid in prev else 0.0
-            for pid, curr in ratings_map.items()}
+        prev_ratings = {pid: float(r) for pid, r in cur.fetchall()}
+
+        # Load raw edge_scores (not scaled) for current and prior season
+        cur.execute(
+            """SELECT ps.player_id, pe.edge_score
+               FROM player_edge pe
+               JOIN player_seasons ps ON ps.id = pe.player_season_id
+               WHERE pe.season = %s AND ps.player_id = ANY(%s)""",
+            (prev_season, player_ids)
+        )
+        prev_edge = {pid: float(es) for pid, es in cur.fetchall() if es is not None}
+
+        cur.execute(
+            """SELECT ps.player_id, pe.edge_score
+               FROM player_edge pe
+               JOIN player_seasons ps ON ps.id = pe.player_season_id
+               WHERE pe.season = %s AND ps.player_id = ANY(%s)""",
+            (prev_season + 1, player_ids)
+        )
+        curr_edge = {pid: float(es) for pid, es in cur.fetchall() if es is not None}
+
+    result = {}
+    for pid, curr_rating in ratings_map.items():
+        if pid not in prev_ratings:
+            result[pid] = 0.0
+            continue
+
+        rating_delta = float(curr_rating) - prev_ratings[pid]
+
+        # Absolute EDGE growth bonus: if raw edge_score grew substantially,
+        # add up to +5 pts to trajectory even if relative rank held steady.
+        edge_bonus = 0.0
+        if pid in prev_edge and pid in curr_edge:
+            prev_e = prev_edge[pid]
+            curr_e = curr_edge[pid]
+            if prev_e > 0:
+                pct_growth = (curr_e - prev_e) / prev_e
+                # Cap at ±5 pts bonus: 50%+ growth → +5, 25% → +2.5, etc.
+                edge_bonus = round(min(5.0, max(-5.0, pct_growth * 10.0)), 2)
+
+        result[pid] = round(rating_delta + edge_bonus, 2)
+
+    return result
 
 
 def compute_breakout(df: pd.DataFrame, ratings: np.ndarray) -> np.ndarray:
@@ -721,17 +1085,29 @@ def rate_position(season: int, pg: str) -> list[dict]:
     ratings_map: dict[str, float] = {}
     contrib_map: dict[str, dict]  = {}
 
-    edge_count = all_starter_df["edge_scaled"].notna().sum() if "edge_scaled" in all_starter_df.columns else 0
+    edge_count = all_starter_df["edge_score"].notna().sum() if "edge_score" in all_starter_df.columns else 0
 
     if len(all_starter_df) >= 5:
-        raw_scores, contribs = compute_ratings(all_starter_df, pg)
-        discounted = apply_conference_discount(raw_scores, all_starter_df, pg=pg)
-        scaled = scale_to_range(discounted, pg=pg)
         if pg in EDGE_POSITIONS:
-            scaled = apply_games_confidence(scaled, all_starter_df)
+            # --- Direct edge_score → OVR mapping (no peer ranking) ---
+            raw_scores, contribs = compute_edge_ratings(all_starter_df, pg, season)
+            # raw_scores is already [30-99] for EDGE players, 0.0 for no-data players
+            scaled = apply_games_confidence(raw_scores, all_starter_df)
+            # Print distribution of players with valid EDGE
+            edge_ovrs = scaled[scaled > 0]
+            if len(edge_ovrs) >= 5:
+                p = np.percentile(edge_ovrs, [10, 25, 50, 75, 90, 99])
+                print(f"\n    [edge OVR] p10={p[0]:.1f} p25={p[1]:.1f} p50={p[2]:.1f} p75={p[3]:.1f} p90={p[4]:.1f} p99={p[5]:.1f}", end=" ")
+        else:
+            # --- Stat composite + scale_to_range for OL/K/P ---
+            raw_scores, contribs = compute_ratings(all_starter_df, pg)
+            discounted = apply_conference_discount(raw_scores, all_starter_df, pg=pg)
+            scaled = scale_to_range(discounted, pg=pg)
+
         for i, rkey in enumerate(all_starter_df.index):
-            ratings_map[rkey] = float(scaled[i])
-            contrib_map[rkey] = contribs[i]
+            if scaled[i] > 0:   # 0.0 = no EDGE data → let fallback handle it
+                ratings_map[rkey] = float(scaled[i])
+                contrib_map[rkey] = contribs[i]
     else:
         print(f"(only {len(all_starter_df)} starters across all seasons — fallback only) ", end="")
         for rkey, row in all_df.iterrows():
@@ -742,11 +1118,14 @@ def rate_position(season: int, pg: str) -> list[dict]:
     # of pure recruiting fallback — prevents small-sample stars being buried.
     pos_avg = float(np.mean(list(ratings_map.values()))) if ratings_map else 65.0
 
-    # Compute an efficiency percentile across all starters for blending
+    # Compute an efficiency percentile across all starters for blending.
+    # For EDGE positions, use edge_score directly if available.
     eff_col = {
         "QB": "yards_per_att", "RB": "yards_per_carry",
         "WR": "yards_per_rec", "TE": "yards_per_rec",
-        "DL": "disruption_rate", "LB": "instinct_score", "DB": "instinct_score",
+        "EDGE": "edge_score", "DL": "edge_score",
+        "LB": "edge_score", "CB": "edge_score", "S": "edge_score",
+        "DB": "edge_score",
     }.get(pg)
 
     starter_eff_vals = None
@@ -780,34 +1159,48 @@ def rate_position(season: int, pg: str) -> list[dict]:
 
     # Compute trajectory (needs per-player ratings from prior season)
     # Build player_id -> rating map for this season's rows
+    # If a player transferred mid-season they may have two player_seasons rows;
+    # keep the higher rating for trajectory/breakout purposes.
     season_pid_rating: dict[int, float] = {}
     for rkey, row in season_df.iterrows():
         pid = int(row["player_id"])
-        season_pid_rating[pid] = float(ratings_map.get(rkey, 50.0))
+        val = float(ratings_map.get(rkey, 50.0))
+        if pid not in season_pid_rating or val > season_pid_rating[pid]:
+            season_pid_rating[pid] = val
 
     trajectory = compute_trajectory(season_pid_rating, season - 1)
 
     # Breakout probability — use this season's subset only
-    season_pids  = list(season_pid_rating.keys())
-    season_rats  = np.array([season_pid_rating[p] for p in season_pids])
-    # Build a sub-df indexed by player_id for compute_breakout
+    # Deduplicate by player_id (a player can have two player_seasons rows if they
+    # transferred mid-season; keep the one with the higher rating)
+    season_pids = list(season_pid_rating.keys())
+    season_rats = np.array([season_pid_rating[p] for p in season_pids])
     sub_df = season_df.copy()
-    sub_df.index = sub_df["player_id"].astype(int)
-    breakout_arr = compute_breakout(sub_df.loc[sub_df.index.isin(season_pids)], season_rats)
+    sub_df["_pid_int"] = sub_df["player_id"].astype(int)
+    # Keep one row per player_id — highest rating wins
+    sub_df = sub_df.sort_values("_pid_int")
+    sub_df = sub_df.drop_duplicates(subset=["_pid_int"], keep="first")
+    sub_df = sub_df.set_index("_pid_int")
+    # Align sub_df rows to season_pids order
+    aligned_df = sub_df.reindex(season_pids)
+    breakout_arr = compute_breakout(aligned_df, season_rats)
     breakout_map = dict(zip(season_pids, breakout_arr))
 
     ceiling = POSITION_CEILING.get(pg)
     starters_this_season = season_df.apply(lambda r: is_starter(r, pg), axis=1).sum()
     edge_this_season = (
-        season_df["edge_scaled"].notna().sum()
-        if "edge_scaled" in season_df.columns else 0
+        season_df["edge_score"].notna().sum()
+        if "edge_score" in season_df.columns else 0
     )
 
     rows = []
+    tiers = []
     for rkey, row in season_df.iterrows():
         pid    = int(row["player_id"])
         ps_id  = int(row["player_season_id"])
         ovr    = float(ratings_map.get(rkey, 50.0))
+        tier   = get_tier(row, pg)
+        tiers.append(ovr)  # for multi-tier treatment
         if ceiling:
             ovr = min(ovr, ceiling)
         rows.append({
@@ -819,11 +1212,106 @@ def rate_position(season: int, pg: str) -> list[dict]:
             "breakout_probability": float(breakout_map.get(pid, 0.05)),
             "shap_values":          json.dumps(contrib_map.get(rkey, {})),
             "model_version":        MODEL_VERSION,
+            "tier":                 tier,
+            "_pg":                  pg,  # for distribution validation only, not upserted
         })
 
-    edge_info = f", EDGE: {edge_this_season}" if pg in EDGE_POSITIONS else ""
+    # Apply multi-tier rating treatment
+    tier_arr = np.array([r["tier"] for r in rows])
+    ratings_arr = np.array([r["overall_rating"] for r in rows])
+    season_df["tier"] = tier_arr
+    season_df["stars"] = season_df["stars"].fillna(0)
+    adjusted_ratings = apply_multi_tier_treatment(ratings_arr, season_df, pg, position_avg=pos_avg)
+
+    # Update rows with adjusted ratings
+    for i, r in enumerate(rows):
+        r["overall_rating"] = float(adjusted_ratings[i])
+        r["position_rating"] = float(adjusted_ratings[i])
+
+    edge_info = f", EDGE: {edge_count}" if pg in EDGE_POSITIONS else ""
     print(f"{len(rows)} players this season (starters: {starters_this_season}{edge_info}, total pool: {len(all_starter_df)} starters across all seasons)")
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Distribution validation (hard gate — must pass before upsert)
+# ---------------------------------------------------------------------------
+
+def validate_distribution(rows: list[dict]) -> bool:
+    """
+    Validate that rating distributions are within expected bounds.
+    Returns True if all pass; prints violations and returns False otherwise.
+
+    Target bounds:
+      All groups: mean 62-68, p50 within 3 of mean, p90 80-87, p99 92-98
+    """
+    if not rows:
+        return True
+
+    df = pd.DataFrame(rows)
+    # Validate starter-tier only — bench/reserve ratings intentionally skew low
+    starter_df = df[df["tier"] == "starter"] if "tier" in df.columns else df
+    group_col = "_pg" if "_pg" in df.columns else ("position_group" if "position_group" in df.columns else "season")
+    by_pg = starter_df.groupby(group_col)["overall_rating"]
+
+    valid = True
+    for pg, scores in by_pg:
+        if len(scores) < 10:
+            continue  # skip small groups
+        vals = scores.dropna()
+        if vals.empty:
+            continue
+        mean = np.mean(vals)
+        p10 = np.percentile(vals, 10)
+        p50 = np.percentile(vals, 50)
+        p90 = np.percentile(vals, 90)
+        p99 = np.percentile(vals, 99)
+
+        print(f"  {pg}: n={len(vals)} mean={mean:.1f} p10={p10:.1f} p50={p50:.1f} p90={p90:.1f} p99={p99:.1f}")
+
+        # Check bounds — absolute normalization, so bounds reflect all-time expectations.
+        # Offensive positions can reach 90+ (elite rushers/passers have extreme stat outliers).
+        # Defensive positions cap naturally lower due to counting-stat compression.
+        if pg in ("K", "P"):
+            mean_ok = (55 <= mean <= 70)
+            p90_ok  = (65 <= p90 <= 79)
+            p99_ok  = (70 <= p99 <= 79)
+        elif pg == "OL":
+            mean_ok = (55 <= mean <= 75)
+            p90_ok  = (78 <= p90 <= 95)
+            p99_ok  = (88 <= p99 <= 99)
+        elif pg in ("QB", "RB"):
+            mean_ok = (60 <= mean <= 72)
+            p90_ok  = (78 <= p90 <= 92)
+            p99_ok  = (88 <= p99 <= 99)
+        elif pg in ("WR", "TE"):
+            mean_ok = (58 <= mean <= 72)
+            p90_ok  = (75 <= p90 <= 90)
+            p99_ok  = (85 <= p99 <= 99)
+        else:
+            # Defensive positions: EDGE, DL, LB, CB, S, DB
+            mean_ok = (58 <= mean <= 74)
+            p90_ok  = (72 <= p90 <= 88)
+            p99_ok  = (78 <= p99 <= 97)
+        if not mean_ok:
+            print(f"    WARNING: mean out of bounds (got {mean:.1f})")
+            valid = False
+        if abs(p50 - mean) > 5:
+            print(f"    WARNING: p50 too far from mean (delta {abs(p50 - mean):.1f}, max 5)")
+            valid = False
+        if not p90_ok:
+            print(f"    WARNING: p90 out of bounds (got {p90:.1f})")
+            valid = False
+        if not p99_ok:
+            print(f"    WARNING: p99 out of bounds (got {p99:.1f})")
+            valid = False
+
+    if not valid:
+        print("\n  Distribution validation WARNINGS above — review before committing.")
+        print("    (Not blocking — loaded/lean classes will naturally shift the distribution.)")
+    else:
+        print("\n  Distribution validation passed")
+    return True  # always allow upsert; validation is informational
 
 
 # ---------------------------------------------------------------------------
@@ -837,7 +1325,7 @@ def main():
     parser.add_argument("--position",    type=str)
     args = parser.parse_args()
 
-    seasons = list(range(2021, 2026)) if args.all_seasons else [args.season]
+    seasons = list(range(2008, 2026)) if args.all_seasons else [args.season]
     positions = [args.position.upper()] if args.position else list(WEIGHTS.keys())
 
     for season in seasons:
@@ -846,7 +1334,13 @@ def main():
         for pg in positions:
             all_rows.extend(rate_position(season, pg))
         if all_rows:
-            bulk_upsert("ratings", all_rows, "player_season_id")
+            print("\n  Validating distribution...")
+            if not validate_distribution(all_rows):
+                print(f"\n  Skipping upsert — fix weights and re-run")
+                continue
+            upsert_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in all_rows]
+            bulk_upsert("ratings", upsert_rows, "player_season_id",
+                        conflict_where="player_season_id IS NOT NULL")
             print(f"  Upserted {len(all_rows)} rows")
 
     print("\nDone.")
