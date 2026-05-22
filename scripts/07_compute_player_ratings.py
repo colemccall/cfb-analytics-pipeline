@@ -645,23 +645,35 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         year     = row.get("year")
         season   = row["season"]
         raw_stats = row.get("data") or {}
-        stars    = int(row.get("stars") or 0)
+        def _si(v, default=0):
+            try:
+                return int(v) if v is not None and v == v else default
+            except (TypeError, ValueError):
+                return default
+
+        def _sf(v, default=0.0):
+            try:
+                return float(v) if v is not None and v == v else default
+            except (TypeError, ValueError):
+                return default
+
+        stars    = _si(row.get("stars"))
         cs       = row.get("composite_score")
 
         feats = extract_features(raw_stats, pg)
         if pg == "OL":
-            feats["experience"] = float(year or 2)
+            feats["experience"] = _sf(year, 2.0)
         feats["recruit_composite"] = _composite_to_100(cs)
         feats["transfer_flag"]     = 1 if (pid, season) in tr_set else 0
         feats["stars"]             = stars
-        feats["year"]              = int(year or 0)
+        feats["year"]              = _si(year)
         feats["team_id"]           = team_id
         feats["name"]              = name
         feats["player_season_id"]  = ps_id
         feats["edge_score"]        = row.get("edge_score")
-        feats["stats_measured"]    = int(row.get("stats_measured") or 0)
-        feats["games_played"]      = int(row.get("games_played") or 0)
-        feats["opp_avg_sp"]        = float(row.get("opponent_avg_sp") or 0.0)
+        feats["stats_measured"]    = _si(row.get("stats_measured"))
+        feats["games_played"]      = _si(row.get("games_played"))
+        feats["opp_avg_sp"]        = _sf(row.get("opponent_avg_sp"))
         feats["conference"]        = row.get("conference") or ""
         feats["_season"]           = season
         rows.append({"player_id": pid, **feats})
@@ -1028,21 +1040,27 @@ def compute_trajectory(ratings_map: dict, prev_season: int, df: pd.DataFrame | N
     player_ids = set(ratings_map.keys())
 
     # Load prior ratings from computed output
+    prev_ratings = {}
     rat_df = read_computed("ratings")
-    if not rat_df.empty and "season" in rat_df.columns:
-        prev_rat = rat_df[rat_df["season"] == prev_season]
-        ps_df = read_raw("player_seasons")[["id", "player_id"]]
-        prev_rat = prev_rat.merge(ps_df, left_on="player_season_id", right_on="id", how="left")
-        prev_rat = prev_rat[prev_rat["player_id"].isin(player_ids)]
-        prev_ratings = dict(zip(prev_rat["player_id"], prev_rat["overall_rating"].astype(float)))
-    else:
-        prev_ratings = {}
+    if not rat_df.empty and "season" in rat_df.columns and "player_season_id" in rat_df.columns:
+        prev_rat = rat_df[rat_df["season"] == prev_season].copy()
+        if not prev_rat.empty:
+            # ratings already has player_id column — use it directly
+            if "player_id" in prev_rat.columns:
+                prev_rat = prev_rat[prev_rat["player_id"].isin(player_ids)]
+                prev_ratings = dict(zip(prev_rat["player_id"], prev_rat["overall_rating"].astype(float)))
 
     # Load edge scores from raw dump
     edge_df = read_raw("player_edge")
-    ps_df   = read_raw("player_seasons")[["id", "player_id", "season"]]
+    ps_df   = read_raw("player_seasons")[["id", "player_id", "season"]].rename(
+        columns={"id": "ps_id", "player_id": "ps_player_id", "season": "ps_season"})
     if not edge_df.empty and not ps_df.empty:
-        merged = edge_df.merge(ps_df, left_on="player_season_id", right_on="id", how="left")
+        merged = edge_df.merge(ps_df, left_on="player_season_id", right_on="ps_id", how="left")
+        # Resolve player_id: prefer edge_df's own column, fall back to player_seasons
+        merged["player_id"] = merged["player_id"].where(
+            merged["player_id"].notna(), merged["ps_player_id"])
+        merged["season"] = merged["season"].where(
+            merged["season"].notna(), merged["ps_season"])
         merged = merged[merged["player_id"].isin(player_ids)]
         prev_edge = dict(zip(
             merged[merged["season"] == prev_season]["player_id"],

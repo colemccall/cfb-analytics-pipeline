@@ -187,7 +187,7 @@ def avg_top(ratings: list, n: int) -> float:
 def load_starter_ratings_by_position(season: int) -> dict:
     """Return {team_id: {QB: [r1,r2,...], RB: [...], ...}} for starter-tier players."""
     rat_df = read_computed("ratings")
-    ps_df  = read_raw("player_seasons")[["id", "team_id", "position_group"]]
+    ps_df  = read_raw("player_seasons")[["id", "position_group"]].rename(columns={"id": "ps_id"})
 
     if rat_df.empty or ps_df.empty:
         return {}
@@ -198,7 +198,7 @@ def load_starter_ratings_by_position(season: int) -> dict:
         (rat_df["overall_rating"] >= 55) &
         rat_df["overall_rating"].notna()
     ]
-    merged = rat_df.merge(ps_df, left_on="player_season_id", right_on="id", how="left")
+    merged = rat_df.merge(ps_df, left_on="player_season_id", right_on="ps_id", how="left")
     merged = merged[merged["team_id"].notna()]
 
     result: dict = defaultdict(lambda: defaultdict(list))

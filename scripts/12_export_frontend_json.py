@@ -134,60 +134,65 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
         print(f"  players.json: no ratings for season {season}")
         return
 
-    # Join player_seasons
-    rat_s = rat_s.merge(ps[["id", "player_id", "team_id", "position_group", "year", "season"]]
-                        .rename(columns={"id": "ps_id", "season": "ps_season"}),
-                        left_on="player_season_id", right_on="ps_id", how="left")
+    # ratings.player_id is the Supabase internal PK — NOT the CFB API player id.
+    # The correct CFB API player id lives in player_seasons.player_id.
+    # Join path: ratings.player_season_id → player_seasons.id → player_seasons.player_id → players.id
+    ps_slim = ps[["id", "player_id", "position_group", "year", "team_id"]] \
+                .rename(columns={"id": "ps_id", "player_id": "cfb_player_id", "team_id": "ps_team_id"})
+    rat_s = rat_s.merge(ps_slim, left_on="player_season_id", right_on="ps_id", how="left")
+    # Use ps team_id if ratings team_id is missing
+    rat_s["team_id"] = rat_s["team_id"].where(rat_s["team_id"].notna(), rat_s["ps_team_id"])
 
-    # Join players
-    rat_s = rat_s.merge(pl[["id", "name", "position", "height_in", "weight_lbs", "hometown_state"]]
-                        .rename(columns={"id": "player_id_pl"}),
-                        left_on="player_id", right_on="player_id_pl", how="left")
+    # players — join on cfb_player_id (= players.id)
+    pl_slim = pl[["id", "name", "position", "height_in", "weight_lbs", "hometown_state"]] \
+                .rename(columns={"id": "pl_id"})
+    rat_s = rat_s.merge(pl_slim, left_on="cfb_player_id", right_on="pl_id", how="left")
 
-    # Join teams
-    rat_s = rat_s.merge(tm[["id", "school", "abbreviation", "conference", "color", "logo_url"]]
-                        .rename(columns={"id": "tm_id"}),
-                        left_on="team_id", right_on="tm_id", how="left")
+    # teams — school/conference/color (use resolved team_id)
+    tm_slim = tm[["id", "school", "abbreviation", "conference", "color", "logo_url"]] \
+                .rename(columns={"id": "tm_id"})
+    rat_s = rat_s.merge(tm_slim, left_on="team_id", right_on="tm_id", how="left")
 
-    # Best recruiting record per player
+    # Recruiting — only need recruit_year (stars/composite_score already in ratings)
     if not rec.empty:
-        rec_best = rec.sort_values("composite_score", ascending=False, na_position="last") \
+        rec_year = rec.sort_values("composite_score", ascending=False, na_position="last") \
                       .drop_duplicates(subset=["player_id"], keep="first") \
-                      [["player_id", "stars", "composite_score", "recruit_year"]]
-        rat_s = rat_s.merge(rec_best, on="player_id", how="left")
+                      [["player_id", "recruit_year"]] \
+                      .rename(columns={"player_id": "rec_pid"})
+        rat_s = rat_s.merge(rec_year, left_on="cfb_player_id", right_on="rec_pid", how="left")
     else:
-        rat_s["stars"] = None
-        rat_s["composite_score"] = None
         rat_s["recruit_year"] = None
 
-    # EDGE scores
+    # EDGE — only need stats_measured/games_played (edge_score already in ratings)
     if not edge.empty:
-        rat_s = rat_s.merge(edge[["player_season_id", "edge_score", "stats_measured", "games_played"]]
-                            .rename(columns={"player_season_id": "edge_ps_id"}),
-                            left_on="player_season_id", right_on="edge_ps_id", how="left")
+        edge_slim = edge[["player_season_id", "stats_measured", "games_played"]] \
+                        .rename(columns={"player_season_id": "edge_ps_id"})
+        rat_s = rat_s.merge(edge_slim, left_on="player_season_id", right_on="edge_ps_id", how="left")
     else:
-        rat_s["edge_score"] = None
         rat_s["stats_measured"] = None
         rat_s["games_played"] = None
 
     # Stats (season aggregate)
+    def _parse_data(v):
+        if isinstance(v, dict): return v
+        try: return json.loads(v)
+        except: return {}
+
     st = T["stats"]
     if not st.empty:
         st_agg = st[(st["stat_type"] == "season_aggregate") & st["game_id"].isna()] \
                    [["player_season_id", "data"]].copy()
-        def _parse(v):
-            if isinstance(v, dict): return v
-            try: return json.loads(v)
-            except: return {}
-        st_agg["data"] = st_agg["data"].apply(_parse)
-        rat_s = rat_s.merge(st_agg.rename(columns={"player_season_id": "st_ps_id", "data": "stats_season"}),
-                            left_on="player_season_id", right_on="st_ps_id", how="left")
+        st_agg["data"] = st_agg["data"].apply(_parse_data)
+        rat_s = rat_s.merge(
+            st_agg.rename(columns={"player_season_id": "st_ps_id", "data": "stats_season"}),
+            left_on="player_season_id", right_on="st_ps_id", how="left")
 
         st_post = st[(st["stat_type"] == "postseason_aggregate") & st["game_id"].isna()] \
                     [["player_season_id", "data"]].copy()
-        st_post["data"] = st_post["data"].apply(_parse)
-        rat_s = rat_s.merge(st_post.rename(columns={"player_season_id": "stp_id", "data": "stats_postseason"}),
-                            left_on="player_season_id", right_on="stp_id", how="left")
+        st_post["data"] = st_post["data"].apply(_parse_data)
+        rat_s = rat_s.merge(
+            st_post.rename(columns={"player_season_id": "stp_id", "data": "stats_postseason"}),
+            left_on="player_season_id", right_on="stp_id", how="left")
     else:
         rat_s["stats_season"] = None
         rat_s["stats_postseason"] = None
@@ -197,7 +202,7 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
         if not row.get("name"):
             continue
         players.append({
-            "id":               _i(row.get("player_id")),
+            "id":               _i(row.get("cfb_player_id")),
             "player_season_id": _i(row.get("player_season_id")),
             "name":             row.get("name"),
             "position":         row.get("position"),
@@ -244,14 +249,11 @@ def export_teams(T: dict, output_dir: Path, season: int) -> None:
     if tm.empty:
         return
 
-    # Per-team player count from ratings
+    # Per-team player count — ratings already has team_id, no ps merge needed
     count_by_team = {}
-    if not rat.empty and not ps.empty:
-        rat_s = rat[rat["season"] == season]
-        merged = rat_s.merge(ps[["id", "team_id"]].rename(columns={"id": "ps_id"}),
-                             left_on="player_season_id", right_on="ps_id", how="left")
-        merged = merged[merged["team_id"].notna()]
-        count_by_team = merged.groupby("team_id").size().to_dict()
+    if not rat.empty:
+        rat_s = rat[(rat["season"] == season) & rat["team_id"].notna()]
+        count_by_team = rat_s.groupby("team_id").size().to_dict()
 
     teams = []
     for _, t in tm.iterrows():
@@ -348,24 +350,16 @@ def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
     if rat.empty:
         return
 
+    # ratings.player_id is Supabase internal; use player_seasons.player_id (CFB API id)
     rat_s = rat[rat["season"] == season].copy()
-    rat_s = rat_s.merge(ps[["id", "player_id", "team_id", "position_group", "year"]]
-                        .rename(columns={"id": "ps_id"}),
+    rat_s = rat_s.merge(ps[["id", "player_id", "position_group", "year"]]
+                        .rename(columns={"id": "ps_id", "player_id": "cfb_player_id"}),
                         left_on="player_season_id", right_on="ps_id", how="left")
     rat_s = rat_s.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
-                        left_on="player_id", right_on="pl_id", how="left")
+                        left_on="cfb_player_id", right_on="pl_id", how="left")
     rat_s = rat_s.merge(tm[["id", "school", "abbreviation", "conference", "color"]]
                         .rename(columns={"id": "tm_id"}),
                         left_on="team_id", right_on="tm_id", how="left")
-
-    if not rec.empty:
-        rec_best = rec.sort_values("composite_score", ascending=False, na_position="last") \
-                      .drop_duplicates(subset=["player_id"], keep="first") \
-                      [["player_id", "stars", "composite_score"]]
-        rat_s = rat_s.merge(rec_best, on="player_id", how="left")
-    else:
-        rat_s["stars"] = None
-        rat_s["composite_score"] = None
 
     rat_s = rat_s.sort_values("overall_rating", ascending=False, na_position="last")
 
@@ -377,7 +371,7 @@ def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
         if len(by_position[pg]) >= TOP_N_PER_POSITION:
             continue
         by_position[pg].append({
-            "id":              _i(row.get("player_id")),
+            "id":              _i(row.get("cfb_player_id")),
             "name":            row.get("name"),
             "year":            _i(row.get("year")),
             "team":            row.get("school"),
@@ -411,29 +405,16 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
     if rat.empty:
         return
 
+    # ratings.player_id is Supabase internal; use player_seasons.player_id (CFB API id)
     print("  Building similarity matrix...")
     df = rat[rat["overall_rating"] >= 55].copy()
-    df = df.merge(ps[["id", "player_id", "team_id", "position_group", "season"]]
-                  .rename(columns={"id": "ps_id"}),
+    df = df.merge(ps[["id", "player_id", "position_group"]]
+                  .rename(columns={"id": "ps_id", "player_id": "cfb_player_id"}),
                   left_on="player_season_id", right_on="ps_id", how="left")
     df = df.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
-                  left_on="player_id", right_on="pl_id", how="left")
+                  left_on="cfb_player_id", right_on="pl_id", how="left")
     df = df.merge(tm[["id", "school"]].rename(columns={"id": "tm_id"}),
                   left_on="team_id", right_on="tm_id", how="left")
-    if not edge.empty:
-        df = df.merge(edge[["player_season_id", "edge_score"]]
-                      .rename(columns={"player_season_id": "e_ps_id"}),
-                      left_on="player_season_id", right_on="e_ps_id", how="left")
-    else:
-        df["edge_score_edge"] = None
-
-    if not rec.empty:
-        rec_best = rec.sort_values("composite_score", ascending=False, na_position="last") \
-                      .drop_duplicates(subset=["player_id"], keep="first") \
-                      [["player_id", "composite_score"]]
-        df = df.merge(rec_best, on="player_id", how="left")
-    else:
-        df["composite_score"] = None
 
     CONF_TIER = {"SEC": 1.0, "Big Ten": 1.0, "ACC": 0.9, "Big 12": 0.9,
                  "Pac-12": 0.85, "Sun Belt": 0.5, "MAC": 0.5, "C-USA": 0.5,
@@ -448,6 +429,8 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
         recency    = max(0.0, (int(row["season"]) - 2008) / 17)
         return [ovr, edge_s, composite, trajectory, conf, recency]
 
+    import numpy as np
+
     by_pos: dict = defaultdict(list)
     for _, row in df.iterrows():
         by_pos[row.get("position_group") or "ATH"].append(row.to_dict())
@@ -457,42 +440,43 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
     for pg, group in by_pos.items():
         if len(group) < 2:
             continue
-        vectors = [make_vector(r) for r in group]
-        dim = len(vectors[0])
+        vectors = np.array([make_vector(r) for r in group], dtype=float)
 
-        # Normalize each dimension to [0,1]
-        arr = [v[:] for v in vectors]
-        for d in range(dim):
-            col = [arr[i][d] for i in range(len(arr))]
-            mn, mx = min(col), max(col)
-            rng = mx - mn
-            for i in range(len(arr)):
-                arr[i][d] = (arr[i][d] - mn) / rng if rng > 0 else 0.0
+        # Min-max normalize each column
+        col_min = vectors.min(axis=0)
+        col_max = vectors.max(axis=0)
+        rng = col_max - col_min
+        rng[rng == 0] = 1.0
+        vectors = (vectors - col_min) / rng
 
-        def cosine(a, b):
-            dot = sum(x * y for x, y in zip(a, b))
-            na  = math.sqrt(sum(x * x for x in a))
-            nb  = math.sqrt(sum(x * x for x in b))
-            return dot / (na * nb) if na * nb > 0 else 0.0
+        # Cosine similarity matrix via numpy
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        normed = vectors / norms
+        sim_matrix = normed @ normed.T  # shape (n, n)
 
         for i, row in enumerate(group):
+            scores = sim_matrix[i]
+            top_idx = np.argsort(scores)[::-1]
             sims = []
-            for j, other in enumerate(group):
-                if i == j:
+            for j in top_idx:
+                if j == i:
                     continue
+                other = group[j]
                 sims.append({
-                    "id":         _i(other.get("player_id")),
+                    "id":         _i(other.get("cfb_player_id")),
                     "ps_id":      _i(other.get("player_season_id")),
                     "name":       other.get("name"),
                     "season":     other.get("season"),
                     "team":       other.get("school"),
                     "ovr":        round(_f(other.get("overall_rating"), 0), 1),
-                    "similarity": round(cosine(arr[i], arr[j]), 3),
+                    "similarity": round(float(scores[j]), 3),
                 })
-            sims.sort(key=lambda x: x["similarity"], reverse=True)
+                if len(sims) == 5:
+                    break
             ps_id = _i(row.get("player_season_id"))
             if ps_id is not None:
-                similar[ps_id] = sims[:5]
+                similar[ps_id] = sims
 
     write_json(output_dir / "similar_players.json", similar)
     print(f"  {len(similar)} player-seasons with similarity data")
@@ -523,11 +507,14 @@ def export_rosters(T: dict, output_dir: Path) -> None:
     if not rec.empty:
         rec_best = rec.sort_values("composite_score", ascending=False, na_position="last") \
                       .drop_duplicates(subset=["player_id"], keep="first") \
-                      [["player_id", "stars", "composite_score"]]
-        merged = merged.merge(rec_best, on="player_id", how="left")
+                      [["player_id", "stars", "composite_score"]] \
+                      .rename(columns={"player_id": "rec_pid",
+                                       "stars": "rec_stars",
+                                       "composite_score": "rec_composite"})
+        merged = merged.merge(rec_best, left_on="player_id", right_on="rec_pid", how="left")
     else:
-        merged["stars"] = None
-        merged["composite_score"] = None
+        merged["rec_stars"] = None
+        merged["rec_composite"] = None
 
     merged = merged[merged["team_id"].notna()]
 
@@ -545,8 +532,8 @@ def export_rosters(T: dict, output_dir: Path) -> None:
             "trajectory":       _f(row.get("trajectory_score")),
             "breakout_prob":    _f(row.get("breakout_probability")),
             "shap":             _parse_shap(row.get("shap_values")),
-            "stars":            _i(row.get("stars")),
-            "composite_score":  _f(row.get("composite_score")),
+            "stars":            _i(row.get("rec_stars")),
+            "composite_score":  _f(row.get("rec_composite")),
         })
 
     # Sort each team/season by overall_rating desc
@@ -762,7 +749,7 @@ def main():
     output_dir: Path = args.output
     season: int = args.season
 
-    print(f"\nExporting season {season} → {output_dir}\n")
+    print(f"\nExporting season {season} -> {output_dir}\n")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     T = load_tables()
