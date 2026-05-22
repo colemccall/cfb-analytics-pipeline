@@ -52,6 +52,7 @@ def _get(api_key: str, path: str, params: dict | None = None, retries: int = 5) 
             headers=_headers(api_key),
             params=params,
             timeout=30,
+            verify=False,
         )
         if resp.status_code == 429:
             wait = 5 * (2**attempt)  # 5, 10, 20, 40, 80s
@@ -141,6 +142,50 @@ def fetch_player_usage(api_key: str, year: int) -> list:
 def fetch_awards(api_key: str, year: int) -> list:
     """All-American, All-Conference, Heisman finalist awards."""
     return _safe(api_key, "/awards", {"year": year})
+
+
+def fetch_game_team_stats(api_key: str, year: int) -> dict:
+    """Per-game team-level box score stats for all games in a season.
+
+    Fetches week-by-week (the API requires week or team parameter).
+    Returns nested dict: {game_cfb_id: {team_db_id_or_cfb_id: {stat_category: value, ...}}}
+
+    Stat keys present: netPassingYards, rushingYards, completions, attempts, points,
+    turnovers, interceptions, passesDeflected, totalYards, etc.
+    """
+    all_games: dict = {}
+    for week in range(1, 16):
+        rows = _safe(api_key, "/games/teams", {"year": year, "week": week, "seasonType": "regular"})
+        for game in rows:
+            game_id = game.get("id")
+            if not game_id:
+                continue
+            all_games[game_id] = {}
+            for team in game.get("teams", []):
+                tid = team.get("teamId")
+                if not tid:
+                    continue
+                stats = {s["category"]: s["stat"] for s in team.get("stats", [])}
+                stats["_points"] = team.get("points")
+                stats["_homeAway"] = team.get("homeAway")
+                all_games[game_id][tid] = stats
+    # Postseason
+    for week in range(1, 8):
+        rows = _safe(api_key, "/games/teams", {"year": year, "week": week, "seasonType": "postseason"})
+        for game in rows:
+            game_id = game.get("id")
+            if not game_id:
+                continue
+            all_games[game_id] = {}
+            for team in game.get("teams", []):
+                tid = team.get("teamId")
+                if not tid:
+                    continue
+                stats = {s["category"]: s["stat"] for s in team.get("stats", [])}
+                stats["_points"] = team.get("points")
+                stats["_homeAway"] = team.get("homeAway")
+                all_games[game_id][tid] = stats
+    return all_games
 
 
 def fetch_games(api_key: str, year: int) -> list:

@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
-from utils.db import bulk_upsert, get_connection
+from utils.store import read_raw, read_computed, write_computed
 from utils.api_client import load_api_key, fetch_sp_ratings_breakdown, fetch_team_stats
 
 MODEL_VERSION = "v2.0-team"
@@ -131,10 +131,8 @@ def build_sp_map(season: int, api_key: str) -> dict:
 
     sp_keys = list(sp_by_name.keys())
 
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, school FROM teams")
-        teams = cur.fetchall()
+    teams_df = read_raw("teams")
+    teams = list(zip(teams_df["id"], teams_df["school"])) if not teams_df.empty else []
 
     result = {}
     exact = fuzzy = unmatched = 0
@@ -188,24 +186,24 @@ def avg_top(ratings: list, n: int) -> float:
 
 def load_starter_ratings_by_position(season: int) -> dict:
     """Return {team_id: {QB: [r1,r2,...], RB: [...], ...}} for starter-tier players."""
-    sql = """
-        SELECT ps.team_id, ps.position_group, r.overall_rating
-        FROM ratings r
-        JOIN player_seasons ps ON ps.id = r.player_season_id
-        WHERE r.season = %s
-          AND r.engine = 'edge'
-          AND r.overall_rating >= 55
-          AND r.overall_rating IS NOT NULL
-          AND ps.team_id IS NOT NULL
-    """
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, (season,))
-        rows = cur.fetchall()
+    rat_df = read_computed("ratings")
+    ps_df  = read_raw("player_seasons")[["id", "team_id", "position_group"]]
+
+    if rat_df.empty or ps_df.empty:
+        return {}
+
+    rat_df = rat_df[
+        (rat_df["season"] == season) &
+        (rat_df["engine"] == "edge") &
+        (rat_df["overall_rating"] >= 55) &
+        rat_df["overall_rating"].notna()
+    ]
+    merged = rat_df.merge(ps_df, left_on="player_season_id", right_on="id", how="left")
+    merged = merged[merged["team_id"].notna()]
 
     result: dict = defaultdict(lambda: defaultdict(list))
-    for team_id, pos_group, rating in rows:
-        result[team_id][pos_group].append(float(rating))
+    for _, row in merged.iterrows():
+        result[int(row["team_id"])][row["position_group"]].append(float(row["overall_rating"]))
     return result
 
 
@@ -350,22 +348,27 @@ def match_raw_to_teams(perf_scores: dict, teams: list) -> dict:
 def load_recruiting_scores(season: int) -> dict:
     """Return {team_id: recruiting_scaled (0-100)}."""
     start_year = season - RECRUITING_WINDOW + 1
-    sql = """
-        SELECT ps.team_id, r.composite_score
-        FROM recruiting r
-        JOIN player_seasons ps ON ps.player_id = r.player_id AND ps.season = r.recruit_year
-        WHERE r.recruit_year BETWEEN %s AND %s
-          AND r.composite_score IS NOT NULL
-          AND ps.team_id IS NOT NULL
-    """
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, (start_year, season))
-        rows = cur.fetchall()
+    rec_df = read_raw("recruiting")
+    ps_df  = read_raw("player_seasons")[["player_id", "team_id", "season"]].rename(columns={"season": "ps_season"})
+
+    if rec_df.empty or ps_df.empty:
+        return {}
+
+    rec_df = rec_df[
+        rec_df["recruit_year"].between(start_year, season) &
+        rec_df["composite_score"].notna()
+    ]
+    merged = rec_df.merge(
+        ps_df,
+        left_on=["player_id", "recruit_year"],
+        right_on=["player_id", "ps_season"],
+        how="inner"
+    )
+    merged = merged[merged["team_id"].notna()]
 
     scores: dict = defaultdict(list)
-    for team_id, composite in rows:
-        scores[team_id].append(float(composite))
+    for _, row in merged.iterrows():
+        scores[int(row["team_id"])].append(float(row["composite_score"]))
 
     return {
         tid: max(0.0, min(100.0, (float(np.mean(vals)) - REC_MIN) / (REC_MAX - REC_MIN) * 100.0))
@@ -378,14 +381,15 @@ def load_recruiting_scores(season: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def load_coaching_changes(season: int) -> set:
-    sql = """
-        SELECT DISTINCT team_id FROM coaching_changes
-        WHERE start_season = %s AND role IN ('HC','OC','DC') AND team_id IS NOT NULL
-    """
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, (season,))
-        return {row[0] for row in cur.fetchall()}
+    df = read_raw("coaching_changes")
+    if df.empty:
+        return set()
+    df = df[
+        (df["start_season"] == season) &
+        (df["role"].isin(["HC", "OC", "DC"])) &
+        df["team_id"].notna()
+    ]
+    return set(df["team_id"].astype(int))
 
 
 # ---------------------------------------------------------------------------
@@ -393,10 +397,10 @@ def load_coaching_changes(season: int) -> set:
 # ---------------------------------------------------------------------------
 
 def load_teams() -> list:
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, school, conference FROM teams ORDER BY school")
-        return cur.fetchall()
+    df = read_raw("teams")
+    if df.empty:
+        return []
+    return list(zip(df["id"], df["school"], df["conference"]))
 
 
 # ---------------------------------------------------------------------------
@@ -541,8 +545,20 @@ def run_season(season: int, api_key: str) -> None:
         seen[(r["team_id"], r["season"])] = r
     rows = list(seen.values())
 
-    print(f"\nUpserting {len(rows)} team rating rows...")
-    bulk_upsert("team_ratings", rows, conflict_col=["team_id", "season"])
+    import pandas as pd
+    new_df = pd.DataFrame(rows)
+    existing = read_computed("team_ratings")
+    if not existing.empty:
+        mask = ~(
+            existing["team_id"].isin(new_df["team_id"]) &
+            existing["season"].isin(new_df["season"])
+        )
+        combined = pd.concat([existing[mask], new_df], ignore_index=True)
+    else:
+        combined = new_df
+
+    print(f"\nWriting {len(rows)} team rating rows...")
+    write_computed("team_ratings", combined)
     print(f"  Done. {len(rows)} rows written.")
 
     # Top-10 summary
