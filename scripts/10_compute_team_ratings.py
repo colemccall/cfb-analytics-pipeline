@@ -1,25 +1,16 @@
-"""Team Ratings - composite per-team quality score per season.
+"""Team Ratings v2 — three-signal composite with position-weighted splits.
 
-Blends four signals into a single 0-100 overall_rating, plus split
-offense/defense ratings:
+Blends three signals into five split ratings (pass_off, run_off, pass_def,
+run_def, special_teams) stored in sub_ratings JSONB, plus overall/offense/defense:
 
-  1. SP+ (schedule-adjusted performance): sigmoid-scaled so SP+ ~0 -> ~50,
-     +30 (elite) -> ~85, -30 (basement) -> ~15.
-  2. Roster quality: average overall_rating of starter-tier players, split
-     by side of ball. Requires script 06 to have run first.
-  3. Recruiting: 5-year rolling average of composite_score for players who
-     joined this team, scaled from the 0.80-1.00 range to 0-100.
-  4. Stability anchor: 5% weight toward the national mean (50) so teams with
-     no data don't collapse to 0.
+  1. SP+ (45%) — schedule-adjusted; sigmoid-scaled so SP+~0 → 50, ±30 → ±35.
+  2. Position-weighted player talent (30%) — top-N starter ratings per position,
+     blended into pass/run/pass-def/run-def composites.
+  3. Raw team stats + advanced metrics (25%) — net passing/rushing yards,
+     3rd-down conversion rates, and havoc (TFL + 2×INTs + fumbles recovered).
 
-Offense/defense ratings use the same weights but substitute the side-specific
-SP+ and starter averages.
-
-SP+ team matching: exact lowercase, then fuzzy (SequenceMatcher >= 0.80).
-If no match is found, substitute the national mean SP+ for that season.
-
-Coaching-change flag: TRUE if any HC/OC/DC row in coaching_changes has
-start_season = the computed season.
+Ratings use fixed absolute anchors (like EDGE player ratings) for cross-season
+comparability. A team that rates 89 in 2019 genuinely compares to an 89 in 2025.
 
 Usage:
     python scripts/10_compute_team_ratings.py              # 2025
@@ -30,6 +21,7 @@ Usage:
 import argparse
 import json
 import sys
+from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -40,69 +32,104 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
 from utils.db import bulk_upsert, get_connection
-from utils.api_client import load_api_key, fetch_sp_ratings_breakdown
+from utils.api_client import load_api_key, fetch_sp_ratings_breakdown, fetch_team_stats
 
-MODEL_VERSION = "v1.0-team"
+MODEL_VERSION = "v2.0-team"
 
-# Composite weights
+# ---------------------------------------------------------------------------
+# Weight constants
+# ---------------------------------------------------------------------------
+
 W_SP        = 0.45
-W_ROSTER    = 0.35
-W_RECRUITING = 0.15
-W_ANCHOR    = 0.05   # pulls toward 50
+W_ROSTER    = 0.30
+W_RAW       = 0.25
 
-# Split weights (offense_rating / defense_rating)
-W_SP_SPLIT      = 0.50
-W_ROSTER_SPLIT  = 0.45
-W_REC_SPLIT     = 0.05
+# Split weights within roster signal
+W_QB   = 0.45;  W_WR_TE = 0.35;  W_OL = 0.20   # pass_off
+W_RB   = 0.40;  W_OL_RUN = 0.40; W_QB_RUN = 0.10; W_WR_TE_RUN = 0.10  # run_off
+W_DB   = 0.45;  W_LB_PDEF = 0.30; W_DL_PDEF = 0.25  # pass_def
+W_DL   = 0.40;  W_LB_RDEF = 0.35; W_DB_RDEF = 0.25  # run_def
 
-# Recruiting composite score range to normalize (0-100)
-REC_MIN = 0.80
-REC_MAX = 1.00
+# Overall from splits
+W_PASS_OFF = 0.25;  W_RUN_OFF = 0.25
+W_PASS_DEF = 0.25;  W_RUN_DEF = 0.20;  W_SPEC = 0.05
 
-# Fuzzy match threshold for SP+ team name lookup
-FUZZY_THRESHOLD = 0.80
+# Offense/defense rollup
+W_OFF_SPLIT = 0.50  # pass_off:run_off split
+W_DEF_SPLIT = 0.55  # pass_def:run_def split (pass-heavy)
 
-# Tier that counts as "starters"
+# Raw stat blend (raw × 0.60 + 3rd-down × 0.40, with havoc for defense)
+W_RAW_BASE  = 0.60;  W_3RD = 0.40
+W_RAW_D_BASE = 0.60; W_3RD_D = 0.20; W_HAVOC = 0.20
+
+# Recruiting constants
+REC_MIN = 0.80;  REC_MAX = 1.00
+RECRUITING_WINDOW = 5
+
+# Starter tier threshold
 STARTER_TIER = "starter"
 
-# Position groups for each side
+# Fuzzy match threshold for SP+ name lookup
+FUZZY_THRESHOLD = 0.80
+
+# Position group sets
 OFF_POSITIONS = {"QB", "RB", "WR", "TE", "OL"}
 DEF_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
 
-# Recruiting window in years (rolling)
-RECRUITING_WINDOW = 5
+# Fixed absolute anchors — cross-season stable (do NOT use percentile curve)
+# Maps blended composite (0-100) → OVR target.
+# Calibrated from 2025 actual composite distribution:
+#   Bottom FBS ≈ 45-48, average FBS ≈ 54-57, p90 ≈ 61, top-5 ≈ 63-65
+# Goal: top-5 nationally → 91-95, average FBS → 65-70, cellar → 40-50.
+TEAM_OVR_ANCHORS = [
+    (30.0,  30),   # FCS / worst FBS floor
+    (46.0,  45),   # cellar FBS (0-win territory)
+    (51.0,  58),   # bottom quarter FBS
+    (54.5,  65),   # average FBS team
+    (57.5,  72),   # bowl-eligible, .500 P4
+    (59.5,  78),   # solid P4, 8-9 wins
+    (61.0,  84),   # conference contender, 10+ wins
+    (62.5,  89),   # CFP-caliber top-12
+    (63.5,  93),   # top-5 nationally
+    (65.0,  97),   # historically elite (rare)
+]
+
+_ANCHOR_X = [a[0] for a in TEAM_OVR_ANCHORS]
+_ANCHOR_Y = [a[1] for a in TEAM_OVR_ANCHORS]
+
+
+def composite_to_ovr(composite: float) -> float:
+    """Map blended composite (0-100) to OVR via fixed piecewise-linear anchors."""
+    return float(np.interp(composite, _ANCHOR_X, _ANCHOR_Y))
+
+
+def _clip(val: float) -> float:
+    return max(10.0, min(99.0, val))
 
 
 # ---------------------------------------------------------------------------
 # SP+ helpers
 # ---------------------------------------------------------------------------
 
-def _fuzzy_match(name: str, candidates: list[str], threshold: float = FUZZY_THRESHOLD) -> str | None:
-    """Return the best-matching candidate string, or None if below threshold."""
+def _fuzzy_match(name: str, candidates: list, threshold: float = FUZZY_THRESHOLD):
     best_score = 0.0
     best_match = None
-    for candidate in candidates:
-        score = SequenceMatcher(None, name, candidate).ratio()
-        if score > best_score:
-            best_score = score
-            best_match = candidate
-    if best_score >= threshold:
-        return best_match
-    return None
+    for c in candidates:
+        s = SequenceMatcher(None, name, c).ratio()
+        if s > best_score:
+            best_score = s
+            best_match = c
+    return best_match if best_score >= threshold else None
 
 
 def build_sp_map(season: int, api_key: str) -> dict:
-    """Return {team_db_id: {overall, offense, defense}} for a season.
-
-    Exact match by lowercased school name first; fuzzy fallback at 0.80.
-    Teams with no SP+ data are excluded - callers substitute the season mean.
-    """
+    """Return {team_db_id: {overall, offense, defense}} for a season."""
     sp_by_name = fetch_sp_ratings_breakdown(api_key, season)
     if not sp_by_name:
         print(f"  Warning: no SP+ data returned for {season}")
         return {}
 
-    sp_keys = list(sp_by_name.keys())   # already lowercase
+    sp_keys = list(sp_by_name.keys())
 
     with get_connection() as conn:
         cur = conn.cursor()
@@ -110,35 +137,32 @@ def build_sp_map(season: int, api_key: str) -> dict:
         teams = cur.fetchall()
 
     result = {}
-    matched_exact = 0
-    matched_fuzzy = 0
-    unmatched = 0
-
+    exact = fuzzy = unmatched = 0
     for db_id, school in teams:
         lower = school.lower()
         if lower in sp_by_name:
             result[db_id] = sp_by_name[lower]
-            matched_exact += 1
+            exact += 1
         else:
-            fuzzy = _fuzzy_match(lower, sp_keys)
-            if fuzzy:
-                result[db_id] = sp_by_name[fuzzy]
-                matched_fuzzy += 1
+            m = _fuzzy_match(lower, sp_keys)
+            if m:
+                result[db_id] = sp_by_name[m]
+                fuzzy += 1
             else:
                 unmatched += 1
 
-    print(f"  SP+ matched: {matched_exact} exact, {matched_fuzzy} fuzzy, {unmatched} unmatched")
+    print(f"  SP+ matched: {exact} exact, {fuzzy} fuzzy, {unmatched} unmatched")
     return result
 
 
-def sp_scaled(raw: float | None, mean: float = 0.0) -> float:
-    """Sigmoid-scale SP+ to 0-100. SP+~0 -> 50, +30 -> ~85, -30 -> ~15."""
+def sp_scaled(raw, mean: float = 0.0) -> float:
+    """Sigmoid-scale SP+ to 0-100. SP+~0→50, ±30→±35."""
     val = raw if raw is not None else mean
-    return 50.0 + 35.0 * float(np.tanh(val / 25.0))
+    return 50.0 + 35.0 * float(np.tanh(float(val) / 25.0))
 
 
-def sp_season_means(sp_map: dict) -> tuple[float, float, float]:
-    """Return (mean_overall, mean_offense, mean_defense) across teams with SP+ data."""
+def sp_season_means(sp_map: dict) -> tuple:
+    """Return (mean_overall, mean_offense, mean_defense_raw) — defense is raw (higher=worse)."""
     if not sp_map:
         return 0.0, 25.0, 25.0
     overs = [v["overall"] for v in sp_map.values()]
@@ -147,60 +171,175 @@ def sp_season_means(sp_map: dict) -> tuple[float, float, float]:
     return (
         float(np.mean(overs)) if overs else 0.0,
         float(np.mean(offs))  if offs  else 25.0,
-        float(np.mean(defs))  if defs  else 25.0,
+        float(np.mean(defs))  if defs  else 25.0,  # raw mean; caller negates for sigmoid
     )
 
 
 # ---------------------------------------------------------------------------
-# Roster quality from player ratings
+# Position-weighted roster quality
 # ---------------------------------------------------------------------------
 
-def load_starter_ratings(season: int) -> dict:
-    """Return {team_id: {offense_avg, defense_avg, overall_avg, starter_count}}
-    using starter-tier player ratings for the season.
-    """
+def avg_top(ratings: list, n: int) -> float:
+    """Average top-N ratings from list; return 50.0 if empty."""
+    if not ratings:
+        return 50.0
+    return float(np.mean(sorted(ratings, reverse=True)[:n]))
+
+
+def load_starter_ratings_by_position(season: int) -> dict:
+    """Return {team_id: {QB: [r1,r2,...], RB: [...], ...}} for starter-tier players."""
     sql = """
-        SELECT
-            ps.team_id,
-            ps.position_group,
-            r.overall_rating
+        SELECT ps.team_id, ps.position_group, r.overall_rating
         FROM ratings r
         JOIN player_seasons ps ON ps.id = r.player_season_id
         WHERE r.season = %s
-          AND r.tier = %s
+          AND r.engine = 'edge'
+          AND r.overall_rating >= 55
           AND r.overall_rating IS NOT NULL
           AND ps.team_id IS NOT NULL
     """
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute(sql, (season, STARTER_TIER))
+        cur.execute(sql, (season,))
         rows = cur.fetchall()
 
-    # Aggregate per team
-    from collections import defaultdict
-    off_ratings: dict  = defaultdict(list)
-    def_ratings: dict  = defaultdict(list)
-
+    result: dict = defaultdict(lambda: defaultdict(list))
     for team_id, pos_group, rating in rows:
-        if pos_group in OFF_POSITIONS:
-            off_ratings[team_id].append(float(rating))
-        elif pos_group in DEF_POSITIONS:
-            def_ratings[team_id].append(float(rating))
+        result[team_id][pos_group].append(float(rating))
+    return result
 
-    all_team_ids = set(off_ratings) | set(def_ratings)
-    result = {}
-    for tid in all_team_ids:
-        off_avg = float(np.mean(off_ratings[tid])) if off_ratings[tid] else None
-        def_avg = float(np.mean(def_ratings[tid])) if def_ratings[tid] else None
-        parts = [x for x in [off_avg, def_avg] if x is not None]
-        team_avg = float(np.mean(parts)) if parts else None
-        total_count = len(off_ratings[tid]) + len(def_ratings[tid])
-        result[tid] = {
-            "offense_avg":    off_avg,
-            "defense_avg":    def_avg,
-            "overall_avg":    team_avg,
-            "starter_count":  total_count,
+
+def compute_roster_splits(by_pos: dict) -> dict:
+    """Compute pass_off, run_off, pass_def, run_def, special_teams from position ratings."""
+    def g(pos):
+        return by_pos.get(pos, [])
+
+    # Merge DB/CB/S into a DB bucket
+    db_all = g("DB") + g("CB") + g("S")
+    dl_all = g("DL") + g("EDGE")
+
+    pass_off = (avg_top(g("QB"),   2) * W_QB
+              + avg_top(g("WR") + g("TE"), 5) * W_WR_TE
+              + avg_top(g("OL"),   5) * W_OL)
+
+    run_off  = (avg_top(g("RB"),   3) * W_RB
+              + avg_top(g("OL"),   5) * W_OL_RUN
+              + avg_top(g("QB"),   2) * W_QB_RUN
+              + avg_top(g("WR") + g("TE"), 5) * W_WR_TE_RUN)
+
+    pass_def = (avg_top(db_all,    5) * W_DB
+              + avg_top(g("LB"),   4) * W_LB_PDEF
+              + avg_top(dl_all,    4) * W_DL_PDEF)
+
+    run_def  = (avg_top(dl_all,    4) * W_DL
+              + avg_top(g("LB"),   4) * W_LB_RDEF
+              + avg_top(db_all,    5) * W_DB_RDEF)
+
+    special  = avg_top(g("K") + g("P"), 2)
+
+    return {
+        "pass_off": pass_off,
+        "run_off":  run_off,
+        "pass_def": pass_def,
+        "run_def":  run_def,
+        "special":  special,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Raw team stats signal
+# ---------------------------------------------------------------------------
+
+def build_perf_scores(season: int, api_key: str) -> dict:
+    """Fetch team season stats and normalize 0-1 across FBS teams.
+
+    Returns {team_name_lower: {pass_off, run_off, pass_def, run_def}} — all 0-1.
+    """
+    raw = fetch_team_stats(api_key, season)
+    if not raw:
+        print(f"  Warning: no team stats returned for {season}")
+        return {}
+
+    # Extract needed fields per team
+    teams_data = {}
+    for row in raw:
+        name = (row.get("team") or "").lower().strip()
+        if not name:
+            continue
+        teams_data[name] = {
+            "net_pass_off":  row.get("netPassingYards") or 0,
+            "rush_off":      row.get("rushingYards") or 0,
+            "net_pass_def":  row.get("netPassingYardsAllowed") or row.get("netPassingYardsOpponent") or 0,
+            "rush_def":      row.get("rushingYardsAllowed") or row.get("rushingYardsOpponent") or 0,
+            "td3_att":       row.get("thirdDownConversions") or 0,
+            "td3_total":     max(row.get("thirdDowns") or 1, 1),
+            "td3d_att":      row.get("thirdDownConversionsAllowed") or row.get("thirdDownConversionsOpponent") or 0,
+            "td3d_total":    max(row.get("thirdDownsOpponent") or row.get("thirdDownsAllowed") or 1, 1),
+            "tfl":           row.get("tacklesForLoss") or 0,
+            "ints":          row.get("interceptions") or 0,
+            "fum_rec":       row.get("fumblesRecovered") or 0,
         }
+
+    if not teams_data:
+        return {}
+
+    # Compute derived metrics
+    for d in teams_data.values():
+        d["3rd_off_rate"] = d["td3_att"] / d["td3_total"]
+        d["3rd_def_rate"] = d["td3d_att"] / d["td3d_total"]
+        d["havoc"] = d["tfl"] + d["ints"] * 2 + d["fum_rec"]
+
+    def normalize(key: str, vals: dict, invert: bool = False) -> dict:
+        """Normalize a metric 0-1 across all teams."""
+        v_list = [d[key] for d in vals.values()]
+        lo, hi = min(v_list), max(v_list)
+        if hi == lo:
+            return {n: 0.5 for n in vals}
+        result = {}
+        for n, d in vals.items():
+            norm = (d[key] - lo) / (hi - lo)
+            result[n] = 1.0 - norm if invert else norm
+        return result
+
+    n_pass_off  = normalize("net_pass_off",  teams_data)
+    n_rush_off  = normalize("rush_off",      teams_data)
+    n_pass_def  = normalize("net_pass_def",  teams_data, invert=True)
+    n_rush_def  = normalize("rush_def",      teams_data, invert=True)
+    n_3rd_off   = normalize("3rd_off_rate",  teams_data)
+    n_3rd_def   = normalize("3rd_def_rate",  teams_data, invert=True)
+    n_havoc     = normalize("havoc",         teams_data)
+
+    result = {}
+    for name in teams_data:
+        raw_pass_off_adv = n_pass_off[name] * W_RAW_BASE + n_3rd_off[name] * W_3RD
+        raw_run_off_adv  = n_rush_off[name] * W_RAW_BASE + n_3rd_off[name] * W_3RD
+        raw_pass_def_adv = n_pass_def[name] * W_RAW_D_BASE + n_3rd_def[name] * W_3RD_D + n_havoc[name] * W_HAVOC
+        raw_run_def_adv  = n_rush_def[name] * W_RAW_D_BASE + n_3rd_def[name] * W_3RD_D + n_havoc[name] * W_HAVOC
+        result[name] = {
+            "pass_off": raw_pass_off_adv * 100.0,
+            "run_off":  raw_run_off_adv  * 100.0,
+            "pass_def": raw_pass_def_adv * 100.0,
+            "run_def":  raw_run_def_adv  * 100.0,
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Match raw stats to DB team ids
+# ---------------------------------------------------------------------------
+
+def match_raw_to_teams(perf_scores: dict, teams: list) -> dict:
+    """Return {team_db_id: {pass_off, run_off, pass_def, run_def}} using fuzzy name match."""
+    perf_keys = list(perf_scores.keys())
+    result = {}
+    for db_id, school, _ in teams:
+        lower = school.lower()
+        if lower in perf_scores:
+            result[db_id] = perf_scores[lower]
+        else:
+            m = _fuzzy_match(lower, perf_keys)
+            if m:
+                result[db_id] = perf_scores[m]
     return result
 
 
@@ -209,18 +348,12 @@ def load_starter_ratings(season: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def load_recruiting_scores(season: int) -> dict:
-    """Return {team_id: recruiting_scaled (0-100)} for the 5-year window ending
-    at `season`. Joins recruiting -> player_seasons to get team context.
-    """
+    """Return {team_id: recruiting_scaled (0-100)}."""
     start_year = season - RECRUITING_WINDOW + 1
     sql = """
-        SELECT
-            ps.team_id,
-            r.composite_score
+        SELECT ps.team_id, r.composite_score
         FROM recruiting r
-        JOIN player_seasons ps
-            ON ps.player_id = r.player_id
-           AND ps.season     = r.recruit_year
+        JOIN player_seasons ps ON ps.player_id = r.player_id AND ps.season = r.recruit_year
         WHERE r.recruit_year BETWEEN %s AND %s
           AND r.composite_score IS NOT NULL
           AND ps.team_id IS NOT NULL
@@ -230,17 +363,14 @@ def load_recruiting_scores(season: int) -> dict:
         cur.execute(sql, (start_year, season))
         rows = cur.fetchall()
 
-    from collections import defaultdict
     scores: dict = defaultdict(list)
     for team_id, composite in rows:
         scores[team_id].append(float(composite))
 
-    result = {}
-    for tid, vals in scores.items():
-        avg = float(np.mean(vals))
-        scaled = max(0.0, min(100.0, (avg - REC_MIN) / (REC_MAX - REC_MIN) * 100.0))
-        result[tid] = scaled
-    return result
+    return {
+        tid: max(0.0, min(100.0, (float(np.mean(vals)) - REC_MIN) / (REC_MAX - REC_MIN) * 100.0))
+        for tid, vals in scores.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -248,15 +378,9 @@ def load_recruiting_scores(season: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def load_coaching_changes(season: int) -> set:
-    """Return set of team_ids that had a head/offensive/defensive coordinator
-    change starting in `season`.
-    """
     sql = """
-        SELECT DISTINCT team_id
-        FROM coaching_changes
-        WHERE start_season = %s
-          AND role IN ('HC', 'OC', 'DC')
-          AND team_id IS NOT NULL
+        SELECT DISTINCT team_id FROM coaching_changes
+        WHERE start_season = %s AND role IN ('HC','OC','DC') AND team_id IS NOT NULL
     """
     with get_connection() as conn:
         cur = conn.cursor()
@@ -268,8 +392,7 @@ def load_coaching_changes(season: int) -> set:
 # Load all teams
 # ---------------------------------------------------------------------------
 
-def load_teams() -> list[tuple]:
-    """Return list of (id, school, conference) for all teams."""
+def load_teams() -> list:
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT id, school, conference FROM teams ORDER BY school")
@@ -277,83 +400,76 @@ def load_teams() -> list[tuple]:
 
 
 # ---------------------------------------------------------------------------
-# Composite formula
+# Three-signal blend → five splits → OVR
 # ---------------------------------------------------------------------------
 
-def _clip(val: float) -> float:
-    return max(10.0, min(99.0, val))
-
-
-def compute_team_rating(
+def compute_team_splits(
+    team_id: int,
     sp: dict | None,
-    roster: dict | None,
-    recruiting_scaled: float | None,
-    sp_means: tuple[float, float, float],
+    roster_by_pos: dict,
+    raw: dict | None,
+    sp_means: tuple,
+    rec_scaled: float | None,
 ) -> dict:
-    """Compute overall/offense/defense ratings from component signals.
-
-    All missing components fall back to the national mean (50 for scaled metrics).
-    Returns dict with keys: overall_rating, offense_rating, defense_rating,
-    sp_overall_scaled, sp_offense_scaled, sp_defense_scaled.
-    """
+    """Blend three signals into pass_off, run_off, pass_def, run_def, special_teams, overall."""
     mean_ovr, mean_off, mean_def = sp_means
 
-    sp_raw_ovr  = sp["overall"]  if sp else None
-    sp_raw_off  = sp["offense"]  if sp else None
-    sp_raw_def  = sp["defense"]  if sp else None
+    sp_off_s = sp_scaled(sp["offense"] if sp else None, mean_off)
+    # SP+ defense: lower = better (points allowed). Negate so sigmoid maps correctly.
+    sp_def_raw = sp["defense"] if sp else None
+    sp_def_s = sp_scaled(-sp_def_raw if sp_def_raw is not None else None, -mean_def)
 
-    sp_ovr_s  = sp_scaled(sp_raw_ovr,  mean_ovr)
-    sp_off_s  = sp_scaled(sp_raw_off,  mean_off)
-    sp_def_s  = sp_scaled(sp_raw_def,  mean_def)
+    # Signal 1: roster
+    ros = compute_roster_splits(roster_by_pos)
 
-    off_avg  = roster["offense_avg"] if roster else None
-    def_avg  = roster["defense_avg"] if roster else None
-    team_avg = roster["overall_avg"] if roster else None
+    # Signal 2: raw stats (0-100 already)
+    raw_pass_off = raw["pass_off"] if raw else 50.0
+    raw_run_off  = raw["run_off"]  if raw else 50.0
+    raw_pass_def = raw["pass_def"] if raw else 50.0
+    raw_run_def  = raw["run_def"]  if raw else 50.0
 
-    # Fallback missing roster to 50 (midpoint)
-    off_avg_f  = off_avg  if off_avg  is not None else 50.0
-    def_avg_f  = def_avg  if def_avg  is not None else 50.0
-    team_avg_f = team_avg if team_avg is not None else 50.0
+    # Three-signal blend per split
+    pass_off = ros["pass_off"] * W_ROSTER + sp_off_s * W_SP + raw_pass_off * W_RAW
+    run_off  = ros["run_off"]  * W_ROSTER + sp_off_s * W_SP + raw_run_off  * W_RAW
+    pass_def = ros["pass_def"] * W_ROSTER + sp_def_s * W_SP + raw_pass_def * W_RAW
+    run_def  = ros["run_def"]  * W_ROSTER + sp_def_s * W_SP + raw_run_def  * W_RAW
+    special  = ros["special"]   # raw only — SP+ has no special teams split
 
-    rec_f = recruiting_scaled if recruiting_scaled is not None else 50.0
+    # Overall composite from splits → fixed-anchor OVR
+    composite = (pass_off * W_PASS_OFF + run_off * W_RUN_OFF
+               + pass_def * W_PASS_DEF + run_def * W_RUN_DEF
+               + special  * W_SPEC)
 
-    overall = (
-        W_SP         * sp_ovr_s
-        + W_ROSTER   * team_avg_f
-        + W_RECRUITING * rec_f
-        + W_ANCHOR   * 50.0
-    )
-    offense = (
-        W_SP_SPLIT     * sp_off_s
-        + W_ROSTER_SPLIT * off_avg_f
-        + W_REC_SPLIT  * rec_f
-    )
-    defense = (
-        W_SP_SPLIT     * sp_def_s
-        + W_ROSTER_SPLIT * def_avg_f
-        + W_REC_SPLIT  * rec_f
-    )
+    ovr = composite_to_ovr(composite)
+
+    # Offense/defense rollup (for backward compat display)
+    offense = (pass_off * W_OFF_SPLIT + run_off * (1 - W_OFF_SPLIT))
+    defense = (pass_def * W_DEF_SPLIT + run_def * (1 - W_DEF_SPLIT))
+
+    def r2(v): return round(float(v), 2)
 
     return {
-        "overall_rating":   round(_clip(overall), 2),
-        "offense_rating":   round(_clip(offense), 2),
-        "defense_rating":   round(_clip(defense), 2),
-        "sp_overall_scaled": round(sp_ovr_s, 2),
-        "sp_offense_scaled": round(sp_off_s, 2),
-        "sp_defense_scaled": round(sp_def_s, 2),
+        "pass_off":       r2(_clip(pass_off)),
+        "run_off":        r2(_clip(run_off)),
+        "pass_def":       r2(_clip(pass_def)),
+        "run_def":        r2(_clip(run_def)),
+        "special_teams":  r2(_clip(special)),
+        "overall_rating": r2(_clip(ovr)),
+        "offense_rating": r2(_clip(offense)),
+        "defense_rating": r2(_clip(defense)),
+        "composite":      r2(composite),
     }
 
 
 # ---------------------------------------------------------------------------
-# Main computation for one season
+# Main per-season computation
 # ---------------------------------------------------------------------------
 
 def run_season(season: int, api_key: str) -> None:
     print(f"\n{'='*60}")
-    print(f"Computing Team Ratings - Season {season}")
+    print(f"Computing Team Ratings v2 - Season {season}")
     print(f"{'='*60}")
 
-    print("Loading teams...")
     teams = load_teams()
     print(f"  {len(teams)} teams")
 
@@ -363,80 +479,75 @@ def run_season(season: int, api_key: str) -> None:
     print(f"  Season SP+ means: overall={sp_means[0]:.1f}, "
           f"offense={sp_means[1]:.1f}, defense={sp_means[2]:.1f}")
 
-    print("Loading starter ratings from player ratings...")
-    roster_map = load_starter_ratings(season)
-    teams_with_ratings = len(roster_map)
-    if teams_with_ratings == 0:
-        print("  Warning: no starter ratings found. Run script 06 first. "
-              "Roster quality will fall back to 50.")
-    else:
-        print(f"  {teams_with_ratings} teams have starter-tier player ratings")
+    print("Loading position-weighted roster ratings...")
+    roster_map = load_starter_ratings_by_position(season)
+    print(f"  {len(roster_map)} teams have starter-tier player ratings")
 
-    print(f"Loading recruiting scores ({season - RECRUITING_WINDOW + 1}-{season} window)...")
+    print("Loading raw team stats...")
+    perf_raw = build_perf_scores(season, api_key)
+    raw_map = match_raw_to_teams(perf_raw, teams)
+    print(f"  {len(raw_map)} teams have raw stat data")
+
+    print(f"Loading recruiting ({season - RECRUITING_WINDOW + 1}–{season})...")
     recruiting_map = load_recruiting_scores(season)
     print(f"  {len(recruiting_map)} teams have recruiting data")
 
     print("Loading coaching changes...")
     coaching_change_teams = load_coaching_changes(season)
-    print(f"  {len(coaching_change_teams)} teams with HC/OC/DC changes in {season}")
+    print(f"  {len(coaching_change_teams)} teams with HC/OC/DC changes")
 
-    # Build one row per team
     rows = []
+    school_map = {t[0]: t[1] for t in teams}
+
     for team_id, school, conference in teams:
         sp      = sp_map.get(team_id)
-        roster  = roster_map.get(team_id)
+        by_pos  = dict(roster_map.get(team_id, {}))
+        raw     = raw_map.get(team_id)
         rec_s   = recruiting_map.get(team_id)
 
-        ratings = compute_team_rating(sp, roster, rec_s, sp_means)
+        splits = compute_team_splits(team_id, sp, by_pos, raw, sp_means, rec_s)
 
-        starter_count = roster["starter_count"] if roster else 0
-        off_avg       = roster["offense_avg"]   if roster else None
-        def_avg       = roster["defense_avg"]   if roster else None
-        avg_starter   = roster["overall_avg"]   if roster else None
-
-        # sub_ratings carries the intermediate inputs for auditability
         sub_ratings = {
-            "sp_overall_scaled":  ratings["sp_overall_scaled"],
-            "sp_offense_scaled":  ratings["sp_offense_scaled"],
-            "sp_defense_scaled":  ratings["sp_defense_scaled"],
-            "offense_roster_avg": round(off_avg, 2) if off_avg is not None else None,
-            "defense_roster_avg": round(def_avg, 2) if def_avg is not None else None,
-            "recruiting_scaled":  round(rec_s, 2)   if rec_s  is not None else None,
+            "pass_off":           splits["pass_off"],
+            "run_off":            splits["run_off"],
+            "pass_def":           splits["pass_def"],
+            "run_def":            splits["run_def"],
+            "special_teams":      splits["special_teams"],
+            "composite":          splits["composite"],
+            "sp_offense_scaled":  round(sp_scaled(sp["offense"] if sp else None, sp_means[1]), 2),
+            "sp_defense_scaled":  round(sp_scaled(sp["defense"] if sp else None, sp_means[2]), 2),
+            "recruiting_scaled":  round(rec_s, 2) if rec_s is not None else None,
         }
 
         rows.append({
             "team_id":            team_id,
             "season":             season,
-            "overall_rating":     ratings["overall_rating"],
-            "offense_rating":     ratings["offense_rating"],
-            "defense_rating":     ratings["defense_rating"],
-            "sp_overall":         round(sp["overall"], 2) if sp else None,
-            "sp_offense":         round(sp["offense"], 2) if sp else None,
-            "sp_defense":         round(sp["defense"], 2) if sp else None,
+            "overall_rating":     splits["overall_rating"],
+            "offense_rating":     splits["offense_rating"],
+            "defense_rating":     splits["defense_rating"],
+            "sp_overall":         round(sp["overall"], 2)  if sp else None,
+            "sp_offense":         round(sp["offense"], 2)  if sp else None,
+            "sp_defense":         round(sp["defense"], 2)  if sp else None,
             "recruiting_score":   round(rec_s, 2) if rec_s is not None else None,
-            "avg_starter_rating": round(avg_starter, 2) if avg_starter is not None else None,
-            "starter_count":      starter_count,
+            "avg_starter_rating": None,  # deprecated in v2; use sub_ratings
+            "starter_count":      sum(len(v) for v in by_pos.values()),
             "coaching_change":    team_id in coaching_change_teams,
             "sub_ratings":        json.dumps(sub_ratings),
         })
 
-    # Dedup by (team_id, season) - should already be unique, but be safe
+    # Dedup
     seen: dict = {}
     for r in rows:
-        key = (r["team_id"], r["season"])
-        seen[key] = r
+        seen[(r["team_id"], r["season"])] = r
     rows = list(seen.values())
 
     print(f"\nUpserting {len(rows)} team rating rows...")
     bulk_upsert("team_ratings", rows, conflict_col=["team_id", "season"])
     print(f"  Done. {len(rows)} rows written.")
 
-    # Print top-10 summary
+    # Top-10 summary
     sorted_rows = sorted(rows, key=lambda r: r["overall_rating"] or 0, reverse=True)
     top10 = sorted_rows[:10]
-
-    # Build school lookup
-    school_map = {t[0]: t[1] for t in teams}
 
     print(f"\n{'='*52}")
     print(f"  Top 10 Teams - {season} Overall Rating")
@@ -445,6 +556,9 @@ def run_season(season: int, api_key: str) -> None:
     print(f"  {'-'*4:<5} {'-'*27:<28} {'-'*7:>7} {'-'*5:>6} {'-'*5:>6}")
     for rank, row in enumerate(top10, 1):
         school = school_map.get(row["team_id"], f"team#{row['team_id']}")
+        sub = json.loads(row["sub_ratings"]) if isinstance(row["sub_ratings"], str) else row["sub_ratings"]
+        po = sub.get("pass_off", "—")
+        ro = sub.get("run_off",  "—")
         print(
             f"  {rank:<5} {school:<28} "
             f"{row['overall_rating']:>7.1f} "
@@ -460,20 +574,17 @@ def run_season(season: int, api_key: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compute composite team ratings per season and upsert to team_ratings."
+        description="Compute v2 team ratings with position-weighted splits per season."
     )
-    parser.add_argument("--season", type=int, default=2025,
-                        help="Season to compute (default: 2025)")
+    parser.add_argument("--season", type=int, default=2025)
     parser.add_argument("--all-seasons", action="store_true",
                         help="Compute for all seasons 2008-2025")
     args = parser.parse_args()
 
     api_key = load_api_key()
-
     seasons = list(range(2008, 2026)) if args.all_seasons else [args.season]
     for s in seasons:
         run_season(s, api_key)
-
     print("\nDone.")
 
 

@@ -98,11 +98,11 @@ STARS_FALLBACK = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
 # OL, K, P: never have EDGE
 EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "EDGE", "DL", "LB", "CB", "S", "DB"}
 
-# K/P ceiling: specialist stats inflate without enough individual differentiation
-POSITION_CEILING = {"K": 78, "P": 78}
+# No hard ceiling — K/P rated by stat composite, scale_to_range handles distribution
+POSITION_CEILING: dict[str, int] = {}
 
 # All seasons used for cross-season normalization
-ALL_SEASONS = list(range(2021, 2026))
+ALL_SEASONS = list(range(2008, 2026))
 
 # ---------------------------------------------------------------------------
 # EDGE → OVR direct mapping (replaces weighted composite + scale_to_range
@@ -118,38 +118,36 @@ ALL_SEASONS = list(range(2021, 2026))
 # ---------------------------------------------------------------------------
 
 EDGE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
-    # Calibrated from 2021-2025 distributions. Opponent multiplier range [0.55, 1.45].
-    # p50 → ~65, p90 → ~87, user-specified top-tier thresholds.
+    # Calibrated from all-time top-20 per position (2008-2025).
+    # Goal: top-20 all-time sets the bar for 99; #20 all-time ≈ 97.
     #
     # Offensive: stat_composite × opp_mult / sqrt(games)
-    #   QB:   p50≈445, p90≈1085, max≈1900 (Daniels 2023).  User: 1400=90, 1700=95, 2000=99
-    "QB":   [(0, 30), (150, 50), (445, 65), (750, 77), (1100, 85), (1400, 90), (1700, 95), (2000, 99)],
-    #   RB:   p50≈120, p90≈345, max≈812 (Skattebo/Jeanty 2024).
-    #   Raised top threshold to compress elite tier — 900=99 so max seasons land 97-98.
-    #   Jeanty-class seasons ~97.5, Skattebo-class ~97.8 (Skattebo's Big 12 opp quality is real).
-    "RB":   [(0, 30), (40,  50), (120, 65), (240, 77), (500,  87), (630,  93), (760,  97), (900,  99)],
-    #   WR:   p50≈120, p90≈300, max≈674.  User: 400=88, 500=95, 600=99
-    "WR":   [(0, 30), (35,  50), (120, 65), (210, 77), (400,  88), (500,  95), (600,  99)],
-    #   TE:   p50≈75, p90≈180, max≈492.  User: 150=80, 250=88, 350=95, 450=99
-    "TE":   [(0, 30), (25,  50), (75,  65), (150, 80), (250,  88), (350,  95), (450,  99)],
+    #   QB:   p50≈445, p90≈1085. All-time #1=2352 (Burrow 2019), #20=1773.
+    "QB":   [(0, 30), (150, 50), (445, 65), (750, 77), (1100, 85), (1450, 90), (1770, 97), (2400, 99)],
+    #   RB:   All-time #1=1003 (Gordon 2014), #20=803 (Ajayi 2014).
+    "RB":   [(0, 30), (40,  50), (120, 65), (240, 77), (500,  87), (650,  93), (803,  97), (1050, 99)],
+    #   WR:   All-time #1=926 (DeVonta Smith 2020), #20=663 (Jones 2022).
+    "WR":   [(0, 30), (35,  50), (120, 65), (210, 77), (400,  87), (550,  93), (663,  97), (950,  99)],
+    #   TE:   All-time #1=622 (Amaro 2013), #20=384 (Andrews 2017).
+    "TE":   [(0, 30), (25,  50), (75,  65), (160, 78), (270,  87), (384,  97), (650,  99)],
     #
-    # Defensive: stat_composite × opp_mult / sqrt(games). Weights rebalanced v4.1:
-    #   tot weight cut dramatically; sacks/TFLs/INTs/PBUs now dominate composite.
-    #   User: 60+=99 for EDGE/DL (where max scores reach 60+).
-    #   CB/S/DB have structurally lower maxes (~35-52) — set 99 at position-realistic max.
+    # Defensive: stat_composite × opp_mult / sqrt(games). Weights v4.1.
+    # All-time top-20 sets 99 ceiling; #20 ≈ 97.
     #
-    #   EDGE: p50≈11, p90≈30, max≈68.  60=99 (user spec)
-    "EDGE": [(0, 30), (3.0, 50), (11.0, 65), (22.0, 77), (35.0, 87), (50.0, 94), (60.0, 99)],
-    #   DL:   p50≈7,  p90≈20, max≈66.  60=99 (user spec)
-    "DL":   [(0, 30), (2.5, 50), (7.0,  65), (15.0, 77), (27.0, 87), (46.0, 94), (60.0, 99)],
-    #   LB:   p50≈11, p90≈30, max≈89.  Impact plays now drive score; 90=99
-    "LB":   [(0, 30), (4.0, 50), (11.0, 65), (22.0, 77), (38.0, 87), (60.0, 94), (90.0, 99)],
-    #   CB:   p50≈9,  p90≈22, max≈52.  Coverage impact (INTs/PBUs) dominant; 50=99
-    "CB":   [(0, 30), (2.5, 50), (8.0,  65), (15.0, 77), (25.0, 87), (38.0, 94), (50.0, 99)],
-    #   S:    p50≈10, p90≈24, max≈46.  46=99
-    "S":    [(0, 30), (3.0, 50), (9.0,  65), (17.0, 77), (27.0, 87), (38.0, 94), (46.0, 99)],
-    #   DB:   p50≈9,  p90≈21, max≈44.  Raised anchors ~2pts to suppress G5 inflation.
-    "DB":   [(0, 30), (2.5, 50), (9.0,  65), (17.0, 77), (27.0, 87), (39.0, 94), (48.0, 99)],
+    #   EDGE: All-time #1=81.4 (Chase Young 2019), #20=58.7 (Kennard 2024). Ceiling 65 per user spec.
+    "EDGE": [(0, 30), (3.0, 50), (11.0, 65), (22.0, 77), (38.0, 87), (58.7, 97), (65.0, 99)],
+    #   DL:   All-time #1=69.9 (Green 2023), #20=51.5 (Polite 2018). Ceiling 65 per user spec.
+    "DL":   [(0, 30), (2.5, 50), (7.0,  65), (15.0, 77), (30.0, 87), (51.5, 97), (65.0, 99)],
+    #   LB:   All-time #1=95.3 (Anderson 2021), #2=82.4 (Josh Allen 2018) — true anomalies.
+    #   #3=70.7 (Lloyd 2021), #20=63.7. Set 99 at 70 so Anderson/Allen go off-chart.
+    "LB":   [(0, 30), (4.0, 50), (11.0, 65), (22.0, 77), (40.0, 87), (63.7, 97), (70.0, 99)],
+    #   CB:   All-time #1=52.3 (Amerson 2011), #20=39.1 (Phillips 2022).
+    #   Team defensive context adjusts score. Ceiling reflects INT-heavy outliers.
+    "CB":   [(0, 30), (1.5, 50), (6.0,  65), (12.0, 74), (20.0, 83), (39.1, 97), (53.0, 99)],
+    #   S:    All-time #1=54.6 (Delpit 2018), #20=35.4 (Stevens 2019).
+    "S":    [(0, 30), (2.0, 50), (7.5,  65), (14.0, 74), (22.0, 83), (35.4, 97), (55.0, 99)],
+    #   DB:   All-time #1=52.3 (Golson 2014), #20=38.3 (Hayward 2011).
+    "DB":   [(0, 30), (1.5, 50), (6.5,  65), (12.0, 74), (20.0, 83), (38.3, 97), (53.0, 99)],
 }
 
 
@@ -181,15 +179,22 @@ def get_era(season: int) -> str:
     return "classic"
 
 
+DEFENSIVE_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
+
 def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
     """Map raw edge_score to OVR via fixed piecewise linear anchors.
 
     Returns a rating in [30, 99] that reflects absolute production quality.
-    Season-aware: uses era-bucketed anchors to prevent deflation in pre-2015 years
-    where hurries/PBU stats are missing from the composite.
+    Era scaling (ERA_ANCHORS) applies only to defensive positions — pre-2016
+    data lacks hurries/PBUs so raw defensive composites are structurally lower.
+    Offensive positions (QB/RB/WR/TE) always use the modern anchors because
+    passing/rushing stats have been tracked consistently since 2008.
     """
-    era = get_era(season)
-    anchors = ERA_ANCHORS[era].get(pg)
+    if pg in DEFENSIVE_POSITIONS:
+        era = get_era(season)
+        anchors = ERA_ANCHORS[era].get(pg)
+    else:
+        anchors = EDGE_OVR_ANCHORS.get(pg)
     if not anchors or edge_score is None or (isinstance(edge_score, float) and np.isnan(edge_score)):
         return 50.0
     xs = [a[0] for a in anchors]
@@ -446,6 +451,13 @@ WEIGHTS = {
         "instinct_score":   0.10,
         "recruit_composite": 0.06,
     },
+    "DB": {
+        "edge_score":      0.40,
+        "coverage_score":   0.22,
+        "tackling_score":   0.22,
+        "instinct_score":   0.10,
+        "recruit_composite": 0.06,
+    },
     "K": {
         "fg_pct":     0.50,
         "fg_long":    0.25,
@@ -523,6 +535,13 @@ WEIGHTS_NO_EDGE = {
         "tackling_score":   0.28,
         "instinct_score":   0.18,
         "pass_rush_score":  0.14,
+        "recruit_composite": 0.10,
+    },
+    "DB": {
+        "coverage_score":   0.35,
+        "tackling_score":   0.25,
+        "instinct_score":   0.18,
+        "pass_rush_score":  0.12,
         "recruit_composite": 0.10,
     },
 }
@@ -765,6 +784,15 @@ FEATURE_BOUNDS: dict[str, tuple[float, float]] = {
     # Universal
     "recruit_composite":(40.0, 100.0),
     "volume_score":     (0.0,  46.0),
+    # K — FG% calibrated: 0.60 = poor, 0.92 = elite all-time
+    "fg_pct":           (0.60, 0.92),
+    # fg_long: 45 = routine, 60 = elite range (McPherson, Moody type)
+    "fg_long":          (40.0, 65.0),
+    "xp_pct":           (0.80, 1.00),
+    # P — net avg: 35 = below avg, 48 = elite (Johnny Townsend type)
+    "avg_yards":        (35.0, 48.0),
+    # inside_20_pct: 0.25 = poor, 0.55 = elite placement
+    "inside_20_pct":    (0.20, 0.55),
     # Pass-through
     "transfer_flag":    (0.0,  1.0),
 }
@@ -799,16 +827,38 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
     """Direct edge_score → OVR mapping for EDGE positions.
 
     For players with a valid edge_score: OVR = edge_to_ovr(edge_score, pg).
-    For players without EDGE data: return 0.0 (will be handled as fallback in rate_position).
+    For players without EDGE data (pre-2016 defense, injured, etc.): use the
+    stat-only composite (WEIGHTS_NO_EDGE) scaled to [30–90] so historical
+    defensive players get meaningful variance instead of a flat 50.0 fallback.
 
     Returns:
-      scores   — np.ndarray of OVR values [30–99] or 0.0 for no-EDGE players
+      scores   — np.ndarray of OVR values [30–99] or 0.0 if truly no data at all
       contribs — list of {feature: value} dicts for shap_values storage
     """
+    # Pre-compute stat-only composites for the whole df (used for no-EDGE fallback).
+    # Features are already extracted columns in the dataframe (via _load_seasons → extract_features).
+    no_edge_weights = WEIGHTS_NO_EDGE.get(pg, {})
+    no_edge_features = list(no_edge_weights.keys())
+    no_edge_w_arr = np.array([no_edge_weights[c] for c in no_edge_features]) if no_edge_features else np.array([])
+
+    # Gather all no-EDGE stat composites to scale relatively within the pool
+    all_stat_scores = []
+    for _, row in df.iterrows():
+        if not has_opp_score(row, pg) and no_edge_features:
+            x = np.array([normalize_feature(c, float(row.get(c) or 0), pg=pg) for c in no_edge_features])
+            all_stat_scores.append(float(x @ no_edge_w_arr))
+        else:
+            all_stat_scores.append(None)
+
+    valid_stat = [s for s in all_stat_scores if s is not None]
+    if valid_stat:
+        stat_pcts = np.percentile(valid_stat, [0, 10, 50, 75, 90, 99, 100])
+        stat_targets = [30.0, 40.0, 58.0, 68.0, 76.0, 85.0, 90.0]  # no-EDGE cap at 90
+
     final_scores   = []
     final_contribs = []
 
-    for _, row in df.iterrows():
+    for i, (_, row) in enumerate(df.iterrows()):
         if has_opp_score(row, pg):
             es  = float(row.get("edge_score") or 0)
             ovr = edge_to_ovr(es, pg, season)
@@ -818,8 +868,13 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
                 "opp_quality":    round(float(row.get("opp_avg_sp") or 0), 2),
                 "stats_measured": int(row.get("stats_measured") or 0),
             }
+        elif all_stat_scores[i] is not None and valid_stat:
+            # Stat-based fallback: scale within the no-EDGE pool, cap at 90
+            ovr = float(np.clip(np.interp(all_stat_scores[i], stat_pcts, stat_targets), 30.0, 90.0))
+            contrib = {"recruit_composite": round(float(row.get("recruit_composite") or 50.0), 2),
+                       "stat_fallback": round(all_stat_scores[i], 4)}
         else:
-            ovr    = 0.0   # no EDGE → fallback handled in rate_position
+            ovr    = 0.0   # truly no data → recruiting fallback in rate_position
             contrib = {}
 
         final_scores.append(ovr)
@@ -1209,15 +1264,17 @@ def rate_position(season: int, pg: str) -> list[dict]:
             "overall_rating":       ovr,
             "position_rating":      ovr,
             "trajectory_score":     float(trajectory.get(pid, 0.0)),
+            "trajectory":           float(trajectory.get(pid, 0.0)),
             "breakout_probability": float(breakout_map.get(pid, 0.05)),
             "shap_values":          json.dumps(contrib_map.get(rkey, {})),
             "model_version":        MODEL_VERSION,
-            "tier":                 tier,
-            "_pg":                  pg,  # for distribution validation only, not upserted
+            "engine":               "edge",
+            "_tier":                tier,   # stripped before upsert (not a DB column)
+            "_pg":                  pg,     # stripped before upsert
         })
 
     # Apply multi-tier rating treatment
-    tier_arr = np.array([r["tier"] for r in rows])
+    tier_arr = np.array([r["_tier"] for r in rows])
     ratings_arr = np.array([r["overall_rating"] for r in rows])
     season_df["tier"] = tier_arr
     season_df["stars"] = season_df["stars"].fillna(0)
@@ -1339,8 +1396,7 @@ def main():
                 print(f"\n  Skipping upsert — fix weights and re-run")
                 continue
             upsert_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in all_rows]
-            bulk_upsert("ratings", upsert_rows, "player_season_id",
-                        conflict_where="player_season_id IS NOT NULL")
+            bulk_upsert("ratings", upsert_rows, ["player_season_id", "season", "engine"])
             print(f"  Upserted {len(all_rows)} rows")
 
     print("\nDone.")
