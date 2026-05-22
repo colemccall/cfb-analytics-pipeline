@@ -1,12 +1,19 @@
-"""Export Supabase data → static JSON files for cfb-analytics-app/data/.
+"""Export pipeline data → static JSON files for cfb-analytics-app/data/.
 
-Writes three files that GitHub Pages serves as static assets:
-  - players.json          — all rated players with stats, ratings, SHAP, team, recruiting
-  - teams.json            — all teams with avg rating, player count, conference
-  - ratings_by_position.json — top 50 per position group
+All frontend data is served as static JSON — no live Supabase queries at runtime.
 
-Also exports any research findings cached in research_cache table:
-  - data/research/{research_key}.json
+Exports:
+  players.json              — all rated players (ratings, SHAP, recruiting, team)
+  teams.json                — all teams with avg rating, player count
+  team_ratings.json         — team OVR + sub-score splits for current season
+  ratings_by_position.json  — top 50 per position group
+  similar_players.json      — precomputed cosine similarity (OVR >= 55)
+  rosters.json              — all team rosters by season  {team_id: {season: [...]}}
+  schedules.json            — all games by team/season    {team_id: {season: [...]}}
+  transfers.json            — all portal moves by team    {team_id: [...]}
+  team_history.json         — year-by-year progression    {team_id: [{season,...}]}
+  research/index.json       — published findings index
+  research/{key}.json       — individual finding payloads
 
 The path ../cfb-analytics-app/data/ assumes both repos sit in the same
 CFB-Analytics-Portfolio/ workspace folder.
@@ -206,7 +213,7 @@ def export_team_ratings(output_dir: Path, season: int) -> None:
         cols = [d[0] for d in cur.description]
         rows = [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    # Convert Decimal to float; parse sub_ratings JSON string
+    # Convert Decimal to float; parse sub_ratings JSON and hoist split keys to top level
     import json as _json
     for r in rows:
         for k in ("overall_rating", "offense_rating", "defense_rating",
@@ -214,8 +221,18 @@ def export_team_ratings(output_dir: Path, season: int) -> None:
                   "recruiting_score", "avg_starter_rating"):
             if r.get(k) is not None:
                 r[k] = float(r[k])
-        if r.get("sub_ratings") and isinstance(r["sub_ratings"], str):
-            r["sub_ratings"] = _json.loads(r["sub_ratings"])
+        sub = r.get("sub_ratings")
+        if sub and isinstance(sub, str):
+            sub = _json.loads(sub)
+        if isinstance(sub, dict):
+            # Hoist split ratings to top-level keys for frontend consumption
+            for split_key in ("pass_off", "run_off", "pass_def", "run_def", "special_teams"):
+                if split_key in sub:
+                    r[split_key] = sub[split_key]
+            # Also fix key names for frontend (sp_overall_scaled → sp_plus, recruiting_scaled → recruit_score)
+            r["sp_plus"] = sub.get("sp_offense_scaled") or sub.get("sp_overall_scaled")
+            r["recruit_score"] = sub.get("recruiting_scaled")
+        r["sub_ratings"] = sub
 
     write_json(output_dir / "team_ratings.json", rows)
     print(f"  {len(rows)} team_ratings rows exported")
@@ -314,15 +331,11 @@ def export_similar_players(output_dir: Path) -> None:
                 r.overall_rating AS ovr,
                 r.edge_score,
                 r.composite_score,
-                r.trajectory,
-                s.data           AS stat_data
+                r.trajectory
             FROM ratings r
             JOIN player_seasons ps ON ps.id = r.player_season_id
             JOIN players p ON p.id = ps.player_id
             LEFT JOIN teams t ON t.id = ps.team_id
-            LEFT JOIN stats s ON s.player_season_id = ps.id
-                AND s.game_id IS NULL
-                AND s.stat_type = ps.position_group
             WHERE r.overall_rating >= 55
               AND r.engine = 'edge'
             ORDER BY ps.position_group, r.overall_rating DESC
@@ -332,48 +345,19 @@ def export_similar_players(output_dir: Path) -> None:
 
     print(f"  {len(rows)} player-seasons eligible for similarity")
 
-    def _f(stats, key):
-        if not stats:
-            return 0.0
-        v = stats.get(key)
-        try:
-            return float(v) if v is not None else 0.0
-        except (TypeError, ValueError):
-            return 0.0
-
     CONF_TIER = {"SEC": 1.0, "Big Ten": 1.0, "ACC": 0.9, "Big 12": 0.9,
                  "Pac-12": 0.85, "Sun Belt": 0.5, "MAC": 0.5, "C-USA": 0.5,
                  "Mountain West": 0.55, "American": 0.55}
 
     def make_vector(row: dict) -> list[float]:
-        pg = row["position_group"] or "ATH"
-        sd = row["stat_data"] or {}
-        ovr = float(row["ovr"] or 50)
-        edge = float(row["edge_score"] or 0)
-        conf = CONF_TIER.get(row.get("team") or "", 0.6)
-
-        if pg == "QB":
-            att = max(_f(sd, "passingATT"), 1)
-            return [ovr, edge,
-                    _f(sd, "passingYDS") / att,
-                    (_f(sd, "passingTD") + 1) / (_f(sd, "passingINT") + 1),
-                    _f(sd, "passingCOMPLETIONS") / att,
-                    _f(sd, "rushingYDS"),
-                    float(row.get("composite_score") or 0),
-                    conf]
-        if pg == "RB":
-            car = max(_f(sd, "rushingCAR"), 1)
-            return [ovr, edge, _f(sd, "rushingYDS") / car,
-                    _f(sd, "rushingYDS"), _f(sd, "receivingYDS"),
-                    float(row.get("composite_score") or 0), conf, 0.0]
-        if pg in ("WR", "TE"):
-            rec = max(_f(sd, "receivingREC"), 1)
-            return [ovr, edge, _f(sd, "receivingYDS") / rec,
-                    _f(sd, "receivingYDS"), _f(sd, "receivingTD"),
-                    float(row.get("composite_score") or 0), conf, 0.0]
-        # Default for defensive / other
-        return [ovr, edge, float(row.get("composite_score") or 0),
-                float(row.get("trajectory") or 0), conf, 0.0, 0.0, 0.0]
+        """6-dim vector: ovr, edge, composite, trajectory, conf_tier, season_recency."""
+        ovr        = float(row["ovr"] or 50)
+        edge       = float(row["edge_score"] or 0)
+        composite  = float(row.get("composite_score") or 0)
+        trajectory = float(row.get("trajectory") or 0)
+        conf       = CONF_TIER.get(row.get("team") or "", 0.6)
+        recency    = max(0.0, (int(row["season"]) - 2008) / 17)  # normalise 2008–2025 to 0–1
+        return [ovr, edge, composite, trajectory, conf, recency]
 
     # Group by position group
     by_pos: dict[str, list[dict]] = defaultdict(list)
@@ -448,6 +432,257 @@ def export_research(output_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# New static exports (Phase A — replaces live Supabase queries in frontend)
+# ---------------------------------------------------------------------------
+
+def export_rosters(output_dir: Path) -> None:
+    """Export all team rosters across all seasons → rosters.json.
+
+    Shape: {team_id: {season: [player, ...]}}
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ps.team_id, ps.season, ps.id AS player_season_id,
+                   ps.position_group, ps.year,
+                   p.id AS player_id, p.name,
+                   r.overall_rating, r.trajectory_score, r.breakout_probability,
+                   r.shap_values,
+                   rec.stars, rec.composite_score
+            FROM player_seasons ps
+            JOIN players p ON p.id = ps.player_id
+            LEFT JOIN ratings r ON r.player_season_id = ps.id AND r.engine = 'edge'
+            LEFT JOIN LATERAL (
+                SELECT stars, composite_score FROM recruiting
+                WHERE player_id = ps.player_id
+                ORDER BY composite_score DESC NULLS LAST LIMIT 1
+            ) rec ON true
+            WHERE ps.team_id IS NOT NULL
+            ORDER BY ps.team_id, ps.season, r.overall_rating DESC NULLS LAST
+        """)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    rosters: dict = {}
+    for row in rows:
+        tid = str(row["team_id"])
+        sea = str(row["season"])
+        rosters.setdefault(tid, {}).setdefault(sea, []).append({
+            "player_id":        row["player_id"],
+            "player_season_id": row["player_season_id"],
+            "name":             row["name"],
+            "position_group":   row["position_group"],
+            "year":             row["year"],
+            "overall_rating":   float(row["overall_rating"]) if row["overall_rating"] else None,
+            "trajectory":       float(row["trajectory_score"]) if row["trajectory_score"] else None,
+            "breakout_prob":    float(row["breakout_probability"]) if row["breakout_probability"] else None,
+            "shap":             _parse_shap(row["shap_values"]),
+            "stars":            row["stars"],
+            "composite_score":  float(row["composite_score"]) if row["composite_score"] else None,
+        })
+
+    write_json(output_dir / "rosters.json", rosters)
+
+
+def export_schedules(output_dir: Path) -> None:
+    """Export all games by team and season → schedules.json.
+
+    Shape: {team_id: {season: [game, ...]}}
+    Each game row includes is_home, opponent, result (W/L/null).
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT g.id, g.season, g.week, g.game_date, g.season_type,
+                   g.home_team_id, g.away_team_id,
+                   g.home_score, g.away_score, g.neutral_site,
+                   ht.school AS home_team, at.school AS away_team
+            FROM games g
+            JOIN teams ht ON ht.id = g.home_team_id
+            JOIN teams at ON at.id = g.away_team_id
+            ORDER BY g.season, g.week NULLS LAST, g.id
+        """)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    schedules: dict = {}
+
+    def _result(is_home, home_score, away_score):
+        if home_score is None or away_score is None:
+            return None
+        team_score = home_score if is_home else away_score
+        opp_score  = away_score if is_home else home_score
+        if team_score > opp_score:
+            return "W"
+        if team_score < opp_score:
+            return "L"
+        return "T"
+
+    for g in rows:
+        game_date = str(g["game_date"]) if g["game_date"] else None
+        home_score = int(g["home_score"]) if g["home_score"] is not None else None
+        away_score = int(g["away_score"]) if g["away_score"] is not None else None
+
+        for is_home in (True, False):
+            tid = str(g["home_team_id"] if is_home else g["away_team_id"])
+            sea = str(g["season"])
+            opponent   = g["away_team"] if is_home else g["home_team"]
+            team_score = home_score if is_home else away_score
+            opp_score  = away_score if is_home else home_score
+            schedules.setdefault(tid, {}).setdefault(sea, []).append({
+                "game_id":     g["id"],
+                "season":      g["season"],
+                "week":        g["week"],
+                "game_date":   game_date,
+                "season_type": g["season_type"],
+                "is_home":     is_home,
+                "neutral_site": g["neutral_site"],
+                "opponent":    opponent,
+                "team_score":  team_score,
+                "opp_score":   opp_score,
+                "result":      _result(is_home, home_score, away_score),
+            })
+
+    write_json(output_dir / "schedules.json", schedules)
+
+
+def export_transfers(output_dir: Path) -> None:
+    """Export all transfer portal moves by team → transfers.json.
+
+    Shape: {team_id: [{direction: 'in'|'out', ...}]}
+    Each player appears under both their from_team and to_team.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT t.player_id, t.from_team_id, t.to_team_id,
+                   t.transfer_year, t.portal_date,
+                   p.name,
+                   ps.position_group,
+                   ft.school AS from_school,
+                   tt.school AS to_school
+            FROM transfers t
+            JOIN players p ON p.id = t.player_id
+            LEFT JOIN teams ft ON ft.id = t.from_team_id
+            LEFT JOIN teams tt ON tt.id = t.to_team_id
+            LEFT JOIN player_seasons ps
+                   ON ps.player_id = t.player_id AND ps.season = t.transfer_year
+            ORDER BY t.transfer_year DESC, p.name
+        """)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    transfers: dict = {}
+    for row in rows:
+        portal_date = str(row["portal_date"]) if row["portal_date"] else None
+        entry = {
+            "player_id":      row["player_id"],
+            "name":           row["name"],
+            "position_group": row["position_group"],
+            "transfer_year":  row["transfer_year"],
+            "portal_date":    portal_date,
+            "from_school":    row["from_school"],
+            "to_school":      row["to_school"],
+        }
+        if row["from_team_id"]:
+            out = {**entry, "direction": "out"}
+            transfers.setdefault(str(row["from_team_id"]), []).append(out)
+        if row["to_team_id"]:
+            inn = {**entry, "direction": "in"}
+            transfers.setdefault(str(row["to_team_id"]), []).append(inn)
+
+    write_json(output_dir / "transfers.json", transfers)
+
+
+def export_team_history(output_dir: Path) -> None:
+    """Export year-by-year team progression → team_history.json.
+
+    Shape: {team_id: [{season, wins, losses, conference, sp_overall, overall_rating, ...}]}
+    Rows sorted newest-first.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                tr.team_id,
+                tr.season,
+                tr.overall_rating,
+                tr.sp_overall,
+                tr.offense_rating,
+                tr.defense_rating,
+                tr.recruiting_score,
+                t.conference,
+                COUNT(CASE
+                    WHEN g.home_team_id = tr.team_id AND g.home_score > g.away_score THEN 1
+                    WHEN g.away_team_id = tr.team_id AND g.away_score > g.home_score THEN 1
+                END) AS wins,
+                COUNT(CASE
+                    WHEN g.home_team_id = tr.team_id AND g.home_score < g.away_score THEN 1
+                    WHEN g.away_team_id = tr.team_id AND g.away_score < g.home_score THEN 1
+                END) AS losses
+            FROM team_ratings tr
+            JOIN teams t ON t.id = tr.team_id
+            LEFT JOIN games g
+                   ON g.season = tr.season
+                  AND (g.home_team_id = tr.team_id OR g.away_team_id = tr.team_id)
+                  AND g.home_score IS NOT NULL
+            GROUP BY tr.team_id, tr.season, tr.overall_rating, tr.sp_overall,
+                     tr.offense_rating, tr.defense_rating, tr.recruiting_score, t.conference
+            ORDER BY tr.team_id, tr.season DESC
+        """)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    history: dict = {}
+    for row in rows:
+        tid = str(row["team_id"])
+        history.setdefault(tid, []).append({
+            "season":           row["season"],
+            "wins":             int(row["wins"]) if row["wins"] is not None else None,
+            "losses":           int(row["losses"]) if row["losses"] is not None else None,
+            "conference":       row["conference"],
+            "sp_overall":       float(row["sp_overall"]) if row["sp_overall"] else None,
+            "overall_rating":   float(row["overall_rating"]) if row["overall_rating"] else None,
+            "offense_rating":   float(row["offense_rating"]) if row["offense_rating"] else None,
+            "defense_rating":   float(row["defense_rating"]) if row["defense_rating"] else None,
+            "recruiting_score": float(row["recruiting_score"]) if row["recruiting_score"] else None,
+        })
+
+    write_json(output_dir / "team_history.json", history)
+
+
+def export_research_index(output_dir: Path) -> None:
+    """Write data/research/index.json — an array of published finding metadata.
+
+    Each entry: {key, title, category, summary, headline_stat}.
+    Populated from research_cache rows that include a '_meta' key in their data.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT research_key, data FROM research_cache")
+        rows = cur.fetchall()
+
+    index = []
+    for key, data in rows:
+        payload = data if isinstance(data, dict) else json.loads(data)
+        meta = payload.get("_meta", {})
+        if meta:
+            index.append({
+                "key":           key,
+                "title":         meta.get("title", key),
+                "category":      meta.get("category", ""),
+                "summary":       meta.get("summary", ""),
+                "headline_stat": meta.get("headline_stat", ""),
+            })
+
+    research_dir = output_dir / "research"
+    research_dir.mkdir(parents=True, exist_ok=True)
+    write_json(research_dir / "index.json", index)
+    if not index:
+        print("  No research findings with _meta yet — index.json written as empty array")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -478,8 +713,21 @@ def main():
     print("similar_players.json...")
     export_similar_players(output_dir)
 
-    print("research/*.json...")
+    print("rosters.json...")
+    export_rosters(output_dir)
+
+    print("schedules.json...")
+    export_schedules(output_dir)
+
+    print("transfers.json...")
+    export_transfers(output_dir)
+
+    print("team_history.json...")
+    export_team_history(output_dir)
+
+    print("research/index.json + research/*.json...")
     export_research(output_dir)
+    export_research_index(output_dir)
 
     print("\nDone.")
 
