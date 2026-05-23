@@ -1,4 +1,4 @@
-"""EDGE — Efficiency-Driven Grade per Event  (v4.0).
+"""EDGE — Efficiency-Driven Grade per Event (v4.1).
 
 Formula (all positions):
     edge_score = sum_over_games(stat_composite_i × opp_mult_i) / sqrt(games_played)
@@ -8,24 +8,21 @@ Offensive (QB/RB/WR/TE):
     opp_mult scales by the opponent's *defensive* SP+ rating for that game.
 
 Defensive (EDGE/DL/LB/CB/S):
-    stat_composite = weighted sum of per-game defensive stats
-                     (sacks, hurries, PBUs, INTs, tackles, TFLs).
-    All positions use all 6 stat categories; weights differ by role.
+    stat_composite = weighted sum of per-game defensive stats.
+    Pre-2016: only INTs available — sacks/hurries/TFLs/PBUs are absent from the
+    CFB Data API for those seasons. Defensive EDGE scores pre-2016 will be sparse.
     opp_mult scales by the opponent's *offensive* SP+ rating for that game.
 
-stats_measured: season total of primary countable stats (used as minimum
-    threshold in script 06 and for display). Offense: primary volume stat.
-    Defense: sum of all tracked stats across the season.
-
-games_played: count of distinct games where the player recorded any stats.
+All data is read from data/raw/*.json and written to data/raw/player_edge.json.
 
 Usage:
-    python scripts/08_compute_edge_score.py              # 2025
-    python scripts/08_compute_edge_score.py --season 2024
-    python scripts/08_compute_edge_score.py --all-seasons
+    python scripts/06_compute_edge_scores.py              # 2025 only
+    python scripts/06_compute_edge_scores.py --season 2024
+    python scripts/06_compute_edge_scores.py --all-seasons  # 2008-2025
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -36,55 +33,27 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
-from utils.db import bulk_upsert, get_connection
+from utils.store import read_raw, RAW_DIR
 from utils.api_client import load_api_key, fetch_sp_ratings_all, fetch_sp_ratings_breakdown, fetch_game_team_stats
 
-MODEL_VERSION = "v4.1-team-context"
+MODEL_VERSION = "v4.1-local"
 
-# Offensive positions: per-game game_aggregate stats × opp defensive SP+
 OFF_EDGE_POSITIONS = {"QB", "RB", "WR", "TE"}
-
-# Defensive positions: per-game game_aggregate stats × opp offensive SP+
 DEF_EDGE_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
-
 EDGE_POSITIONS = OFF_EDGE_POSITIONS | DEF_EDGE_POSITIONS
-
-# Minimum games for a valid EDGE score (both offense and defense)
 MIN_GAMES = 3
 
 # ---------------------------------------------------------------------------
 # Stat composite weights
 # ---------------------------------------------------------------------------
 
-# Offensive per-game stat composite weights.
-# Yards are the base unit; TDs add a large bonus; INTs are penalized.
 OFFENSIVE_COMPOSITE = {
-    "QB": {
-        "passingYDS":  1.0,
-        "rushingYDS":  0.7,
-        "passingTD":  25.0,
-        "rushingTD":  20.0,
-        "passingINT": -20.0,
-    },
-    "RB": {
-        "rushingYDS":   1.0,
-        "receivingYDS": 0.9,
-        "rushingTD":   20.0,
-        "receivingTD": 20.0,
-    },
-    "WR": {
-        "receivingYDS": 1.0,
-        "receivingTD": 25.0,
-        "receivingREC": 2.0,
-    },
-    "TE": {
-        "receivingYDS": 1.0,
-        "receivingTD": 25.0,
-        "receivingREC": 2.5,
-    },
+    "QB": {"passingYDS": 1.0, "rushingYDS": 0.7, "passingTD": 25.0, "rushingTD": 20.0, "passingINT": -20.0},
+    "RB": {"rushingYDS": 1.0, "receivingYDS": 0.9, "rushingTD": 20.0, "receivingTD": 20.0},
+    "WR": {"receivingYDS": 1.0, "receivingTD": 25.0, "receivingREC": 2.0},
+    "TE": {"receivingYDS": 1.0, "receivingTD": 25.0, "receivingREC": 2.5},
 }
 
-# Primary stat keys for computing stats_measured (season volume qualifier).
 OFFENSE_PRIMARY_STATS = {
     "QB": ["passingATT", "rushingCAR"],
     "RB": ["rushingCAR", "receivingREC"],
@@ -92,30 +61,20 @@ OFFENSE_PRIMARY_STATS = {
     "TE": ["receivingREC"],
 }
 
-# Defensive per-game stat composite weights.
-# All positions use all 6 categories; weights reflect positional emphasis.
 DEF_STAT_WEIGHTS = {
-    # tot weight is intentionally low — raw tackle counts conflate "made the stop" with
-    # "was standing there after teammates shed blockers". TFLs, sacks, and hurries represent
-    # genuine disruption.
-    # Coverage positions (CB/S/DB): INTs are elite plays worth ~3× a PBU. A PBU just means
-    # the pass was incomplete (could be out-of-bounds, dropped, etc.); an INT means you
-    # outplayed the receiver AND the QB. PBU=2.0 prevents tackle-volume DBs from dominating.
-    "EDGE": {"sacks": 7.0, "hur": 2.5, "tfl": 4.0, "tot": 0.3, "ints":  4.0, "pbu": 1.5},
-    "DL":   {"sacks": 6.0, "hur": 2.0, "tfl": 4.0, "tot": 0.4, "ints":  3.0, "pbu": 0.5},
-    "LB":   {"sacks": 5.5, "hur": 1.5, "tfl": 4.0, "tot": 0.6, "ints":  7.0, "pbu": 2.0},
+    "EDGE": {"sacks": 7.0, "hur": 2.5, "tfl": 4.0, "tot": 0.3, "ints": 4.0,  "pbu": 1.5},
+    "DL":   {"sacks": 6.0, "hur": 2.0, "tfl": 4.0, "tot": 0.4, "ints": 3.0,  "pbu": 0.5},
+    "LB":   {"sacks": 5.5, "hur": 1.5, "tfl": 4.0, "tot": 0.6, "ints": 7.0,  "pbu": 2.0},
     "CB":   {"sacks": 2.5, "hur": 1.0, "tfl": 2.0, "tot": 0.3, "ints": 12.0, "pbu": 2.0},
     "S":    {"sacks": 3.0, "hur": 1.5, "tfl": 3.0, "tot": 0.4, "ints": 10.0, "pbu": 2.0},
     "DB":   {"sacks": 2.5, "hur": 1.0, "tfl": 2.0, "tot": 0.3, "ints": 11.0, "pbu": 2.0},
 }
 
-
 # ---------------------------------------------------------------------------
-# Stat coercion helpers
+# Stat coercion
 # ---------------------------------------------------------------------------
 
 def _coerce_float(val) -> float:
-    """Parse a stat value that may be string, int, float, or None."""
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
@@ -130,13 +89,12 @@ def _coerce_float(val) -> float:
     except (ValueError, TypeError):
         return 0.0
 
-
 def _coerce_int(val) -> int:
     return int(_coerce_float(val))
 
 
 # ---------------------------------------------------------------------------
-# SP+ opponent quality map
+# SP+ opponent quality map — built from API (cached) + local teams.json
 # ---------------------------------------------------------------------------
 
 def build_opponent_sp_map(season: int, api_key: str) -> dict:
@@ -146,16 +104,16 @@ def build_opponent_sp_map(season: int, api_key: str) -> dict:
         flat = fetch_sp_ratings_all(api_key, season)
         sp_by_name = {k: {"overall": v, "offense": 0.0, "defense": 0.0} for k, v in flat.items()}
 
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, school FROM teams")
-        rows = cur.fetchall()
-
+    teams_df = read_raw("teams")
     result = {}
-    for db_id, school in rows:
+    for _, row in teams_df.iterrows():
+        school = str(row.get("school") or "")
+        db_id = row.get("id")
+        if not db_id or not school:
+            continue
         sp = sp_by_name.get(school.lower())
         if sp is not None:
-            result[db_id] = sp
+            result[int(db_id)] = sp
     return result
 
 
@@ -172,23 +130,11 @@ def _season_means(sp_map: dict) -> tuple:
     )
 
 
-def opponent_multiplier(opp_team_id, sp_map: dict, side: str,
-                        season_means: tuple) -> float:
-    """
-    Opponent quality multiplier — asymmetric, std-normalized.
+def opponent_multiplier(opp_team_id, sp_map: dict, side: str, season_means: tuple) -> float:
+    """Asymmetric opponent quality multiplier.
 
-    Normalization: z = (val - mean) / std  → clipped to [-2, +2]
-    Bonus (hard opponent):  mult = 1.0 + z * 0.35   → up to 1.70
-    Penalty (weak opponent): mult = 1.0 + z * 0.12  → down to 0.76
-
-    Asymmetry rationale: a DB making an INT against a weak offense still
-    demonstrates real skill — the defender can't choose who throws at them.
-    But facing an elite offense should be rewarded more than facing a weak
-    one is penalized. Penalty kept light (0.12) so G5 players with strong
-    production against their schedule are not excessively discounted.
-
-    side="defense": for offensive players — lower opp defense SP+ = harder.
-    side="offense": for defensive players — higher opp offense SP+ = harder.
+    Bonus (hard opponent):   up to 1.70 (z * 0.35)
+    Penalty (weak opponent): down to 0.76 (z * 0.12)
     """
     if not opp_team_id or opp_team_id not in sp_map:
         return 1.0
@@ -198,13 +144,11 @@ def opponent_multiplier(opp_team_id, sp_map: dict, side: str,
     if isinstance(sp_entry, dict):
         if side == "defense":
             val = sp_entry.get("defense", mean_def)
-            # lower defense SP+ = stronger defense = harder for offense
-            std = max(mean_def * 0.26, 1.0)   # ~std of SP+ defense
+            std = max(mean_def * 0.26, 1.0)
             z = (mean_def - val) / std
         else:
             val = sp_entry.get("offense", mean_off)
-            # higher offense SP+ = stronger offense = harder for defense
-            std = max(mean_off * 0.26, 1.0)   # ~std of SP+ offense (~7/27 ≈ 0.26)
+            std = max(mean_off * 0.26, 1.0)
             z = (val - mean_off) / std
     else:
         sp = float(sp_entry)
@@ -212,37 +156,35 @@ def opponent_multiplier(opp_team_id, sp_map: dict, side: str,
 
     z = max(-2.0, min(2.0, z))
     if z >= 0:
-        return 1.0 + z * 0.35   # bonus: up to 1.70 for elite opponents
+        return 1.0 + z * 0.35
     else:
-        return 1.0 + z * 0.12   # penalty: down to 0.76 for weakest opponents (was 0.20/0.60)
+        return 1.0 + z * 0.12
 
 
 # ---------------------------------------------------------------------------
-# Team defensive context — yards/points allowed per game
+# Team defensive context (game-level yards/points allowed)
 # ---------------------------------------------------------------------------
 
 def build_game_context_map(api_key: str, season: int) -> dict:
-    """Build a lookup from (db_game_id, defending_team_db_id) → opp offensive stats.
-
-    For each game, the "context" for a defensive player is how many yards/points
-    their team allowed — i.e., the opponent's offensive stats in that game.
-
-    Returns: {(game_db_id, def_team_db_id): {"pass_yds": ..., "rush_yds": ..., "points": ...}}
-    """
-    # Load game team stats from API (cached after first call)
-    raw = fetch_game_team_stats(api_key, season)  # {cfb_game_id: {cfb_team_id: {stats}}}
-
+    """Return {(db_game_id, def_team_db_id): {pass_yds, rush_yds, points}}."""
+    raw = fetch_game_team_stats(api_key, season)
     if not raw:
         return {}
 
-    with get_connection() as conn:
-        cur = conn.cursor()
-        # Map cfb_api_id → db_id for games
-        cur.execute("SELECT id, cfb_api_id FROM games WHERE season = %s", (season,))
-        game_cfb_to_db = {r[1]: r[0] for r in cur.fetchall()}
-        # Map cfb_api_id → db_id for teams
-        cur.execute("SELECT id, cfb_api_id FROM teams WHERE cfb_api_id IS NOT NULL")
-        team_cfb_to_db = {r[1]: r[0] for r in cur.fetchall()}
+    games_df = read_raw("games")
+    teams_df = read_raw("teams")
+
+    game_cfb_to_db = {}
+    for _, r in games_df[games_df["season"] == season].iterrows():
+        cid = r.get("cfb_api_id")
+        if cid is not None:
+            game_cfb_to_db[int(cid)] = int(r["id"])
+
+    team_cfb_to_db = {}
+    for _, r in teams_df.iterrows():
+        cid = r.get("cfb_api_id")
+        if cid is not None:
+            team_cfb_to_db[int(cid)] = int(r["id"])
 
     def _int_stat(d, key):
         v = d.get(key)
@@ -258,12 +200,11 @@ def build_game_context_map(api_key: str, season: int) -> dict:
         db_game_id = game_cfb_to_db.get(cfb_game_id)
         if not db_game_id:
             continue
-        # For each team, store OPPONENT'S offensive output as this team's defensive context
         team_ids = list(teams_dict.keys())
         if len(team_ids) != 2:
             continue
         for i, def_cfb_tid in enumerate(team_ids):
-            off_cfb_tid = team_ids[1 - i]   # the other team = offense
+            off_cfb_tid = team_ids[1 - i]
             def_db_tid = team_cfb_to_db.get(def_cfb_tid)
             if not def_db_tid:
                 continue
@@ -276,160 +217,131 @@ def build_game_context_map(api_key: str, season: int) -> dict:
                     points = float(points)
                 except (ValueError, TypeError):
                     points = None
-            result[(db_game_id, def_db_tid)] = {
-                "pass_yds": pass_yds,
-                "rush_yds": rush_yds,
-                "points":   points,
-            }
+            result[(db_game_id, def_db_tid)] = {"pass_yds": pass_yds, "rush_yds": rush_yds, "points": points}
     return result
 
 
 def _compute_season_defensive_means(ctx_map: dict) -> dict:
-    """Compute mean/std of pass_yds and rush_yds across all games (both teams)."""
     pass_vals = [v["pass_yds"] for v in ctx_map.values() if v["pass_yds"] is not None]
     rush_vals = [v["rush_yds"] for v in ctx_map.values() if v["rush_yds"] is not None]
     pt_vals   = [v["points"]   for v in ctx_map.values() if v["points"]   is not None]
     def _stats(vals):
         if not vals:
-            return (200.0, 60.0)  # fallback means
+            return (200.0, 60.0)
         return (float(np.mean(vals)), max(float(np.std(vals)), 1.0))
-    return {
-        "pass": _stats(pass_vals),
-        "rush": _stats(rush_vals),
-        "pts":  _stats(pt_vals),
-    }
+    return {"pass": _stats(pass_vals), "rush": _stats(rush_vals), "pts": _stats(pt_vals)}
 
 
-# How much defensive context blends into the stat composite by position group.
-# Range [0.0, 1.0]: 0 = no context adjustment, 0.25 = 25% of score modified by context.
-# Context cap: max adjustment (bonus or penalty) of ±30% to individual game composite.
 DEF_CONTEXT_WEIGHTS = {
-    # Coverage positions: pass yards allowed is primary signal
     "CB":   {"pass": 0.55, "rush": 0.05, "pts": 0.40},
     "S":    {"pass": 0.45, "rush": 0.15, "pts": 0.40},
     "DB":   {"pass": 0.50, "rush": 0.10, "pts": 0.40},
-    # Run stoppers: rush yards allowed is primary
     "DL":   {"pass": 0.15, "rush": 0.55, "pts": 0.30},
     "EDGE": {"pass": 0.25, "rush": 0.45, "pts": 0.30},
-    # LB: balanced pass/rush
     "LB":   {"pass": 0.30, "rush": 0.40, "pts": 0.30},
 }
-
-# Blend fraction: how much the context modifier adjusts the game composite.
-# 0.35 means context can adjust the per-game composite by up to ±10.5% (0.35 × 0.30).
-# This rewards players on strong defensive units (e.g. SEC lockdown CBs) without
-# over-weighting team performance over individual stats.
 DEF_CONTEXT_BLEND = 0.35
 
 
 def def_context_modifier(pg: str, game_db_id: int, player_team_db_id: int,
                           ctx_map: dict, ctx_means: dict) -> float:
-    """
-    Returns a context multiplier (near 1.0) for a defensive player's game.
-
-    Good defensive game (low yards/pts allowed) → > 1.0 (bonus)
-    Bad defensive game (high yards/pts allowed) → < 1.0 (penalty)
-    Missing data → 1.0 (neutral)
-
-    The modifier is blended with 1.0 at DEF_CONTEXT_BLEND so it adjusts
-    the stat composite by at most ±30%.
-    """
     ctx = ctx_map.get((game_db_id, player_team_db_id))
     if not ctx:
         return 1.0
-
     weights = DEF_CONTEXT_WEIGHTS.get(pg)
     if not weights:
         return 1.0
-
     z_pass = z_rush = z_pts = 0.0
-
     pass_yds = ctx.get("pass_yds")
     if pass_yds is not None:
         mean_p, std_p = ctx_means["pass"]
-        # More yards allowed = worse = lower z (penalty)
         z_pass = (mean_p - pass_yds) / std_p
-
     rush_yds = ctx.get("rush_yds")
     if rush_yds is not None:
         mean_r, std_r = ctx_means["rush"]
         z_rush = (mean_r - rush_yds) / std_r
-
     pts = ctx.get("points")
     if pts is not None:
         mean_pts, std_pts = ctx_means["pts"]
         z_pts = (mean_pts - pts) / std_pts
-
-    # Weighted z-score
-    z_total = (z_pass * weights["pass"] + z_rush * weights["rush"] + z_pts * weights["pts"])
-    # Clip to ±1.5 std, scale to ±0.30 range
-    z_total = max(-1.5, min(1.5, z_total))
-    context_adj = z_total * 0.20   # max ±0.30 modifier
-
-    # Final modifier: blend with 1.0
-    raw_mod = 1.0 + context_adj
+    z_total = max(-1.5, min(1.5, z_pass * weights["pass"] + z_rush * weights["rush"] + z_pts * weights["pts"]))
+    raw_mod = 1.0 + z_total * 0.20
     return 1.0 - DEF_CONTEXT_BLEND + DEF_CONTEXT_BLEND * raw_mod
 
 
 # ---------------------------------------------------------------------------
-# Shared game-stats query
+# Load per-game stats from local raw JSON
 # ---------------------------------------------------------------------------
 
 def _load_game_stats(season: int, positions: set) -> pd.DataFrame:
-    """Load per-game stat rows from stats table for a set of position groups."""
-    sql = """
-        SELECT
-            ps.player_id,
-            ps.position_group,
-            ps.team_id           AS player_team_id,
-            s.game_id,
-            s.data,
-            g.home_team_id,
-            g.away_team_id
-        FROM stats s
-        JOIN player_seasons ps ON ps.id = s.player_season_id
-        JOIN games g ON g.id = s.game_id
-        WHERE ps.season = %s
-          AND ps.position_group = ANY(%s)
-          AND s.stat_type = 'game_aggregate'
-          AND s.game_id IS NOT NULL
-    """
-    with get_connection() as conn:
-        return pd.read_sql(sql, conn, params=(season, list(positions)))
+    """Load game_aggregate stat rows from data/raw/stats.json for given positions."""
+    stats_df = read_raw("stats")
+    ps_df    = read_raw("player_seasons")
+    games_df = read_raw("games")
+
+    if stats_df.empty or ps_df.empty or games_df.empty:
+        return pd.DataFrame()
+
+    # Filter stats
+    mask = (
+        (stats_df["stat_type"] == "game_aggregate") &
+        (stats_df["game_id"].notna())
+    )
+    s = stats_df[mask].copy()
+
+    # Filter player_seasons to this season + positions
+    ps = ps_df[
+        (ps_df["season"] == season) &
+        (ps_df["position_group"].isin(positions))
+    ][["id", "player_id", "position_group", "team_id"]].copy()
+    ps = ps.rename(columns={"id": "ps_id"})
+
+    # Parse data field
+    def _parse_data(v):
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return {}
+        return {}
+
+    s["data"] = s["data"].apply(_parse_data)
+
+    # Join stats -> player_seasons
+    merged = s.merge(ps, left_on="player_season_id", right_on="ps_id", how="inner")
+
+    # Join games for home/away team IDs
+    g = games_df[["id", "home_team_id", "away_team_id"]].rename(columns={"id": "game_db_id"})
+    # game_id in stats is db game id
+    merged = merged.merge(g, left_on="game_id", right_on="game_db_id", how="left")
+
+    merged["player_team_id"] = merged["team_id"].where(merged["team_id"].notna())
+    return merged[["player_id", "position_group", "player_team_id", "game_id", "data", "home_team_id", "away_team_id"]]
 
 
 # ---------------------------------------------------------------------------
-# Offensive EDGE — per-game stat composite × opp defensive SP+
+# Offensive EDGE
 # ---------------------------------------------------------------------------
 
 def _off_stat_composite(pg: str, stats: dict) -> float:
     weights = OFFENSIVE_COMPOSITE.get(pg, {})
-    total = 0.0
-    for key, w in weights.items():
-        total += _coerce_float(stats.get(key)) * w
-    return total
+    return sum(_coerce_float(stats.get(k)) * w for k, w in weights.items())
 
 
 def _off_stats_measured(pg: str, stats: dict) -> float:
-    """Season total of primary countable stats for minimum-threshold check."""
     if pg == "QB":
-        # API stores attempts as "passingC/ATT" (e.g. "21/23") — extract the denominator
         catt = stats.get("passingC/ATT") or stats.get("passingATT")
         if catt and "/" in str(catt):
             att = _coerce_int(str(catt).split("/")[-1])
         else:
             att = _coerce_int(catt)
         return float(att + _coerce_int(stats.get("rushingCAR")))
-    keys = OFFENSE_PRIMARY_STATS.get(pg, [])
-    return sum(_coerce_float(stats.get(k)) for k in keys)
+    return sum(_coerce_float(stats.get(k)) for k in OFFENSE_PRIMARY_STATS.get(pg, []))
 
 
 def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
-    """
-    Per-game opponent-adjusted EDGE for QB/RB/WR/TE.
-    Returns DataFrame: player_id, position_group, edge_score, games_played,
-                       stats_measured, opponent_avg_sp.
-    """
     rows = _load_game_stats(season, OFF_EDGE_POSITIONS)
     if rows.empty:
         return pd.DataFrame()
@@ -447,8 +359,12 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
         if raw <= 0:
             continue
 
-        opp_mult = opponent_multiplier(opp_team, sp_map, side="defense",
-                                       season_means=season_means)
+        try:
+            opp_id = int(opp_team) if opp_team is not None and not pd.isna(opp_team) else None
+        except (TypeError, ValueError):
+            opp_id = None
+
+        opp_mult = opponent_multiplier(opp_id, sp_map, side="defense", season_means=season_means)
         records.append({
             "player_id":      int(r["player_id"]),
             "position_group": pg,
@@ -464,8 +380,7 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
 
     def agg(grp):
         n         = len(grp)
-        total_adj = grp["adj_score"].sum()
-        edge      = total_adj / max(np.sqrt(n), 1.0)
+        edge      = grp["adj_score"].sum() / max(np.sqrt(n), 1.0)
         avg_mult  = grp["opp_mult"].mean()
         return pd.Series({
             "edge_score":      edge,
@@ -481,50 +396,26 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Defensive EDGE — per-game stat composite × opp offensive SP+
+# Defensive EDGE
 # ---------------------------------------------------------------------------
 
 def _def_stat_composite(pg: str, stats: dict) -> tuple[float, float]:
-    """Returns (adj_composite, raw_vol) for one game.
-
-    raw_vol is the sum of all tracked stat counts — used for stats_measured.
-    """
     weights = DEF_STAT_WEIGHTS.get(pg)
     if not weights:
         return 0.0, 0.0
-
     tot   = _coerce_int(stats.get("defensiveTOT"))
     sacks = _coerce_int(stats.get("defensiveSACKS"))
     tfl   = _coerce_int(stats.get("defensiveTFL"))
     hur   = _coerce_int(stats.get("defensiveQB HUR")) or _coerce_int(stats.get("defensiveQBH"))
     pbu   = _coerce_int(stats.get("defensivePD")) or _coerce_int(stats.get("defensivePBU"))
     ints  = _coerce_int(stats.get("interceptionsINT")) or _coerce_int(stats.get("defensiveINT"))
-
-    score = (
-        tot   * weights["tot"]  +
-        sacks * weights["sacks"] +
-        tfl   * weights["tfl"] +
-        hur   * weights["hur"] +
-        pbu   * weights["pbu"] +
-        ints  * weights["ints"]
-    )
+    score = (tot * weights["tot"] + sacks * weights["sacks"] + tfl * weights["tfl"] +
+             hur * weights["hur"] + pbu * weights["pbu"] + ints * weights["ints"])
     vol = tot + sacks + tfl + hur + pbu + ints
     return score, float(vol)
 
 
-def compute_defensive_edge(season: int, sp_map: dict,
-                           ctx_map: dict | None = None) -> pd.DataFrame:
-    """
-    Per-game opponent-adjusted EDGE for EDGE/DL/LB/CB/S/DB.
-
-    Two-signal adjustment per game:
-    1. Opponent SP+ quality multiplier (existing) — rewards playing tougher offenses
-    2. Team defensive context modifier (new) — uses actual yards/points allowed
-       to credit lockdown defenders who play on good defenses even with low stats
-
-    Returns DataFrame: player_id, position_group, edge_score, games_played,
-                       stats_measured, opponent_avg_sp.
-    """
+def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = None) -> pd.DataFrame:
     rows = _load_game_stats(season, DEF_EDGE_POSITIONS)
     if rows.empty:
         return pd.DataFrame()
@@ -534,26 +425,27 @@ def compute_defensive_edge(season: int, sp_map: dict,
     records = []
 
     for _, r in rows.iterrows():
-        pg       = r["position_group"]
-        my_team  = r["player_team_id"]
-        game_id  = r["game_id"]
+        pg      = r["position_group"]
+        my_team = r["player_team_id"]
+        game_id = r["game_id"]
         opp_team = r["away_team_id"] if my_team == r["home_team_id"] else r["home_team_id"]
-        stats    = r["data"] if isinstance(r["data"], dict) else {}
+        stats   = r["data"] if isinstance(r["data"], dict) else {}
 
         raw, vol = _def_stat_composite(pg, stats)
         if raw <= 0:
             continue
 
-        # Signal 1: opponent offensive quality (SP+)
-        opp_mult = opponent_multiplier(opp_team, sp_map, side="offense",
-                                       season_means=season_means)
+        try:
+            opp_id = int(opp_team) if opp_team is not None and not pd.isna(opp_team) else None
+        except (TypeError, ValueError):
+            opp_id = None
 
-        # Signal 2: team defensive context — yards/points allowed this game
+        opp_mult = opponent_multiplier(opp_id, sp_map, side="offense", season_means=season_means)
+
         ctx_mult = 1.0
         if ctx_map and ctx_means and my_team is not None and game_id is not None:
             try:
-                ctx_mult = def_context_modifier(
-                    pg, int(game_id), int(my_team), ctx_map, ctx_means)
+                ctx_mult = def_context_modifier(pg, int(game_id), int(my_team), ctx_map, ctx_means)
             except (TypeError, ValueError):
                 ctx_mult = 1.0
 
@@ -572,8 +464,7 @@ def compute_defensive_edge(season: int, sp_map: dict,
 
     def agg(grp):
         n         = len(grp)
-        total_adj = grp["adj_score"].sum()
-        edge      = total_adj / max(np.sqrt(n), 1.0)
+        edge      = grp["adj_score"].sum() / max(np.sqrt(n), 1.0)
         avg_mult  = grp["opp_mult"].mean()
         return pd.Series({
             "edge_score":      edge,
@@ -589,52 +480,51 @@ def compute_defensive_edge(season: int, sp_map: dict,
 
 
 # ---------------------------------------------------------------------------
-# Upsert
+# Write results to data/raw/player_edge.json (upsert by player_season_id)
 # ---------------------------------------------------------------------------
 
-def upsert_edge(agg: pd.DataFrame, season: int) -> None:
-    player_ids = [int(r["player_id"]) for _, r in agg.iterrows()]
-    ps_id_map: dict = {}
-    if player_ids:
-        with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT player_id, id FROM player_seasons WHERE season = %s AND player_id = ANY(%s)",
-                (season, player_ids)
-            )
-            for pid, ps_id in cur.fetchall():
-                ps_id_map[pid] = ps_id
+def save_edge(agg: pd.DataFrame, season: int) -> None:
+    ps_df = read_raw("player_seasons")
+    ps_season = ps_df[ps_df["season"] == season][["id", "player_id"]].copy()
+    ps_map = {int(r["player_id"]): int(r["id"]) for _, r in ps_season.iterrows()}
 
-    rows = []
+    new_rows = {}
     skipped = 0
     for _, r in agg.iterrows():
         player_id = int(r["player_id"])
-        ps_id = ps_id_map.get(player_id)
+        ps_id = ps_map.get(player_id)
         if not ps_id:
             skipped += 1
             continue
-        rows.append({
+        new_rows[ps_id] = {
             "player_season_id": ps_id,
+            "player_id":        player_id,
             "season":           season,
             "edge_score":       float(r["edge_score"]) if pd.notna(r.get("edge_score")) else None,
             "stats_measured":   int(r["stats_measured"]) if pd.notna(r.get("stats_measured")) else 0,
             "games_played":     int(r["games_played"]) if pd.notna(r.get("games_played")) else 0,
             "opponent_avg_sp":  float(r["opponent_avg_sp"]) if pd.notna(r.get("opponent_avg_sp")) else None,
             "model_version":    MODEL_VERSION,
-        })
-
-    if not rows:
-        print("  No EDGE rows to upsert")
-        return
+        }
 
     if skipped:
         print(f"  Skipped {skipped} players with no player_seasons row for {season}")
 
-    seen = {r["player_season_id"]: r for r in rows}
-    rows = list(seen.values())
-    bulk_upsert("player_edge", rows, conflict_col="player_season_id",
-                conflict_where="player_season_id IS NOT NULL")
-    print(f"  Upserted {len(rows)} EDGE rows")
+    # Merge with existing player_edge.json — replace rows for this season
+    path = RAW_DIR / "player_edge.json"
+    existing = []
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            existing = json.load(f)
+
+    # Keep rows from other seasons, replace this season
+    kept = [r for r in existing if r.get("season") != season]
+    combined = kept + list(new_rows.values())
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(combined, f, separators=(",", ":"))
+
+    print(f"  Saved {len(new_rows)} EDGE rows for {season} ({len(combined)} total in file)")
 
 
 # ---------------------------------------------------------------------------
@@ -646,45 +536,43 @@ def run_season(season: int, api_key: str) -> None:
     print(f"Computing EDGE — Season {season}")
     print(f"{'='*60}")
 
-    print("Loading SP+ ratings for opponent quality...")
+    print("Loading SP+ ratings...")
     sp_map = build_opponent_sp_map(season, api_key)
-    print(f"  {len(sp_map)} teams have SP+ ratings")
+    print(f"  {len(sp_map)} teams with SP+ ratings")
 
-    print("Computing offensive EDGE (per-game stat composite × opp defensive SP+)...")
+    print("Computing offensive EDGE...")
     off_agg = compute_offensive_edge(season, sp_map)
     if off_agg.empty:
-        print("  Warning: no offensive game_aggregate stats found. Run script 01 first.")
+        print("  No offensive game stats found — check data/raw/stats.json")
     else:
         valid = off_agg["edge_score"].notna().sum()
         print(f"  {valid} offensive players with valid EDGE (>={MIN_GAMES} games)")
         for pg in sorted(off_agg["position_group"].unique()):
             sub = off_agg[off_agg["position_group"] == pg]["edge_score"].dropna()
             if len(sub):
-                p50 = np.percentile(sub, 50)
-                p90 = np.percentile(sub, 90)
-                print(f"    {pg}: n={len(sub)} p50={p50:.1f} p90={p90:.1f} max={sub.max():.1f}")
+                p = np.percentile(sub, [50, 90])
+                print(f"    {pg}: n={len(sub)} p50={p[0]:.1f} p90={p[1]:.1f} max={sub.max():.1f}")
 
-    print("Building team defensive context map (game-level yards/points allowed)...")
+    print("Building team defensive context map...")
     try:
         ctx_map = build_game_context_map(api_key, season)
-        print(f"  {len(ctx_map)} game-team context entries loaded")
+        print(f"  {len(ctx_map)} game-team context entries")
     except Exception as e:
-        print(f"  Warning: could not build context map: {e}. Skipping context signal.")
+        print(f"  Warning: {e}. Skipping context signal.")
         ctx_map = None
 
-    print("Computing defensive EDGE (per-game stat composite × opp offensive SP+ × team context)...")
+    print("Computing defensive EDGE...")
     def_agg = compute_defensive_edge(season, sp_map, ctx_map=ctx_map)
     if def_agg.empty:
-        print("  Warning: no defensive game_aggregate stats found. Run script 01 first.")
+        print(f"  No defensive game stats found for {season} (expected pre-2016)")
     else:
         valid = def_agg["edge_score"].notna().sum()
         print(f"  {valid} defensive players with valid EDGE (>={MIN_GAMES} games)")
         for pg in sorted(def_agg["position_group"].unique()):
             sub = def_agg[def_agg["position_group"] == pg]["edge_score"].dropna()
             if len(sub):
-                p50 = np.percentile(sub, 50)
-                p90 = np.percentile(sub, 90)
-                print(f"    {pg}: n={len(sub)} p50={p50:.1f} p90={p90:.1f} max={sub.max():.1f}")
+                p = np.percentile(sub, [50, 90])
+                print(f"    {pg}: n={len(sub)} p50={p[0]:.1f} p90={p[1]:.1f} max={sub.max():.1f}")
 
     frames = [f for f in [off_agg, def_agg] if not f.empty]
     if not frames:
@@ -692,21 +580,20 @@ def run_season(season: int, api_key: str) -> None:
         return
 
     agg = pd.concat(frames, ignore_index=True)
-    upsert_edge(agg, season)
+    save_edge(agg, season)
     print(f"Season {season} EDGE complete.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute EDGE scores from per-game stats")
+    parser = argparse.ArgumentParser(description="Compute EDGE scores from local JSON stats")
     parser.add_argument("--season", type=int, default=2025)
-    parser.add_argument("--all-seasons", action="store_true")
+    parser.add_argument("--all-seasons", action="store_true", help="Run 2008-2025")
     args = parser.parse_args()
 
     api_key = load_api_key()
     seasons = list(range(2008, 2026)) if args.all_seasons else [args.season]
     for s in seasons:
         run_season(s, api_key)
-
     print("\nDone.")
 
 
