@@ -151,15 +151,57 @@ EDGE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Era-bucketed anchors.
+#
+# Defensive: pre-2016 data lacks hurries/PBUs → raw composites are lower →
+#   lower the score thresholds so elite 2010 defenders still reach 90+.
+#   transition = modern × 0.85, classic = modern × 0.75.
+#
+# Offensive: pre-2016 had fewer tracked games (smaller sqrt(n) denominator)
+#   and different play styles, inflating per-game scores → raise thresholds
+#   so old QBs/RBs need a higher raw score to reach the same OVR.
+#   transition = modern × 1.10, classic = modern × 1.20.
+# ---------------------------------------------------------------------------
+
+def _scale_anchors(anchors: list[tuple[float, float]], factor: float) -> list[tuple[float, float]]:
+    return [(round(x * factor, 4), y) for (x, y) in anchors]
+
+
+OFFENSIVE_POSITIONS = {"QB", "RB", "WR", "TE"}
 DEFENSIVE_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
 
-def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
-    """Map raw edge_score to OVR via fixed piecewise linear anchors.
+ERA_ANCHORS: dict[str, dict[str, list[tuple[float, float]]]] = {
+    "modern": EDGE_OVR_ANCHORS,
+    "transition": {
+        **{pg: _scale_anchors(v, 0.85) for pg, v in EDGE_OVR_ANCHORS.items() if pg in DEFENSIVE_POSITIONS},
+        **{pg: _scale_anchors(v, 1.10) for pg, v in EDGE_OVR_ANCHORS.items() if pg in OFFENSIVE_POSITIONS},
+        **{pg: v for pg, v in EDGE_OVR_ANCHORS.items() if pg not in DEFENSIVE_POSITIONS | OFFENSIVE_POSITIONS},
+    },
+    "classic": {
+        **{pg: _scale_anchors(v, 0.75) for pg, v in EDGE_OVR_ANCHORS.items() if pg in DEFENSIVE_POSITIONS},
+        **{pg: _scale_anchors(v, 1.20) for pg, v in EDGE_OVR_ANCHORS.items() if pg in OFFENSIVE_POSITIONS},
+        **{pg: v for pg, v in EDGE_OVR_ANCHORS.items() if pg not in DEFENSIVE_POSITIONS | OFFENSIVE_POSITIONS},
+    },
+}
 
-    All seasons use the same anchors — no era inflation.
-    Historical players compete on the same absolute scale as modern players.
+
+def get_era(season: int) -> str:
+    if season >= 2016:
+        return "modern"
+    if season >= 2013:
+        return "transition"
+    return "classic"
+
+
+def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
+    """Map raw edge_score to OVR via era-adjusted piecewise linear anchors.
+
+    Defense pre-2016: lower thresholds (missing hurries/PBUs inflate difficulty).
+    Offense pre-2016: higher thresholds (fewer games inflates per-game scores).
     """
-    anchors = EDGE_OVR_ANCHORS.get(pg)
+    era = get_era(season)
+    anchors = ERA_ANCHORS[era].get(pg) if era != "modern" else EDGE_OVR_ANCHORS.get(pg)
     if not anchors or edge_score is None or (isinstance(edge_score, float) and np.isnan(edge_score)):
         return 50.0
     xs = [a[0] for a in anchors]
