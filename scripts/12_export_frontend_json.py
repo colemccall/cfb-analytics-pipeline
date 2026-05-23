@@ -153,13 +153,18 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
                 .rename(columns={"id": "tm_id"})
     rat_s = rat_s.merge(tm_slim, left_on="team_id", right_on="tm_id", how="left")
 
-    # Recruiting — only need recruit_year (stars/composite_score already in ratings)
+    # Recruiting — pull stars/composite from recruiting table (ratings.stars is often None)
     if not rec.empty:
-        rec_year = rec.sort_values("composite_score", ascending=False, na_position="last") \
+        rec_best = rec.sort_values("composite_score", ascending=False, na_position="last") \
                       .drop_duplicates(subset=["player_id"], keep="first") \
-                      [["player_id", "recruit_year"]] \
-                      .rename(columns={"player_id": "rec_pid"})
-        rat_s = rat_s.merge(rec_year, left_on="cfb_player_id", right_on="rec_pid", how="left")
+                      [["player_id", "recruit_year", "stars", "composite_score"]] \
+                      .rename(columns={"player_id": "rec_pid", "stars": "rec_stars",
+                                       "composite_score": "rec_composite"})
+        rat_s = rat_s.merge(rec_best, left_on="cfb_player_id", right_on="rec_pid", how="left")
+        # Fill stars/composite from recruiting if ratings columns are null
+        rat_s["stars"] = rat_s["stars"].where(rat_s["stars"].notna(), rat_s["rec_stars"])
+        rat_s["composite_score"] = rat_s["composite_score"].where(
+            rat_s["composite_score"].notna(), rat_s["rec_composite"])
     else:
         rat_s["recruit_year"] = None
 
@@ -234,7 +239,7 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
         })
 
     players.sort(key=lambda p: p["overall_rating"] or 0, reverse=True)
-    write_json(output_dir / "players.json", players)
+    write_json(output_dir / f"players_{season}.json", players)
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +392,7 @@ def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
             "composite":       _f(row.get("composite_score")),
         })
 
-    write_json(output_dir / "ratings_by_position.json", by_position)
+    write_json(output_dir / f"ratings_by_position_{season}.json", by_position)
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +491,7 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
 # Export: rosters.json
 # ---------------------------------------------------------------------------
 
-def export_rosters(T: dict, output_dir: Path) -> None:
+def export_rosters(T: dict, output_dir: Path, season: int) -> None:
     ps  = T["player_seasons"]
     pl  = T["players"]
     rat = T["ratings"]
@@ -495,13 +500,18 @@ def export_rosters(T: dict, output_dir: Path) -> None:
     if ps.empty:
         return
 
-    merged = ps.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
-                      left_on="player_id", right_on="pl_id", how="left")
+    ps_s = ps[ps["season"] == season].copy()
+    if ps_s.empty:
+        print(f"  rosters_{season}.json: no player_seasons for this season")
+        return
+
+    merged = ps_s.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
+                        left_on="player_id", right_on="pl_id", how="left")
 
     if not rat.empty:
-        rat_slim = rat[["player_season_id", "overall_rating", "trajectory_score",
-                         "breakout_probability", "shap_values"]].copy()
-        merged = merged.merge(rat_slim, left_on="id", right_on="player_season_id",
+        rat_s = rat[rat["season"] == season][["player_season_id", "overall_rating",
+                     "trajectory_score", "breakout_probability", "shap_values"]].copy()
+        merged = merged.merge(rat_s, left_on="id", right_on="player_season_id",
                               how="left", suffixes=("", "_rat"))
 
     if not rec.empty:
@@ -521,8 +531,7 @@ def export_rosters(T: dict, output_dir: Path) -> None:
     rosters: dict = {}
     for _, row in merged.iterrows():
         tid = str(_i(row["team_id"]))
-        sea = str(_i(row["season"]))
-        rosters.setdefault(tid, {}).setdefault(sea, []).append({
+        rosters.setdefault(tid, []).append({
             "player_id":        _i(row["player_id"]),
             "player_season_id": _i(row["id"]),
             "name":             row.get("name"),
@@ -536,50 +545,47 @@ def export_rosters(T: dict, output_dir: Path) -> None:
             "composite_score":  _f(row.get("rec_composite")),
         })
 
-    # Sort each team/season by overall_rating desc
     for tid in rosters:
-        for sea in rosters[tid]:
-            rosters[tid][sea].sort(key=lambda p: p["overall_rating"] or 0, reverse=True)
+        rosters[tid].sort(key=lambda p: p["overall_rating"] or 0, reverse=True)
 
-    write_json(output_dir / "rosters.json", rosters)
+    write_json(output_dir / f"rosters_{season}.json", rosters)
 
 
 # ---------------------------------------------------------------------------
 # Export: schedules.json
 # ---------------------------------------------------------------------------
 
-def export_schedules(T: dict, output_dir: Path) -> None:
+def export_schedules(T: dict, output_dir: Path, season: int) -> None:
     games = T["games"]
     teams = T["teams"]
 
     if games.empty:
         return
 
-    tm_map = dict(zip(teams["id"], teams["school"])) if not teams.empty else {}
+    games_s = games[games["season"] == season]
+    if games_s.empty:
+        print(f"  schedules_{season}.json: no games for this season")
+        return
 
+    tm_map = dict(zip(teams["id"], teams["school"])) if not teams.empty else {}
     schedules: dict = {}
 
-    for _, g in games.iterrows():
-        home_id  = _i(g.get("home_team_id"))
-        away_id  = _i(g.get("away_team_id"))
-        home_sc  = _i(g.get("home_score"))
-        away_sc  = _i(g.get("away_score"))
+    for _, g in games_s.iterrows():
+        home_id   = _i(g.get("home_team_id"))
+        away_id   = _i(g.get("away_team_id"))
+        home_sc   = _i(g.get("home_score"))
+        away_sc   = _i(g.get("away_score"))
         game_date = str(g["game_date"]) if g.get("game_date") else None
-        season   = _i(g.get("season"))
-        sea_str  = str(season)
 
         for is_home in (True, False):
-            tid = str(home_id if is_home else away_id)
+            tid        = str(home_id if is_home else away_id)
             opponent   = tm_map.get(away_id if is_home else home_id)
             team_score = home_sc if is_home else away_sc
             opp_score  = away_sc if is_home else home_sc
-            if team_score is not None and opp_score is not None:
-                result = "W" if team_score > opp_score else ("L" if team_score < opp_score else "T")
-            else:
-                result = None
-            schedules.setdefault(tid, {}).setdefault(sea_str, []).append({
+            result     = ("W" if team_score > opp_score else ("L" if team_score < opp_score else "T")) \
+                         if (team_score is not None and opp_score is not None) else None
+            schedules.setdefault(tid, []).append({
                 "game_id":     _i(g.get("id")),
-                "season":      season,
                 "week":        _i(g.get("week")),
                 "game_date":   game_date,
                 "season_type": g.get("season_type"),
@@ -589,16 +595,18 @@ def export_schedules(T: dict, output_dir: Path) -> None:
                 "team_score":  team_score,
                 "opp_score":   opp_score,
                 "result":      result,
+                "home_team_id": home_id,
+                "away_team_id": away_id,
             })
 
-    write_json(output_dir / "schedules.json", schedules)
+    write_json(output_dir / f"schedules_{season}.json", schedules)
 
 
 # ---------------------------------------------------------------------------
 # Export: transfers.json
 # ---------------------------------------------------------------------------
 
-def export_transfers(T: dict, output_dir: Path) -> None:
+def export_transfers(T: dict, output_dir: Path, season: int) -> None:
     tr  = T["transfers"]
     pl  = T["players"]
     ps  = T["player_seasons"]
@@ -607,8 +615,13 @@ def export_transfers(T: dict, output_dir: Path) -> None:
     if tr.empty:
         return
 
-    merged = tr.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
-                      left_on="player_id", right_on="pl_id", how="left")
+    tr_s = tr[tr["transfer_year"] == season] if "transfer_year" in tr.columns else tr
+    if tr_s.empty:
+        print(f"  transfers_{season}.json: no transfers for this season")
+        return
+
+    merged = tr_s.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
+                        left_on="player_id", right_on="pl_id", how="left")
 
     if not tm.empty:
         from_schools = tm[["id", "school"]].rename(columns={"id": "from_id", "school": "from_school"})
@@ -617,11 +630,9 @@ def export_transfers(T: dict, output_dir: Path) -> None:
         merged = merged.merge(to_schools,   left_on="to_team_id",   right_on="to_id",   how="left")
 
     if not ps.empty:
-        pos_lookup = ps.drop_duplicates(subset=["player_id", "season"]) \
-                       [["player_id", "season", "position_group"]] \
-                       .rename(columns={"season": "ps_season"})
-        merged = merged.merge(pos_lookup, left_on=["player_id", "transfer_year"],
-                              right_on=["player_id", "ps_season"], how="left")
+        pos_lookup = ps[ps["season"] == season].drop_duplicates(subset=["player_id"]) \
+                       [["player_id", "position_group"]]
+        merged = merged.merge(pos_lookup, on="player_id", how="left")
 
     transfers: dict = {}
     for _, row in merged.iterrows():
@@ -630,7 +641,7 @@ def export_transfers(T: dict, output_dir: Path) -> None:
             "player_id":      _i(row["player_id"]),
             "name":           row.get("name"),
             "position_group": row.get("position_group"),
-            "transfer_year":  _i(row.get("transfer_year")),
+            "transfer_year":  season,
             "portal_date":    portal_date,
             "from_school":    row.get("from_school"),
             "to_school":      row.get("to_school"),
@@ -642,7 +653,7 @@ def export_transfers(T: dict, output_dir: Path) -> None:
         if to_id:
             transfers.setdefault(str(to_id), []).append({**entry, "direction": "in"})
 
-    write_json(output_dir / "transfers.json", transfers)
+    write_json(output_dir / f"transfers_{season}.json", transfers)
 
 
 # ---------------------------------------------------------------------------
@@ -740,50 +751,61 @@ def export_research(T: dict, output_dir: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+ALL_SEASONS = list(range(2008, CURRENT_SEASON + 1))
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Export local data → static JSON for frontend")
-    parser.add_argument("--season", type=int, default=CURRENT_SEASON)
+    parser = argparse.ArgumentParser(description="Export local data -> static JSON for frontend")
+    parser.add_argument("--season", type=int, default=None,
+                        help="Single season to export (default: all seasons)")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
     output_dir: Path = args.output
-    season: int = args.season
+    seasons = [args.season] if args.season else ALL_SEASONS
 
-    print(f"\nExporting season {season} -> {output_dir}\n")
+    print(f"\nExporting {len(seasons)} season(s) -> {output_dir}\n")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     T = load_tables()
     print()
 
-    print("players.json...")
-    export_players(T, output_dir, season)
+    # Season-independent exports (once, using latest season for display defaults)
+    current = seasons[-1]
 
     print("teams.json...")
-    export_teams(T, output_dir, season)
+    export_teams(T, output_dir, current)
 
     print("team_ratings.json...")
-    export_team_ratings(T, output_dir, season)
-
-    print("ratings_by_position.json...")
-    export_ratings_by_position(T, output_dir, season)
-
-    print("similar_players.json...")
-    export_similar_players(T, output_dir)
-
-    print("rosters.json...")
-    export_rosters(T, output_dir)
-
-    print("schedules.json...")
-    export_schedules(T, output_dir)
-
-    print("transfers.json...")
-    export_transfers(T, output_dir)
+    export_team_ratings(T, output_dir, current)
 
     print("team_history.json...")
     export_team_history(T, output_dir)
 
+    print("similar_players.json...")
+    export_similar_players(T, output_dir)
+
     print("research/...")
     export_research(T, output_dir)
+
+    # Per-season exports
+    for season in seasons:
+        print(f"\n--- Season {season} ---")
+
+        print(f"  players_{season}.json...")
+        export_players(T, output_dir, season)
+
+        print(f"  ratings_by_position_{season}.json...")
+        export_ratings_by_position(T, output_dir, season)
+
+        print(f"  rosters_{season}.json...")
+        export_rosters(T, output_dir, season)
+
+        print(f"  schedules_{season}.json...")
+        export_schedules(T, output_dir, season)
+
+        print(f"  transfers_{season}.json...")
+        export_transfers(T, output_dir, season)
 
     print("\nDone.")
 
