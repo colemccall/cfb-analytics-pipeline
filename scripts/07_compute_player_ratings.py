@@ -152,37 +152,23 @@ EDGE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
 
 
 # ---------------------------------------------------------------------------
-# Era-bucketed anchors.
-#
-# Defensive: pre-2016 data lacks hurries/PBUs → raw composites are lower →
-#   lower the score thresholds so elite 2010 defenders still reach 90+.
-#   transition = modern × 0.85, classic = modern × 0.75.
-#
-# Offensive: pre-2016 had fewer tracked games (smaller sqrt(n) denominator)
-#   and different play styles, inflating per-game scores → raise thresholds
-#   so old QBs/RBs need a higher raw score to reach the same OVR.
-#   transition = modern × 1.10, classic = modern × 1.20.
+# Era-bucketed anchors for defensive positions only.
+# Pre-2016 data lacks hurries/PBUs → raw defensive composites are lower →
+# lower the score thresholds so elite 2010 defenders still reach 90+.
+# Offensive stats (yards, TDs) have been tracked consistently since 2008
+# and the raw score distributions are stable across eras — no adjustment needed.
 # ---------------------------------------------------------------------------
 
 def _scale_anchors(anchors: list[tuple[float, float]], factor: float) -> list[tuple[float, float]]:
     return [(round(x * factor, 4), y) for (x, y) in anchors]
 
 
-OFFENSIVE_POSITIONS = {"QB", "RB", "WR", "TE"}
 DEFENSIVE_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
 
 ERA_ANCHORS: dict[str, dict[str, list[tuple[float, float]]]] = {
-    "modern": EDGE_OVR_ANCHORS,
-    "transition": {
-        **{pg: _scale_anchors(v, 0.85) for pg, v in EDGE_OVR_ANCHORS.items() if pg in DEFENSIVE_POSITIONS},
-        **{pg: _scale_anchors(v, 1.10) for pg, v in EDGE_OVR_ANCHORS.items() if pg in OFFENSIVE_POSITIONS},
-        **{pg: v for pg, v in EDGE_OVR_ANCHORS.items() if pg not in DEFENSIVE_POSITIONS | OFFENSIVE_POSITIONS},
-    },
-    "classic": {
-        **{pg: _scale_anchors(v, 0.75) for pg, v in EDGE_OVR_ANCHORS.items() if pg in DEFENSIVE_POSITIONS},
-        **{pg: _scale_anchors(v, 1.20) for pg, v in EDGE_OVR_ANCHORS.items() if pg in OFFENSIVE_POSITIONS},
-        **{pg: v for pg, v in EDGE_OVR_ANCHORS.items() if pg not in DEFENSIVE_POSITIONS | OFFENSIVE_POSITIONS},
-    },
+    "modern":     EDGE_OVR_ANCHORS,
+    "transition": {pg: _scale_anchors(v, 0.85) for pg, v in EDGE_OVR_ANCHORS.items()},  # 2013–2015
+    "classic":    {pg: _scale_anchors(v, 0.75) for pg, v in EDGE_OVR_ANCHORS.items()},  # 2008–2012
 }
 
 
@@ -195,13 +181,15 @@ def get_era(season: int) -> str:
 
 
 def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
-    """Map raw edge_score to OVR via era-adjusted piecewise linear anchors.
+    """Map raw edge_score to OVR via piecewise linear anchors.
 
-    Defense pre-2016: lower thresholds (missing hurries/PBUs inflate difficulty).
-    Offense pre-2016: higher thresholds (fewer games inflates per-game scores).
+    Defensive positions pre-2016 use scaled-down thresholds (missing hurries/PBUs).
+    Offensive positions always use modern anchors — distributions are era-stable.
     """
-    era = get_era(season)
-    anchors = ERA_ANCHORS[era].get(pg) if era != "modern" else EDGE_OVR_ANCHORS.get(pg)
+    if pg in DEFENSIVE_POSITIONS:
+        anchors = ERA_ANCHORS[get_era(season)].get(pg)
+    else:
+        anchors = EDGE_OVR_ANCHORS.get(pg)
     if not anchors or edge_score is None or (isinstance(edge_score, float) and np.isnan(edge_score)):
         return 50.0
     xs = [a[0] for a in anchors]
