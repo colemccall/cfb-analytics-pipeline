@@ -309,15 +309,17 @@ def _load_game_stats(season: int, positions: set) -> pd.DataFrame:
 
     s["data"] = s["data"].apply(_parse_data)
 
+    # stats also has a player_id column (Supabase internal) — drop it before merging
+    s = s.drop(columns=["player_id"], errors="ignore")
+
     # Join stats -> player_seasons
     merged = s.merge(ps, left_on="player_season_id", right_on="ps_id", how="inner")
+    merged = merged.rename(columns={"player_id": "player_id", "team_id": "player_team_id"})
 
     # Join games for home/away team IDs
     g = games_df[["id", "home_team_id", "away_team_id"]].rename(columns={"id": "game_db_id"})
-    # game_id in stats is db game id
     merged = merged.merge(g, left_on="game_id", right_on="game_db_id", how="left")
 
-    merged["player_team_id"] = merged["team_id"].where(merged["team_id"].notna())
     return merged[["player_id", "position_group", "player_team_id", "game_id", "data", "home_team_id", "away_team_id"]]
 
 
@@ -390,7 +392,7 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
             "position_group":  grp["position_group"].iloc[0],
         })
 
-    result = df.groupby("player_id").apply(agg).reset_index()
+    result = df.groupby("player_id").apply(agg, include_groups=False).reset_index()
     result.loc[result["games_played"] < MIN_GAMES, "edge_score"] = None
     return result
 
@@ -474,7 +476,7 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
             "position_group":  grp["position_group"].iloc[0],
         })
 
-    result = df.groupby("player_id").apply(agg).reset_index()
+    result = df.groupby("player_id").apply(agg, include_groups=False).reset_index()
     result.loc[result["games_played"] < MIN_GAMES, "edge_score"] = None
     return result
 
