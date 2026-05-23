@@ -851,7 +851,10 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
     valid_stat = [s for s in all_stat_scores if s is not None]
     if valid_stat:
         stat_pcts = np.percentile(valid_stat, [0, 10, 50, 75, 90, 99, 100])
-        stat_targets = [30.0, 40.0, 58.0, 68.0, 76.0, 85.0, 90.0]  # no-EDGE cap at 90
+        # Cap at 78: without EDGE (opponent-adjusted EPA) we can't confirm elite
+        # production. Volume stats alone compress near the top — a 78 ceiling
+        # ensures pre-EDGE-era players are rated meaningfully but don't crowd 90+.
+        stat_targets = [30.0, 38.0, 55.0, 64.0, 70.0, 76.0, 78.0]
 
     final_scores   = []
     final_contribs = []
