@@ -179,13 +179,13 @@ def opponent_multiplier(opp_team_id, sp_map: dict, side: str,
 
     Normalization: z = (val - mean) / std  → clipped to [-2, +2]
     Bonus (hard opponent):  mult = 1.0 + z * 0.35   → up to 1.70
-    Penalty (weak opponent): mult = 1.0 + z * 0.20  → down to 0.60
+    Penalty (weak opponent): mult = 1.0 + z * 0.12  → down to 0.76
 
     Asymmetry rationale: a DB making an INT against a weak offense still
     demonstrates real skill — the defender can't choose who throws at them.
     But facing an elite offense should be rewarded more than facing a weak
-    one is penalized. This prevents the symmetric 0.30 floor that destroys
-    otherwise strong G5 seasons.
+    one is penalized. Penalty kept light (0.12) so G5 players with strong
+    production against their schedule are not excessively discounted.
 
     side="defense": for offensive players — lower opp defense SP+ = harder.
     side="offense": for defensive players — higher opp offense SP+ = harder.
@@ -214,7 +214,7 @@ def opponent_multiplier(opp_team_id, sp_map: dict, side: str,
     if z >= 0:
         return 1.0 + z * 0.35   # bonus: up to 1.70 for elite opponents
     else:
-        return 1.0 + z * 0.20   # penalty: down to 0.60 for weakest opponents
+        return 1.0 + z * 0.12   # penalty: down to 0.76 for weakest opponents (was 0.20/0.60)
 
 
 # ---------------------------------------------------------------------------

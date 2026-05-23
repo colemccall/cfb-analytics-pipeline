@@ -151,50 +151,15 @@ EDGE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Era-bucketed anchors for historical backfill (2008–2020).
-# Pre-2015 data lacks hurries/PBUs, making raw composite scores structurally lower.
-# Rather than altering the EDGE formula, we lower the anchor thresholds so that
-# an elite 2010 QB (missing hurry data) still maps to ~90 OVR, not ~75.
-# Scaling: transition = modern × 0.85, classic = modern × 0.75
-# ---------------------------------------------------------------------------
-
-def _scale_anchors(anchors: list[tuple[float, float]], factor: float) -> list[tuple[float, float]]:
-    """Scale the edge_score breakpoints by factor, keep OVR values unchanged."""
-    return [(round(x * factor, 4), y) for (x, y) in anchors]
-
-
-ERA_ANCHORS: dict[str, dict[str, list[tuple[float, float]]]] = {
-    "modern":     EDGE_OVR_ANCHORS,  # 2018+, same as calibrated anchors
-    "transition": {pg: _scale_anchors(v, 0.85) for pg, v in EDGE_OVR_ANCHORS.items()},  # 2013–2017
-    "classic":    {pg: _scale_anchors(v, 0.75) for pg, v in EDGE_OVR_ANCHORS.items()},  # 2008–2012
-}
-
-
-def get_era(season: int) -> str:
-    if season >= 2018:
-        return "modern"
-    if season >= 2013:
-        return "transition"
-    return "classic"
-
-
 DEFENSIVE_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
 
 def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
     """Map raw edge_score to OVR via fixed piecewise linear anchors.
 
-    Returns a rating in [30, 99] that reflects absolute production quality.
-    Era scaling (ERA_ANCHORS) applies only to defensive positions — pre-2016
-    data lacks hurries/PBUs so raw defensive composites are structurally lower.
-    Offensive positions (QB/RB/WR/TE) always use the modern anchors because
-    passing/rushing stats have been tracked consistently since 2008.
+    All seasons use the same anchors — no era inflation.
+    Historical players compete on the same absolute scale as modern players.
     """
-    if pg in DEFENSIVE_POSITIONS:
-        era = get_era(season)
-        anchors = ERA_ANCHORS[era].get(pg)
-    else:
-        anchors = EDGE_OVR_ANCHORS.get(pg)
+    anchors = EDGE_OVR_ANCHORS.get(pg)
     if not anchors or edge_score is None or (isinstance(edge_score, float) and np.isnan(edge_score)):
         return 50.0
     xs = [a[0] for a in anchors]
