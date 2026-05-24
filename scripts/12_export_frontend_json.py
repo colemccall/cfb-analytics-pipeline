@@ -529,7 +529,8 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
         print(f"  rosters_{season}.json: no player_seasons for this season")
         return
 
-    merged = ps_s.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
+    pl_cols = [c for c in ["id", "name", "height_in", "weight_lbs", "hometown_state"] if c in pl.columns]
+    merged = ps_s.merge(pl[pl_cols].rename(columns={"id": "pl_id"}),
                         left_on="player_id", right_on="pl_id", how="left")
 
     if not rat.empty:
@@ -537,6 +538,12 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
                      "trajectory_score", "breakout_probability", "shap_values"]].copy()
         merged = merged.merge(rat_s, left_on="id", right_on="player_season_id",
                               how="left", suffixes=("", "_rat"))
+
+    edge = T.get("player_edge", pd.DataFrame())
+    if not edge.empty and "edge_score" in edge.columns:
+        edge_s = edge[["player_season_id", "edge_score"]].rename(
+            columns={"player_season_id": "edge_ps_id"})
+        merged = merged.merge(edge_s, left_on="id", right_on="edge_ps_id", how="left")
 
     if not rec.empty:
         rec_best = rec.sort_values("composite_score", ascending=False, na_position="last") \
@@ -561,12 +568,16 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
             "name":             row.get("name"),
             "position_group":   row.get("position_group"),
             "year":             _i(row.get("year")),
+            "height_in":        _i(row.get("height_in")),
+            "weight_lbs":       _i(row.get("weight_lbs")),
+            "hometown_state":   row.get("hometown_state"),
             "overall_rating":   _f(row.get("overall_rating")),
             "trajectory":       _f(row.get("trajectory_score")),
             "breakout_prob":    _f(row.get("breakout_probability")),
             "shap":             _parse_shap(row.get("shap_values")),
             "stars":            _i(row.get("rec_stars")),
             "composite_score":  _f(row.get("rec_composite")),
+            "edge_score":       _f(row.get("edge_score")),
         })
 
     for tid in rosters:
