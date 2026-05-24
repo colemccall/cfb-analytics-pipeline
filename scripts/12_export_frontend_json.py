@@ -310,6 +310,7 @@ def export_teams(T: dict, output_dir: Path, season: int) -> None:
 # ---------------------------------------------------------------------------
 
 def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
+    """Export all seasons of team ratings (not just current) so the UI can look up any year."""
     tr = T["team_ratings"]
     tm = T["teams"]
 
@@ -317,9 +318,9 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
         print("  team_ratings.json: no computed team ratings — skipping")
         return
 
-    tr_s = tr[tr["season"] == season].copy() if "season" in tr.columns else tr.copy()
+    tr_s = tr.copy() if "season" in tr.columns else tr.copy()
     if tr_s.empty:
-        print(f"  team_ratings.json: no data for season {season}")
+        print(f"  team_ratings.json: no data")
         return
 
     if not tm.empty:
