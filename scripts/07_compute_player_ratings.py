@@ -151,45 +151,91 @@ EDGE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Era-bucketed anchors for defensive positions only.
-# Pre-2016 data lacks hurries/PBUs → raw defensive composites are lower →
-# lower the score thresholds so elite 2010 defenders still reach 90+.
-# Offensive stats (yards, TDs) have been tracked consistently since 2008
-# and the raw score distributions are stable across eras — no adjustment needed.
-# ---------------------------------------------------------------------------
-
-def _scale_anchors(anchors: list[tuple[float, float]], factor: float) -> list[tuple[float, float]]:
-    return [(round(x * factor, 4), y) for (x, y) in anchors]
-
-
 DEFENSIVE_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
 
-ERA_ANCHORS: dict[str, dict[str, list[tuple[float, float]]]] = {
-    "modern":     EDGE_OVR_ANCHORS,
-    "transition": {pg: _scale_anchors(v, 0.85) for pg, v in EDGE_OVR_ANCHORS.items()},  # 2013–2015
-    "classic":    {pg: _scale_anchors(v, 0.75) for pg, v in EDGE_OVR_ANCHORS.items()},  # 2008–2012
+# ---------------------------------------------------------------------------
+# Pre-2016 CLASSIC defensive ratings (2008–2015).
+#
+# The CFB Data API tracks interceptions back to 2008 but does NOT track
+# sacks, TFLs, QB hurries, or pass breakups before 2016. Tackles are also
+# absent. This means:
+#
+#   CB / S / DB — rated by interceptions (always tracked) + recruiting composite.
+#     Reference: Amerson 2011 (13 INT) → ~97, Peterson 2010 (4 INT, 5-star) → ~91,
+#     Ha-Ha Clinton-Dix 2013 (2 INT, 5-star) → ~85.
+#
+#   LB — INTs are rare but meaningful (Te'o 2012 had 7 — extraordinary).
+#     Without tackle data we still use INT + recruiting. Te'o (7 INT, 5-star) → ~97.
+#
+#   EDGE / DL — INTs are irrelevant; sacks/TFLs are absent → recruiting composite
+#     is the only signal. Myles Garrett 2015 (5-star, 0.9992) → ~85 (cap; can't
+#     confirm production without sack data).
+#
+# Adaptive blending: w_int scales from 0.45 (0 INT) to 0.95 (13+ INT).
+# At 0 INT, recruiting dominates; at record INTs, recruiting is minor context.
+# ---------------------------------------------------------------------------
+
+# Piecewise INT → OVR anchors per defensive position.
+# Calibrated so average starter (1 INT) → ~60, All-American (4-5 INT) → ~85-90,
+# record season → 97-99.
+_CLASSIC_INT_ANCHORS: dict[str, list[tuple[float, float]]] = {
+    "CB": [(0,40),(1,60),(2,70),(3,78),(4,85),(5,89),(6,92),(7,94),(8,96),(10,98),(13,99)],
+    "S":  [(0,40),(1,60),(2,70),(3,78),(4,84),(5,88),(6,91),(7,93),(8,95),(10,97),(13,99)],
+    "DB": [(0,40),(1,59),(2,69),(3,77),(4,83),(5,87),(6,90),(7,93),(8,95),(10,97),(13,99)],
+    # LB: 4+ INTs for a linebacker is extraordinary; Te'o (7 INT) → 97
+    "LB": [(0,38),(1,58),(2,70),(3,80),(4,88),(5,93),(6,96),(7,99)],
 }
+
+# Hard cap for EDGE/DL pre-2016: recruiting only, can't verify pass-rush production.
+_CLASSIC_EDGE_CAP = 88
+_CLASSIC_DL_CAP   = 85
+
+
+def compute_pre2016_classic_ovr(ints: float, rec_ovr: float, pg: str) -> float:
+    """Rate a pre-2016 defensive player using the CLASSIC system (INT + recruiting).
+
+    Args:
+        ints:    season interception count (float)
+        rec_ovr: recruiting OVR already on 0–100 scale (_composite_to_100 output)
+        pg:      position group
+
+    For CB/S/DB/LB: adaptive blend of INT-derived OVR and recruiting OVR.
+    For EDGE/DL: recruiting OVR capped — no production data available pre-2016.
+      Myles Garrett 2015 (5-star, ~100 rec_ovr) → 85 (cap).
+    """
+    if pg in ("EDGE", "DL"):
+        cap = _CLASSIC_EDGE_CAP if pg == "EDGE" else _CLASSIC_DL_CAP
+        return float(np.clip(min(cap, rec_ovr), 35.0, cap))
+
+    anchors = _CLASSIC_INT_ANCHORS.get(pg)
+    if not anchors:
+        return float(np.clip(rec_ovr, 35.0, 99.0))
+
+    xs = [a[0] for a in anchors]
+    ys = [float(a[1]) for a in anchors]
+    int_ovr = float(np.interp(ints, xs, ys))
+
+    # Adaptive weight: INT signal earns more weight as INT count rises.
+    # w_int = 0.45 at 0 INT (recruiting dominates) → 0.95 at 13+ INT (Amerson).
+    w_int = float(np.clip(0.45 + ints * 0.04, 0.45, 0.95))
+    w_rec = 1.0 - w_int
+
+    ovr = int_ovr * w_int + rec_ovr * w_rec
+    return float(np.clip(ovr, 35.0, 99.0))
 
 
 def get_era(season: int) -> str:
-    if season >= 2016:
-        return "modern"
-    if season >= 2013:
-        return "transition"
-    return "classic"
+    return "modern" if season >= 2016 else "pre2016"
 
 
 def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
     """Map raw edge_score to OVR via piecewise linear anchors.
 
-    Defensive positions pre-2016 use scaled-down thresholds (missing hurries/PBUs).
-    Offensive positions always use modern anchors — distributions are era-stable.
+    Pre-2016 defensive positions should NOT reach this function — they are
+    handled by compute_pre2016_classic_ovr() in compute_edge_ratings().
+    All other positions (offensive all eras, defensive 2016+) use EDGE_OVR_ANCHORS.
     """
-    if pg in DEFENSIVE_POSITIONS:
-        anchors = ERA_ANCHORS[get_era(season)].get(pg)
-    else:
-        anchors = EDGE_OVR_ANCHORS.get(pg)
+    anchors = EDGE_OVR_ANCHORS.get(pg)
     if not anchors or edge_score is None or (isinstance(edge_score, float) and np.isnan(edge_score)):
         return 50.0
     xs = [a[0] for a in anchors]
@@ -660,6 +706,9 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
             feats["experience"] = _sf(year, 2.0)
         feats["recruit_composite"] = _composite_to_100(cs)
         feats["transfer_flag"]     = 1 if (pid, season) in tr_set else 0
+        # Store raw INT count for pre-2016 CLASSIC defensive rating system.
+        if pg in DEFENSIVE_POSITIONS:
+            feats["interceptionsINT"] = _sf(raw_stats.get("interceptionsINT"), 0.0)
         feats["stars"]             = stars
         feats["year"]              = _si(year)
         feats["team_id"]           = team_id
@@ -685,13 +734,38 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
 # Starter classification
 # ---------------------------------------------------------------------------
 
+def _has_valid_edge(row: pd.Series) -> bool:
+    """A valid EDGE score (≥3 attributed games from script 06) is itself proof the
+    player produced enough to be evaluated as a starter. Critical for pre-2016
+    defenders, whose season tackle totals are missing so volume-based tiering fails."""
+    es = row.get("edge_score")
+    try:
+        return es is not None and not np.isnan(float(es)) and float(es) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def is_starter(row: pd.Series, pg: str) -> bool:
     """Returns True if player qualifies as 'starter' tier."""
+    if _has_valid_edge(row):
+        return True
+    # Pre-2016 defensive players with any interceptions are starters — they have
+    # real production signal even without EDGE scores.
+    row_season = int(row.get("_season") or 9999)
+    if pg in DEFENSIVE_POSITIONS and row_season < 2016:
+        ints = float(row.get("interceptionsINT") or 0)
+        if ints >= 1:
+            return True
+        # No INTs but still a pre-2016 defender — use recruiting to classify
+        rec = float(row.get("recruit_composite") or 40)
+        return rec >= 60  # 3-star+ treat as starter for CLASSIC rating
     return classify_tier(pg, row.to_dict()) == "starter"
 
 
 def get_tier(row: pd.Series, pg: str) -> str:
     """Classify player into tier: starter, role, reserve, or bench."""
+    if _has_valid_edge(row):
+        return "starter"
     return classify_tier(pg, row.to_dict(), games_played=row.get("games_played", 1))
 
 
@@ -706,6 +780,12 @@ def has_opp_score(row: pd.Series, pg: str = "") -> bool:
     if v is None or pd.isna(v) or float(v) == 0.0:
         return False
     sm = float(row.get("stats_measured") or 0)
+    # Pre-2016 defenders only have interceptions tracked per game (no tackles/sacks),
+    # so their stats_measured is tiny. Lower the bar — a valid EDGE from ≥3 INT-games
+    # is the strongest signal we have for that era.
+    season = int(row.get("_season") or 0)
+    if pg in {"EDGE", "DL", "LB", "CB", "S", "DB"} and season < 2016:
+        return sm >= 3
     thresholds = {
         "QB": 100, "RB": 60, "WR": 20, "TE": 10,
         "EDGE": 20, "DL": 20, "LB": 30, "CB": 15, "S": 15, "DB": 15,
@@ -860,7 +940,22 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
     final_contribs = []
 
     for i, (_, row) in enumerate(df.iterrows()):
-        if has_opp_score(row, pg):
+        # Per-row pre-2016 defensive check — df contains ALL seasons.
+        row_season = int(row.get("_season") or season)
+        is_pre2016_def = (pg in DEFENSIVE_POSITIONS and row_season < 2016)
+
+        if is_pre2016_def:
+            # CLASSIC system: interceptions + recruiting composite.
+            # interceptionsINT is stored directly by _load_seasons for defensive positions.
+            ints    = float(row.get("interceptionsINT") or 0)
+            rec_ovr = float(row.get("recruit_composite") or 40.0)
+            ovr     = compute_pre2016_classic_ovr(ints, rec_ovr, pg)
+            contrib = {
+                "interceptionsINT":   round(ints, 1),
+                "recruit_composite":  round(rec_ovr, 2),
+                "classic_system":     True,
+            }
+        elif has_opp_score(row, pg):
             es  = float(row.get("edge_score") or 0)
             ovr = edge_to_ovr(es, pg, season)
             contrib = {
@@ -870,8 +965,8 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
                 "stats_measured": int(row.get("stats_measured") or 0),
             }
         elif all_stat_scores[i] is not None and valid_stat:
-            # Stat-based fallback: scale within the no-EDGE pool, cap at 90
-            ovr = float(np.clip(np.interp(all_stat_scores[i], stat_pcts, stat_targets), 30.0, 90.0))
+            # Stat-based fallback: scale within the no-EDGE pool, cap at 78
+            ovr = float(np.clip(np.interp(all_stat_scores[i], stat_pcts, stat_targets), 30.0, 78.0))
             contrib = {"recruit_composite": round(float(row.get("recruit_composite") or 50.0), 2),
                        "stat_fallback": round(all_stat_scores[i], 4)}
         else:
@@ -989,13 +1084,15 @@ def apply_multi_tier_treatment(scores: np.ndarray, df: pd.DataFrame, pg: str,
     return result
 
 
-def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame) -> np.ndarray:
+def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame, pg: str = "") -> np.ndarray:
     """Damp ratings toward position average only for low-game-count players.
 
     Players with 8+ games: untouched (full confidence).
     Players with fewer games: rating pulled toward position average proportionally.
     Prevents a 2-game wonder from rating 95 but doesn't compress full-season players.
     Zero values (no EDGE data) are skipped entirely — they get fallback_rating later.
+    Pre-2016 defensive players skip the penalty: they use season totals (CLASSIC system)
+    and have games_played=0 by construction (no player_edge row).
     """
     valid = scaled[scaled > 0]
     avg = float(np.mean(valid)) if len(valid) > 0 else 65.0
@@ -1003,6 +1100,9 @@ def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame) -> np.ndarray:
     for i, (_, row) in enumerate(df.iterrows()):
         if scaled[i] == 0.0:
             continue  # no EDGE data — leave as 0, fallback_rating handles it
+        row_season = int(row.get("_season") or 9999)
+        if pg in DEFENSIVE_POSITIONS and row_season < 2016:
+            continue  # CLASSIC system: season totals, no per-game confidence check
         games = float(row.get("games_played", 0) or 0)
         if games >= 8:
             continue  # full-season starters: no change
@@ -1153,7 +1253,7 @@ def rate_position(season: int, pg: str) -> list[dict]:
             # --- Direct edge_score → OVR mapping (no peer ranking) ---
             raw_scores, contribs = compute_edge_ratings(all_starter_df, pg, season)
             # raw_scores is already [30-99] for EDGE players, 0.0 for no-data players
-            scaled = apply_games_confidence(raw_scores, all_starter_df)
+            scaled = apply_games_confidence(raw_scores, all_starter_df, pg=pg)
             # Print distribution of players with valid EDGE
             edge_ovrs = scaled[scaled > 0]
             if len(edge_ovrs) >= 5:
@@ -1213,7 +1313,7 @@ def rate_position(season: int, pg: str) -> list[dict]:
         contrib_map[rkey] = {"recruit_composite": 0.5}
 
     # --- Filter down to the requested season ---
-    season_df = all_df[all_df["_season"] == season]
+    season_df = all_df[all_df["_season"] == season].copy()
     if season_df.empty:
         print("no data for requested season")
         return []

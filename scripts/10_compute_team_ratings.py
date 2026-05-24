@@ -76,31 +76,66 @@ FUZZY_THRESHOLD = 0.80
 OFF_POSITIONS = {"QB", "RB", "WR", "TE", "OL"}
 DEF_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
 
-# Fixed absolute anchors — cross-season stable (do NOT use percentile curve)
-# Maps blended composite (0-100) → OVR target.
-# Calibrated from 2025 actual composite distribution:
-#   Bottom FBS ≈ 45-48, average FBS ≈ 54-57, p90 ≈ 61, top-5 ≈ 63-65
-# Goal: top-5 nationally → 91-95, average FBS → 65-70, cellar → 40-50.
-TEAM_OVR_ANCHORS = [
-    (30.0,  30),   # FCS / worst FBS floor
-    (46.0,  45),   # cellar FBS (0-win territory)
-    (51.0,  58),   # bottom quarter FBS
-    (54.5,  65),   # average FBS team
-    (57.5,  72),   # bowl-eligible, .500 P4
-    (59.5,  78),   # solid P4, 8-9 wins
-    (61.0,  84),   # conference contender, 10+ wins
-    (62.5,  89),   # CFP-caliber top-12
-    (63.5,  93),   # top-5 nationally
-    (65.0,  97),   # historically elite (rare)
+# ---------------------------------------------------------------------------
+# SP+-anchored team rating curves (Madden/CFB-style spread).
+#
+# SP+ is a schedule-adjusted points-margin metric — the best single team signal.
+# We map it directly to a 0-99 OVR with fixed anchors so ratings are cross-season
+# comparable and have a proper spread (elite ~96-99, average ~72, cellar ~50).
+#
+# Calibrated from 2025 SP+ distribution:
+#   sp_overall: min=-37 p25=-9 p50=+1.6 p90=+18 max=+32
+#   sp_offense: 8..43, p50=27 (higher = better)
+#   sp_defense: 8..43, p50=27 (LOWER = better — points allowed)
+# ---------------------------------------------------------------------------
+
+# Overall: sp_overall (centered near 0) → OVR
+SP_OVERALL_ANCHORS = [
+    (-37, 48), (-20, 58), (-10, 65), (-3, 70), (2, 73),
+    (10, 80), (18, 87), (25, 93), (33, 99),
+]
+# Offense: sp_offense (higher = better)
+SP_OFFENSE_ANCHORS = [
+    (5, 48), (15, 60), (22, 68), (27, 73), (33, 82), (39, 90), (44, 97),
+]
+# Defense: sp_defense (LOWER = better) — note descending OVR as value rises
+SP_DEFENSE_ANCHORS = [
+    (7, 97), (14, 90), (20, 82), (27, 73), (33, 66), (39, 58), (44, 50),
 ]
 
-_ANCHOR_X = [a[0] for a in TEAM_OVR_ANCHORS]
-_ANCHOR_Y = [a[1] for a in TEAM_OVR_ANCHORS]
+
+def _interp_anchors(val: float, anchors: list) -> float:
+    xs = [a[0] for a in anchors]
+    ys = [a[1] for a in anchors]
+    return float(np.interp(val, xs, ys))
 
 
-def composite_to_ovr(composite: float) -> float:
-    """Map blended composite (0-100) to OVR via fixed piecewise-linear anchors."""
-    return float(np.interp(composite, _ANCHOR_X, _ANCHOR_Y))
+def sp_overall_to_ovr(sp: float) -> float:
+    return _interp_anchors(sp, SP_OVERALL_ANCHORS)
+
+
+def sp_offense_to_ovr(sp: float) -> float:
+    return _interp_anchors(sp, SP_OFFENSE_ANCHORS)
+
+
+def sp_defense_to_ovr(sp: float) -> float:
+    return _interp_anchors(sp, SP_DEFENSE_ANCHORS)
+
+
+# Roster-talent fallback anchors — mean of a team's top-22 starter OVRs → team OVR.
+# Used to blend with SP+ (and as the sole signal when SP+ is missing, e.g. FCS).
+ROSTER_OVR_ANCHORS = [
+    (50, 50), (60, 62), (66, 70), (72, 80), (78, 88), (84, 95), (90, 99),
+]
+
+
+def roster_to_ovr(mean_top: float) -> float:
+    return _interp_anchors(mean_top, ROSTER_OVR_ANCHORS)
+
+
+# Blend: SP+ is primary; roster talent adds the "eye test" feel.
+W_SP_BLEND = 0.75
+W_ROSTER_BLEND = 0.25
 
 
 def _clip(val: float) -> float:
@@ -187,7 +222,7 @@ def avg_top(ratings: list, n: int) -> float:
 def load_starter_ratings_by_position(season: int) -> dict:
     """Return {team_id: {QB: [r1,r2,...], RB: [...], ...}} for starter-tier players."""
     rat_df = read_computed("ratings")
-    ps_df  = read_raw("player_seasons")[["id", "position_group"]].rename(columns={"id": "ps_id"})
+    ps_df  = read_raw("player_seasons")[["id", "team_id", "position_group"]].rename(columns={"id": "ps_id"})
 
     if rat_df.empty or ps_df.empty:
         return {}
@@ -245,8 +280,90 @@ def compute_roster_splits(by_pos: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Raw team stats signal
+# Team season stats — pivot the /stats/season long format into per-team dicts
+# and persist display-ready per-game metrics for the frontend stats panel.
 # ---------------------------------------------------------------------------
+
+def build_team_stat_table(season: int, api_key: str) -> dict:
+    """Pivot /stats/season long rows ({team, statName, statValue}) into
+    {team_name_lower: {statName: float}}."""
+    raw = fetch_team_stats(api_key, season)
+    if not raw:
+        return {}
+    table: dict = defaultdict(dict)
+    for row in raw:
+        name = (row.get("team") or "").lower().strip()
+        stat = row.get("statName")
+        if not name or not stat:
+            continue
+        try:
+            table[name][stat] = float(row.get("statValue") or 0)
+        except (TypeError, ValueError):
+            continue
+    return dict(table)
+
+
+def store_team_season_stats(season: int, api_key: str, teams: list) -> None:
+    """Compute display-ready per-game team metrics and persist to
+    data/computed/team_season_stats.json (one row per team_id × season)."""
+    table = build_team_stat_table(season, api_key)
+    if not table:
+        print(f"  No team stats to store for {season}")
+        return
+
+    table_keys = list(table.keys())
+    rows = []
+    for team_id, school, _conf in teams:
+        lower = school.lower()
+        stats = table.get(lower) or table.get(_fuzzy_match(lower, table_keys) or "")
+        if not stats:
+            continue
+        g = max(stats.get("games", 0) or 0, 1)
+
+        def pg(key):  # per-game
+            return round(stats.get(key, 0) / g, 1)
+
+        def rate(num, den):
+            d = stats.get(den, 0)
+            return round(100.0 * stats.get(num, 0) / d, 1) if d else None
+
+        rows.append({
+            "team_id": team_id, "season": season, "games": int(g),
+            # Offense per game
+            "yards_pg":        pg("totalYards"),
+            "pass_yards_pg":   pg("netPassingYards"),
+            "rush_yards_pg":   pg("rushingYards"),
+            "first_downs_pg":  pg("firstDowns"),
+            "third_down_pct":  rate("thirdDownConversions", "thirdDowns"),
+            "fourth_down_pct": rate("fourthDownConversions", "fourthDowns"),
+            # Defense per game (opponent output allowed)
+            "yards_allowed_pg":      pg("totalYardsOpponent"),
+            "pass_allowed_pg":       pg("netPassingYardsOpponent"),
+            "rush_allowed_pg":       pg("rushingYardsOpponent"),
+            "third_down_def_pct":    rate("thirdDownConversionsOpponent", "thirdDownsOpponent"),
+            # Disruption / takeaways
+            "sacks_pg":      pg("sacks"),
+            "tfl_pg":        pg("tacklesForLoss"),
+            "takeaways":     int((stats.get("interceptions", 0) or 0) + (stats.get("fumblesRecovered", 0) or 0)),
+            "giveaways":     int(stats.get("turnovers", 0) or 0),
+            "turnover_margin": int(((stats.get("interceptions", 0) or 0) + (stats.get("fumblesRecovered", 0) or 0))
+                                   - (stats.get("turnovers", 0) or 0)),
+            "possession_pg_sec": int((stats.get("possessionTime", 0) or 0) / g),
+        })
+
+    if not rows:
+        return
+
+    import pandas as pd
+    new_df = pd.DataFrame(rows)
+    existing = read_computed("team_season_stats")
+    if not existing.empty:
+        mask = ~(existing["team_id"].isin(new_df["team_id"]) & existing["season"].isin(new_df["season"]))
+        combined = pd.concat([existing[mask], new_df], ignore_index=True)
+    else:
+        combined = new_df
+    write_computed("team_season_stats", combined)
+
 
 def build_perf_scores(season: int, api_key: str) -> dict:
     """Fetch team season stats and normalize 0-1 across FBS teams.
@@ -415,40 +532,41 @@ def compute_team_splits(
     sp_means: tuple,
     rec_scaled: float | None,
 ) -> dict:
-    """Blend three signals into pass_off, run_off, pass_def, run_def, special_teams, overall."""
-    mean_ovr, mean_off, mean_def = sp_means
+    """SP+-anchored overall/offense/defense (0-99), blended with roster talent.
 
-    sp_off_s = sp_scaled(sp["offense"] if sp else None, mean_off)
-    # SP+ defense: lower = better (points allowed). Negate so sigmoid maps correctly.
-    sp_def_raw = sp["defense"] if sp else None
-    sp_def_s = sp_scaled(-sp_def_raw if sp_def_raw is not None else None, -mean_def)
+    sub_ratings (pass_off/run_off/pass_def/run_def) come from position-weighted
+    roster splits — these drive the detail bars, not the headline OVR.
+    """
+    # --- Headline ratings: SP+ anchored, blended with roster talent ---
+    # Roster talent = mean of the team's top-22 starter OVRs across all positions.
+    all_starter_ovrs = [r for ratings in roster_by_pos.values() for r in ratings]
+    mean_top22 = (float(np.mean(sorted(all_starter_ovrs, reverse=True)[:22]))
+                  if all_starter_ovrs else None)
+    roster_ovr = roster_to_ovr(mean_top22) if mean_top22 is not None else None
 
-    # Signal 1: roster
+    if sp is not None:
+        sp_ovr = sp_overall_to_ovr(sp["overall"])
+        off    = sp_offense_to_ovr(sp["offense"])
+        deff   = sp_defense_to_ovr(sp["defense"])
+        if roster_ovr is not None:
+            overall = sp_ovr * W_SP_BLEND + roster_ovr * W_ROSTER_BLEND
+        else:
+            overall = sp_ovr
+    elif roster_ovr is not None:
+        # No SP+ (e.g. FCS / unmatched) — fall back to roster talent only.
+        overall = roster_ovr
+        off = deff = roster_ovr
+    else:
+        overall = off = deff = 50.0
+
+    # --- Detail splits: position-weighted roster quality (drives the bars) ---
     ros = compute_roster_splits(roster_by_pos)
-
-    # Signal 2: raw stats (0-100 already)
-    raw_pass_off = raw["pass_off"] if raw else 50.0
-    raw_run_off  = raw["run_off"]  if raw else 50.0
-    raw_pass_def = raw["pass_def"] if raw else 50.0
-    raw_run_def  = raw["run_def"]  if raw else 50.0
-
-    # Three-signal blend per split
-    pass_off = ros["pass_off"] * W_ROSTER + sp_off_s * W_SP + raw_pass_off * W_RAW
-    run_off  = ros["run_off"]  * W_ROSTER + sp_off_s * W_SP + raw_run_off  * W_RAW
-    pass_def = ros["pass_def"] * W_ROSTER + sp_def_s * W_SP + raw_pass_def * W_RAW
-    run_def  = ros["run_def"]  * W_ROSTER + sp_def_s * W_SP + raw_run_def  * W_RAW
-    special  = ros["special"]   # raw only — SP+ has no special teams split
-
-    # Overall composite from splits → fixed-anchor OVR
-    composite = (pass_off * W_PASS_OFF + run_off * W_RUN_OFF
-               + pass_def * W_PASS_DEF + run_def * W_RUN_DEF
-               + special  * W_SPEC)
-
-    ovr = composite_to_ovr(composite)
-
-    # Offense/defense rollup (for backward compat display)
-    offense = (pass_off * W_OFF_SPLIT + run_off * (1 - W_OFF_SPLIT))
-    defense = (pass_def * W_DEF_SPLIT + run_def * (1 - W_DEF_SPLIT))
+    # Blend roster splits toward the SP+ offense/defense headline so bars track OVR.
+    pass_off = ros["pass_off"] * 0.6 + off  * 0.4
+    run_off  = ros["run_off"]  * 0.6 + off  * 0.4
+    pass_def = ros["pass_def"] * 0.6 + deff * 0.4
+    run_def  = ros["run_def"]  * 0.6 + deff * 0.4
+    special  = ros["special"]
 
     def r2(v): return round(float(v), 2)
 
@@ -458,10 +576,10 @@ def compute_team_splits(
         "pass_def":       r2(_clip(pass_def)),
         "run_def":        r2(_clip(run_def)),
         "special_teams":  r2(_clip(special)),
-        "overall_rating": r2(_clip(ovr)),
-        "offense_rating": r2(_clip(offense)),
-        "defense_rating": r2(_clip(defense)),
-        "composite":      r2(composite),
+        "overall_rating": r2(_clip(overall)),
+        "offense_rating": r2(_clip(off)),
+        "defense_rating": r2(_clip(deff)),
+        "composite":      r2(overall),
     }
 
 
@@ -491,6 +609,9 @@ def run_season(season: int, api_key: str) -> None:
     perf_raw = build_perf_scores(season, api_key)
     raw_map = match_raw_to_teams(perf_raw, teams)
     print(f"  {len(raw_map)} teams have raw stat data")
+
+    print("Storing display team stats...")
+    store_team_season_stats(season, api_key, teams)
 
     print(f"Loading recruiting ({season - RECRUITING_WINDOW + 1}–{season})...")
     recruiting_map = load_recruiting_scores(season)

@@ -126,8 +126,9 @@ def load_tables() -> dict:
         "transfers":      read_raw("transfers"),
         "player_edge":    read_raw("player_edge"),
         "research_cache": read_raw("research_cache"),
-        "ratings":        read_computed("ratings"),
-        "team_ratings":   read_computed("team_ratings"),
+        "ratings":          read_computed("ratings"),
+        "team_ratings":     read_computed("team_ratings"),
+        "team_season_stats": read_computed("team_season_stats"),
     }
     for name, df in t.items():
         print(f"  {name:<20} {len(df):>8} rows")
@@ -162,8 +163,7 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
     ps_slim = ps[["id", "player_id", "position_group", "year", "team_id"]] \
                 .rename(columns={"id": "ps_id", "player_id": "cfb_player_id", "team_id": "ps_team_id"})
     rat_s = rat_s.merge(ps_slim, left_on="player_season_id", right_on="ps_id", how="left")
-    # Use ps team_id if ratings team_id is missing
-    rat_s["team_id"] = rat_s["team_id"].where(rat_s["team_id"].notna(), rat_s["ps_team_id"])
+    rat_s = rat_s.rename(columns={"ps_team_id": "team_id"})
 
     # players — join on cfb_player_id (= players.id)
     pl_slim = pl[["id", "name", "position", "height_in", "weight_lbs", "hometown_state"]] \
@@ -183,10 +183,9 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
                       .rename(columns={"player_id": "rec_pid", "stars": "rec_stars",
                                        "composite_score": "rec_composite"})
         rat_s = rat_s.merge(rec_best, left_on="cfb_player_id", right_on="rec_pid", how="left")
-        # Fill stars/composite from recruiting if ratings columns are null
-        rat_s["stars"] = rat_s["stars"].where(rat_s["stars"].notna(), rat_s["rec_stars"])
-        rat_s["composite_score"] = rat_s["composite_score"].where(
-            rat_s["composite_score"].notna(), rat_s["rec_composite"])
+        # ratings has no stars/composite — use recruiting values directly
+        rat_s["stars"] = rat_s["rec_stars"]
+        rat_s["composite_score"] = rat_s["rec_composite"]
     else:
         rat_s["recruit_year"] = None
 
@@ -276,10 +275,12 @@ def export_teams(T: dict, output_dir: Path, season: int) -> None:
     if tm.empty:
         return
 
-    # Per-team player count — ratings already has team_id, no ps merge needed
+    # Per-team player count — join ratings -> player_seasons to get team_id
     count_by_team = {}
-    if not rat.empty:
-        rat_s = rat[(rat["season"] == season) & rat["team_id"].notna()]
+    if not rat.empty and not ps.empty:
+        ps_slim = ps[["id", "team_id"]].rename(columns={"id": "player_season_id"})
+        rat_s = rat[rat["season"] == season].merge(ps_slim, on="player_season_id", how="left")
+        rat_s = rat_s[rat_s["team_id"].notna()]
         count_by_team = rat_s.groupby("team_id").size().to_dict()
 
     teams = []
@@ -379,7 +380,7 @@ def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
 
     # ratings.player_id is Supabase internal; use player_seasons.player_id (CFB API id)
     rat_s = rat[rat["season"] == season].copy()
-    rat_s = rat_s.merge(ps[["id", "player_id", "position_group", "year"]]
+    rat_s = rat_s.merge(ps[["id", "player_id", "team_id", "position_group", "year"]]
                         .rename(columns={"id": "ps_id", "player_id": "cfb_player_id"}),
                         left_on="player_season_id", right_on="ps_id", how="left")
     rat_s = rat_s.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
@@ -435,7 +436,7 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
     # ratings.player_id is Supabase internal; use player_seasons.player_id (CFB API id)
     print("  Building similarity matrix...")
     df = rat[rat["overall_rating"] >= 55].copy()
-    df = df.merge(ps[["id", "player_id", "position_group"]]
+    df = df.merge(ps[["id", "player_id", "team_id", "position_group"]]
                   .rename(columns={"id": "ps_id", "player_id": "cfb_player_id"}),
                   left_on="player_season_id", right_on="ps_id", how="left")
     df = df.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
@@ -633,13 +634,13 @@ def export_transfers(T: dict, output_dir: Path, season: int) -> None:
     pl  = T["players"]
     ps  = T["player_seasons"]
     tm  = T["teams"]
+    rat = T.get("ratings", pd.DataFrame())
 
     if tr.empty:
         return
 
     tr_s = tr[tr["transfer_year"] == season] if "transfer_year" in tr.columns else tr
-    # Only export transfers linked to a known player — unlinked rows (player_id NaN)
-    # come from script 01's raw portal dump and have no name/position to show.
+    # Only export transfers linked to a known player
     if "player_id" in tr_s.columns:
         tr_s = tr_s[tr_s["player_id"].notna()]
     if tr_s.empty:
@@ -660,20 +661,46 @@ def export_transfers(T: dict, output_dir: Path, season: int) -> None:
                        [["player_id", "position_group"]]
         merged = merged.merge(pos_lookup, on="player_id", how="left")
 
+    # Build rating lookup: (player_season_id) → overall_rating
+    # Also need (player_id, season, team_id) → player_season_id from player_seasons
+    ps_ovr_map: dict = {}   # player_season_id → overall_rating
+    ps_id_map: dict  = {}   # (player_id, season, team_id) → player_season_id
+    if not rat.empty and not ps.empty:
+        if "overall_rating" in rat.columns and "player_season_id" in rat.columns:
+            for _, rr in rat.iterrows():
+                psid = _i(rr.get("player_season_id"))
+                ovr  = _f(rr.get("overall_rating"))
+                if psid and ovr:
+                    ps_ovr_map[psid] = ovr
+        for _, pr in ps.iterrows():
+            key = (_i(pr["player_id"]), _i(pr["season"]), _i(pr["team_id"]))
+            if all(k is not None for k in key):
+                ps_id_map[key] = _i(pr["id"])
+
+    def _lookup_ovr(pid, seas, team_id):
+        psid = ps_id_map.get((_i(pid), _i(seas), _i(team_id)))
+        return ps_ovr_map.get(psid) if psid else None
+
     transfers: dict = {}
     for _, row in merged.iterrows():
         portal_date = str(row["portal_date"]) if row.get("portal_date") else None
+        pid     = _i(row["player_id"])
+        from_id = _i(row.get("from_team_id"))
+        to_id   = _i(row.get("to_team_id"))
+        # Current-season rating at to_team; previous-season rating at from_team
+        ovr_current  = _lookup_ovr(pid, season,     to_id)
+        ovr_previous = _lookup_ovr(pid, season - 1, from_id)
         entry = {
-            "player_id":      _i(row["player_id"]),
+            "player_id":      pid,
             "name":           row.get("name"),
             "position_group": row.get("position_group"),
             "transfer_year":  season,
             "portal_date":    portal_date,
             "from_school":    row.get("from_school"),
             "to_school":      row.get("to_school"),
+            "ovr_current":    round(ovr_current,  1) if ovr_current  else None,
+            "ovr_previous":   round(ovr_previous, 1) if ovr_previous else None,
         }
-        from_id = _i(row.get("from_team_id"))
-        to_id   = _i(row.get("to_team_id"))
         if from_id:
             transfers.setdefault(str(from_id), []).append({**entry, "direction": "out"})
         if to_id:
@@ -685,6 +712,52 @@ def export_transfers(T: dict, output_dir: Path, season: int) -> None:
 # ---------------------------------------------------------------------------
 # Export: team_history.json
 # ---------------------------------------------------------------------------
+
+def _build_conf_history(teams: "pd.DataFrame") -> dict:
+    """Build {team_id: {season: conference}} from teams table + override table."""
+    if teams.empty:
+        return {}
+    base = dict(zip(teams["id"], teams["conference"]))
+
+    # School-name based overrides for well-known realignment moves.
+    # Keyed by EXACT lowercase school name as stored in the teams table.
+    _by_school: dict[str, list[tuple[int, int, str]]] = {
+        "usc":            [(2008, 2023, "Pac-12"),        (2024, 9999, "Big Ten")],
+        "ucla":           [(2008, 2023, "Pac-12"),        (2024, 9999, "Big Ten")],
+        "oregon":         [(2008, 2023, "Pac-12"),        (2024, 9999, "Big Ten")],
+        "washington":     [(2008, 2023, "Pac-12"),        (2024, 9999, "Big Ten")],
+        "texas":          [(2008, 2023, "Big 12"),        (2024, 9999, "SEC")],
+        "oklahoma":       [(2008, 2023, "Big 12"),        (2024, 9999, "SEC")],
+        "utah":           [(2008, 2023, "Pac-12"),        (2024, 9999, "Big 12")],
+        "colorado":       [(2008, 2010, "Big 12"),  (2011, 2023, "Pac-12"), (2024, 9999, "Big 12")],
+        "arizona":        [(2008, 2023, "Pac-12"),        (2024, 9999, "Big 12")],
+        "arizona state":  [(2008, 2023, "Pac-12"),        (2024, 9999, "Big 12")],
+        "maryland":       [(2008, 2013, "ACC"),           (2014, 9999, "Big Ten")],
+        "rutgers":        [(2008, 2013, "Big East"),      (2014, 9999, "Big Ten")],
+        "nebraska":       [(2008, 2010, "Big 12"),        (2011, 9999, "Big Ten")],
+        "texas a&m":      [(2008, 2011, "Big 12"),        (2012, 9999, "SEC")],
+        "missouri":       [(2008, 2011, "Big 12"),        (2012, 9999, "SEC")],
+        "pittsburgh":     [(2008, 2012, "Big East"),      (2013, 9999, "ACC")],
+        "syracuse":       [(2008, 2012, "Big East"),      (2013, 9999, "ACC")],
+        "louisville":     [(2008, 2013, "Big East"),      (2014, 9999, "ACC")],
+        "west virginia":  [(2008, 2011, "Big East"),      (2012, 9999, "Big 12")],
+        "tcu":            [(2008, 2011, "Mountain West"), (2012, 9999, "Big 12")],
+    }
+
+    # Build id → school lookup
+    id_to_school = dict(zip(teams["id"], teams["school"].str.lower())) if "school" in teams.columns else {}
+
+    def _conf_for_team_season(tid: int, sea: int) -> str:
+        school = id_to_school.get(tid, "")
+        overrides = _by_school.get(school)
+        if overrides:
+            for (start, end, conf) in overrides:
+                if start <= sea <= end:
+                    return conf
+        return base.get(tid, "")
+
+    return _conf_for_team_season
+
 
 def export_team_history(T: dict, output_dir: Path) -> None:
     tr    = T["team_ratings"]
@@ -713,7 +786,7 @@ def export_team_history(T: dict, output_dir: Path) -> None:
                 wins_by[aid][sea]   += 1
                 losses_by[hid][sea] += 1
 
-    conf_map = dict(zip(teams["id"], teams["conference"])) if not teams.empty else {}
+    get_conf = _build_conf_history(teams)
 
     history: dict = {}
     for _, row in tr.sort_values("season", ascending=False).iterrows():
@@ -723,7 +796,7 @@ def export_team_history(T: dict, output_dir: Path) -> None:
             "season":           sea,
             "wins":             wins_by[tid].get(sea),
             "losses":           losses_by[tid].get(sea),
-            "conference":       conf_map.get(tid) or row.get("conference"),
+            "conference":       get_conf(tid, sea),
             "sp_overall":       _f(row.get("sp_overall")),
             "overall_rating":   _f(row.get("overall_rating")),
             "offense_rating":   _f(row.get("offense_rating")),
@@ -732,6 +805,29 @@ def export_team_history(T: dict, output_dir: Path) -> None:
         })
 
     write_json(output_dir / "team_history.json", history)
+
+
+# ---------------------------------------------------------------------------
+# Export: team_stats_{season}.json — per-game team metrics for the stats panel
+# ---------------------------------------------------------------------------
+
+def export_team_stats(T: dict, output_dir: Path, season: int) -> None:
+    ts = T.get("team_season_stats")
+    if ts is None or ts.empty:
+        return
+    ts_s = ts[ts["season"] == season]
+    if ts_s.empty:
+        print(f"  team_stats_{season}.json: no data")
+        return
+    out: dict = {}
+    for _, row in ts_s.iterrows():
+        tid = _i(row.get("team_id"))
+        if tid is None:
+            continue
+        d = {k: (None if (isinstance(v, float) and math.isnan(v)) else v)
+             for k, v in row.to_dict().items() if k not in ("team_id", "season")}
+        out[str(tid)] = d
+    write_json(output_dir / f"team_stats_{season}.json", out)
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +928,9 @@ def main():
 
         print(f"  transfers_{season}.json...")
         export_transfers(T, output_dir, season)
+
+        print(f"  team_stats_{season}.json...")
+        export_team_stats(T, output_dir, season)
 
     print("\nDone.")
 
