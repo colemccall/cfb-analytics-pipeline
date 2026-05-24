@@ -43,10 +43,32 @@ TOP_N_PER_POSITION = 50
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _clean_nan(o):
+    """Recursively replace float NaN/inf with None — literal NaN is invalid JSON
+    and breaks browser fetch().json(). pandas merges produce NaN for unmatched rows.
+    Handles both python float and numpy float (np.float64) NaN."""
+    if isinstance(o, dict):
+        return {k: _clean_nan(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_clean_nan(v) for v in o]
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    # numpy scalar (np.float64 etc.) — unwrap then check
+    if hasattr(o, "item"):
+        try:
+            v = o.item()
+            if isinstance(v, float):
+                return v if math.isfinite(v) else None
+            return v
+        except (ValueError, TypeError):
+            return o
+    return o
+
+
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, separators=(",", ":"), default=_default)
+        json.dump(_clean_nan(data), f, separators=(",", ":"), default=_default, allow_nan=False)
     size_kb = path.stat().st_size / 1024
     n = len(data) if isinstance(data, (list, dict)) else "?"
     print(f"  Wrote {path.name} ({size_kb:.1f} KB, {n} items)")
@@ -616,8 +638,12 @@ def export_transfers(T: dict, output_dir: Path, season: int) -> None:
         return
 
     tr_s = tr[tr["transfer_year"] == season] if "transfer_year" in tr.columns else tr
+    # Only export transfers linked to a known player — unlinked rows (player_id NaN)
+    # come from script 01's raw portal dump and have no name/position to show.
+    if "player_id" in tr_s.columns:
+        tr_s = tr_s[tr_s["player_id"].notna()]
     if tr_s.empty:
-        print(f"  transfers_{season}.json: no transfers for this season")
+        print(f"  transfers_{season}.json: no linked transfers for this season")
         return
 
     merged = tr_s.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
