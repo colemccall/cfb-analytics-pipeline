@@ -5,14 +5,15 @@ Two data sources:
   2. ESPN scraper — current cycle HC/OC/DC hires, Selenium-based
 
 Usage:
-    python scripts/05_coaching_changes.py               # seed CSV + ESPN scrape
-    python scripts/05_coaching_changes.py --csv-only    # seed CSV only
-    python scripts/05_coaching_changes.py --espn-only   # ESPN scrape only
-    python scripts/05_coaching_changes.py --csv data/my.csv  # custom CSV path
+    python scripts/05_load_coaching_changes.py               # seed CSV + ESPN scrape
+    python scripts/05_load_coaching_changes.py --csv-only    # seed CSV only
+    python scripts/05_load_coaching_changes.py --espn-only   # ESPN scrape only
+    python scripts/05_load_coaching_changes.py --csv data/my.csv  # custom CSV path
 """
 
 import argparse
 import csv
+import datetime
 import difflib
 import re
 import sys
@@ -32,7 +33,7 @@ DEFAULT_CSV = Path(__file__).parent.parent / "data" / "coaching_changes_seed.csv
 ESPN_URL = "https://www.espn.com/college-football/story/_/id/38866719/college-football-coaching-changes-tracker-2024-25"
 
 SLEEP_SEC = 2.0
-PAGE_LOAD_WAIT = 12
+PAGE_LOAD_WAIT = 12  # seconds; ESPN article requires JS rendering before content appears
 
 VALID_ROLES = {"HC", "OC", "DC", "ST"}
 
@@ -227,7 +228,7 @@ def _parse_espn_coach_line(text: str, team_id: int) -> dict | None:
         return None
 
     years = re.findall(r"\b(202[0-9])\b", text)
-    start_season = int(years[0]) if years else 2024
+    start_season = int(years[0]) if years else datetime.date.today().year
 
     is_departure = any(w in text_l for w in [" fired ", " resigned ", " left ", " departed ", " stepping down "])
     end_season = start_season if is_departure else None

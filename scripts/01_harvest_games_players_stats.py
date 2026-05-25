@@ -39,6 +39,10 @@ from utils.store import read_raw, RAW_DIR
 SEASONS_PRIMARY    = list(range(2021, 2026))
 SEASONS_HISTORICAL = list(range(2008, 2021))
 
+AWARD_TIER_ALL_AMERICAN = 3  # All-American, Outland, Rimington, Lombardi, Bednarik
+AWARD_TIER_FIRST_TEAM   = 2  # All-Conference first team
+AWARD_TIER_HONORABLE    = 1  # All-Conference second team / honorable mention
+
 POSITION_GROUP_MAP = {
     "QB":  "QB",
     "RB":  "RB",  "HB":  "RB",  "FB":  "RB",
@@ -89,9 +93,9 @@ def find_player_stats(stat_lookup: dict, first_name: str, last_name: str, team: 
             continue
         parts = name.split(" ", 1)
         if len(parts) == 2 and parts[1] == last_name.lower():
-            rf = first_name.lower()
-            sf = parts[0]
-            if rf.startswith(sf) or sf.startswith(rf):
+            query_first = first_name.lower()
+            stored_first = parts[0]
+            if query_first.startswith(stored_first) or stored_first.startswith(query_first):
                 return stats
     return {}
 
@@ -120,9 +124,9 @@ def find_player_ppa(ppa_lookup: dict, first_name: str, last_name: str, team: str
             continue
         parts = name.split(" ", 1)
         if len(parts) == 2 and parts[1] == last_name.lower():
-            rf = first_name.lower()
-            sf = parts[0]
-            if rf.startswith(sf) or sf.startswith(rf):
+            query_first = first_name.lower()
+            stored_first = parts[0]
+            if query_first.startswith(stored_first) or stored_first.startswith(query_first):
                 return val
     return 0.0
 
@@ -152,11 +156,11 @@ def build_awards_lookup(awards_raw: list) -> dict:
         if not name or not award:
             continue
         if any(x in award for x in ["all-american", "outland", "rimington", "lombardi", "bednarik"]):
-            tier = 3
+            tier = AWARD_TIER_ALL_AMERICAN
         elif "all-" in award and any(x in award for x in ["first", "1st"]):
-            tier = 2
+            tier = AWARD_TIER_FIRST_TEAM
         elif "all-" in award and any(x in award for x in ["second", "2nd", "honorable"]):
-            tier = 1
+            tier = AWARD_TIER_HONORABLE
         else:
             continue
         key = (name, team)
@@ -187,7 +191,7 @@ def _save_json(path: Path, data: list) -> None:
 # Teams
 # ---------------------------------------------------------------------------
 
-def save_teams(teams_raw: list) -> dict:
+def upsert_teams(teams_raw: list) -> dict:
     """Upsert teams into teams.json. Returns {school_lower: db_id}."""
     rows = []
     for t in teams_raw:
@@ -227,17 +231,17 @@ def save_teams(teams_raw: list) -> dict:
             r["id"] = max_id
         existing[school] = r
 
-    combined = list(existing.values())
-    _save_json(path, combined)
-    print(f"  Saved {len(rows)} teams ({len(combined)} total)")
-    return {(r["school"] or "").lower(): r["id"] for r in combined if r.get("school")}
+    all_teams = list(existing.values())
+    _save_json(path, all_teams)
+    print(f"  Saved {len(rows)} teams ({len(all_teams)} total)")
+    return {(r["school"] or "").lower(): r["id"] for r in all_teams if r.get("school")}
 
 
 # ---------------------------------------------------------------------------
 # Players + player_seasons
 # ---------------------------------------------------------------------------
 
-def save_players(rosters_by_team: dict, team_id_map: dict, season: int) -> tuple[dict, dict]:
+def upsert_players_and_seasons(rosters_by_team: dict, team_id_map: dict, season: int) -> tuple[dict, dict]:
     """Upsert players and player_seasons. Returns (cfb_api_id->db_id, player_id->ps_id)."""
     # Load existing
     players_path = RAW_DIR / "players.json"
@@ -557,12 +561,12 @@ def run_year(api_key: str, season: int) -> None:
 
     print("Teams...")
     teams_raw  = fetch_teams(api_key, season)
-    team_id_map = save_teams(teams_raw)
+    team_id_map = upsert_teams(teams_raw)
     team_names  = [t.get("school") for t in teams_raw if t.get("school")]
 
     print("Rosters -> players + player_seasons...")
     rosters_by_team = fetch_all_rosters(api_key, team_names, season)
-    player_id_map, ps_id_map = save_players(rosters_by_team, team_id_map, season)
+    player_id_map, ps_id_map = upsert_players_and_seasons(rosters_by_team, team_id_map, season)
 
     print("Games...")
     games_raw   = fetch_games(api_key, season)

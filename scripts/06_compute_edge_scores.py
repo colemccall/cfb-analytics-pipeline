@@ -93,6 +93,22 @@ def _coerce_int(val) -> int:
     return int(_coerce_float(val))
 
 
+def _parse_stat_value(d: dict, key: str) -> float | None:
+    """Parse a stat value from a game-stats dict, handling 'made-att' strings.
+
+    The CFB Data API sometimes encodes stats like completions as "25-38"
+    (completions-attempts). This function takes the value before the dash
+    so that integer stats parse correctly.
+    """
+    v = d.get(key)
+    if v is None:
+        return None
+    try:
+        return float(str(v).split("-")[0])
+    except (ValueError, TypeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # SP+ opponent quality map — built from API (cached) + local teams.json
 # ---------------------------------------------------------------------------
@@ -117,7 +133,7 @@ def build_opponent_sp_map(season: int, api_key: str) -> dict:
     return result
 
 
-def _season_means(sp_map: dict) -> tuple:
+def _season_means(sp_map: dict) -> tuple[float, float, float]:  # (mean_off_sp, mean_def_sp, mean_overall_sp)
     if not sp_map:
         return (25.0, 25.0, 0.0)
     offs  = [v["offense"] for v in sp_map.values() if isinstance(v, dict)]
@@ -186,15 +202,6 @@ def build_game_context_map(api_key: str, season: int) -> dict:
         if cid is not None:
             team_cfb_to_db[int(cid)] = int(r["id"])
 
-    def _int_stat(d, key):
-        v = d.get(key)
-        if v is None:
-            return None
-        try:
-            return float(str(v).split("-")[0])
-        except (ValueError, TypeError):
-            return None
-
     result = {}
     for cfb_game_id, teams_dict in raw.items():
         db_game_id = game_cfb_to_db.get(cfb_game_id)
@@ -209,8 +216,8 @@ def build_game_context_map(api_key: str, season: int) -> dict:
             if not def_db_tid:
                 continue
             opp_stats = teams_dict[off_cfb_tid]
-            pass_yds = _int_stat(opp_stats, "netPassingYards")
-            rush_yds = _int_stat(opp_stats, "rushingYards")
+            pass_yds = _parse_stat_value(opp_stats, "netPassingYards")
+            rush_yds = _parse_stat_value(opp_stats, "rushingYards")
             points   = opp_stats.get("_points")
             if points is not None:
                 try:
@@ -240,7 +247,7 @@ DEF_CONTEXT_WEIGHTS = {
     "EDGE": {"pass": 0.25, "rush": 0.45, "pts": 0.30},
     "LB":   {"pass": 0.30, "rush": 0.40, "pts": 0.30},
 }
-DEF_CONTEXT_BLEND = 0.35
+DEF_CONTEXT_BLEND = 0.35  # weight applied to team defensive context modifier (vs raw EDGE). See docs/AUDIT_FINDINGS.md §5.
 
 
 def def_context_modifier(pg: str, game_db_id: int, player_team_db_id: int,

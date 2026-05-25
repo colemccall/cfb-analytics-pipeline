@@ -209,7 +209,7 @@ def fuzzy_match_player(name: str, from_school: str | None,
 # Save to local JSON
 # ---------------------------------------------------------------------------
 
-def save_transfers(entries: list[dict], player_index: dict, team_index: dict) -> None:
+def upsert_transfers(entries: list[dict], player_index: dict, team_index: dict) -> None:
     rows = []
     unmatched = 0
     for e in entries:
@@ -251,12 +251,12 @@ def save_transfers(entries: list[dict], player_index: dict, team_index: dict) ->
     existing_map = {(r.get("player_id"), r.get("transfer_year"), r.get("from_team_id")): r
                     for r in existing_data}
     existing_map.update(new_rows)
-    combined = list(existing_map.values())
+    all_transfers = list(existing_map.values())
 
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(combined, f, separators=(",", ":"))
+        json.dump(all_transfers, f, separators=(",", ":"))
 
-    print(f"  Saved {len(new_rows)} transfer rows ({unmatched} unmatched). Total: {len(combined)}")
+    print(f"  Saved {len(new_rows)} transfer rows ({unmatched} unmatched). Total: {len(all_transfers)}")
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +284,7 @@ def main():
             entries = scrape_on3(year)
         print(f"  Got {len(entries)} portal entries")
         if entries:
-            save_transfers(entries, player_index, team_index)
+            upsert_transfers(entries, player_index, team_index)
 
     print("\nDone.")
 

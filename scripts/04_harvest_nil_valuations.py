@@ -191,9 +191,11 @@ def build_player_index() -> dict:
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT p.id, p.name, t.school
+            SELECT DISTINCT ON (p.id) p.id, p.name, t.school
             FROM players p
-            LEFT JOIN teams t ON t.id = p.team_id
+            JOIN player_seasons ps ON ps.player_id = p.id
+            JOIN teams t ON t.id = ps.team_id
+            ORDER BY p.id, ps.season DESC
         """)
         index: dict = {}
         for pid, name, school in cur.fetchall():

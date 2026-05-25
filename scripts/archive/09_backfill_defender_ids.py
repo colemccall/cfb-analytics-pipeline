@@ -1,3 +1,7 @@
+# ARCHIVED: One-time backfill. Already run. Do not re-run.
+# Original purpose: backfill defender_player_id on plays where attribution was NULL.
+# All plays have been backfilled. This script is kept for reference only.
+
 """Backfill defender_player_id on plays that have NULL attribution.
 
 Reads all sack/INT/TFL plays where defender_player_id IS NULL, re-parses
@@ -9,7 +13,7 @@ import re as _re
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from dotenv import load_dotenv
 load_dotenv()

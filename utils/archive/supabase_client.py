@@ -1,3 +1,7 @@
+# ARCHIVED: No active callers in local-arch scripts (01–12).
+# Scripts use utils/db.get_connection() (psycopg2) for all DB access.
+# Kept for reference only — do not import from active scripts.
+
 import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
