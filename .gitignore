@@ -20,6 +20,10 @@ output/
 # API response cache
 .cache/
 
+# Local data store (Supabase dump + computed outputs)
+data/raw/
+data/computed/
+
 # Data seeds you don't want in git
 data/*.csv
 
