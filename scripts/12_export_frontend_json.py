@@ -590,6 +590,35 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
 # Export: schedules.json
 # ---------------------------------------------------------------------------
 
+def _build_fcs_name_map() -> dict:
+    """Build {cfb_api_id: team_name} from cached API game responses for FCS lookup."""
+    cache_dir = Path(__file__).parent.parent / ".cache"
+    id_to_name: dict = {}
+    if not cache_dir.exists():
+        return id_to_name
+    for f in cache_dir.glob("*.json"):
+        try:
+            with open(f) as fp:
+                data = json.load(fp)
+            if not isinstance(data, list) or not data:
+                continue
+            first = data[0]
+            if not isinstance(first, dict) or "homeTeam" not in first:
+                continue
+            for g in data:
+                hid = g.get("homeId")
+                aid = g.get("awayId")
+                ht  = g.get("homeTeam")
+                at  = g.get("awayTeam")
+                if hid and ht:
+                    id_to_name[int(hid)] = ht
+                if aid and at:
+                    id_to_name[int(aid)] = at
+        except Exception:
+            continue
+    return id_to_name
+
+
 def export_schedules(T: dict, output_dir: Path, season: int) -> None:
     games = T["games"]
     teams = T["teams"]
@@ -603,6 +632,13 @@ def export_schedules(T: dict, output_dir: Path, season: int) -> None:
         return
 
     tm_map = dict(zip(teams["id"], teams["school"])) if not teams.empty else {}
+    # Supplement with FCS team names from API cache
+    fcs_map = _build_fcs_name_map()
+    def _team_name(tid):
+        if tid is None:
+            return None
+        return tm_map.get(tid) or fcs_map.get(tid) or f"FCS opponent"
+
     schedules: dict = {}
 
     for _, g in games_s.iterrows():
@@ -612,24 +648,35 @@ def export_schedules(T: dict, output_dir: Path, season: int) -> None:
         away_sc   = _i(g.get("away_score"))
         game_date = str(g["game_date"]) if g.get("game_date") else None
 
+        # For result calc: FCS opponent scores may be null — treat as 0 for W/L but
+        # still store null in opp_score so UI can display "—" rather than "0".
         for is_home in (True, False):
-            tid        = str(home_id if is_home else away_id)
-            opponent   = tm_map.get(away_id if is_home else home_id)
+            team_id_val = home_id if is_home else away_id
+            if team_id_val is None:
+                continue  # skip games where this side has no known team_id
+            tid        = str(team_id_val)
+            opp_id     = away_id if is_home else home_id
+            opponent   = _team_name(opp_id)
             team_score = home_sc if is_home else away_sc
             opp_score  = away_sc if is_home else home_sc
-            result     = ("W" if team_score > opp_score else ("L" if team_score < opp_score else "T")) \
-                         if (team_score is not None and opp_score is not None) else None
+            # Result: if opp_score is null but team_score exists, treat opp as 0 (FCS game)
+            if team_score is not None:
+                opp_for_result = opp_score if opp_score is not None else 0
+                result = ("W" if team_score > opp_for_result
+                          else ("L" if team_score < opp_for_result else "T"))
+            else:
+                result = None
             schedules.setdefault(tid, []).append({
-                "game_id":     _i(g.get("id")),
-                "week":        _i(g.get("week")),
-                "game_date":   game_date,
-                "season_type": g.get("season_type"),
-                "is_home":     is_home,
+                "game_id":      _i(g.get("id")),
+                "week":         _i(g.get("week")),
+                "game_date":    game_date,
+                "season_type":  g.get("season_type"),
+                "is_home":      is_home,
                 "neutral_site": bool(g.get("neutral_site")),
-                "opponent":    opponent,
-                "team_score":  team_score,
-                "opp_score":   opp_score,
-                "result":      result,
+                "opponent":     opponent,
+                "team_score":   team_score,
+                "opp_score":    opp_score,
+                "result":       result,
                 "home_team_id": home_id,
                 "away_team_id": away_id,
             })
