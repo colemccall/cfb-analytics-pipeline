@@ -22,7 +22,7 @@ import pandas as pd
 
 _ROOT     = Path(__file__).parent.parent
 RAW_DIR   = _ROOT / "data" / "raw"
-COMP_DIR  = _ROOT / "data" / "computed"
+COMPUTED_DIR  = _ROOT / "data" / "computed"
 
 
 class _Encoder(json.JSONEncoder):
@@ -52,14 +52,14 @@ def read_raw(table: str) -> pd.DataFrame:
 
 def read_computed(table: str) -> pd.DataFrame:
     """Load data/computed/{table}.json → DataFrame. Empty DataFrame if file missing."""
-    rows = _load_json(COMP_DIR / f"{table}.json")
+    rows = _load_json(COMPUTED_DIR / f"{table}.json")
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def write_computed(table: str, df: pd.DataFrame) -> None:
     """Write DataFrame → data/computed/{table}.json."""
-    COMP_DIR.mkdir(parents=True, exist_ok=True)
-    path = COMP_DIR / f"{table}.json"
+    COMPUTED_DIR.mkdir(parents=True, exist_ok=True)
+    path = COMPUTED_DIR / f"{table}.json"
     rows = df.where(pd.notna(df), other=None).to_dict(orient="records")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rows, f, separators=(",", ":"), cls=_Encoder)

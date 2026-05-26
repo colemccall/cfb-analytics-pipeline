@@ -25,7 +25,6 @@ def _get_working_url() -> str:
             conn = psycopg2.connect(url, connect_timeout=5)
             conn.close()
             _working_url = url
-            print(f"  [db] Connected via {'pooler' if 'pooler' in url else 'direct'}")
             return _working_url
         except Exception:
             continue

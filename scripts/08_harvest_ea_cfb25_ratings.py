@@ -4,14 +4,15 @@ Strategy: paginate TeamCrafters /players/CFB25 to bulk-collect all ~11k players,
 then fuzzy-match to our player DB by name + team. No per-player searches needed.
 
 Usage:
-    python scripts/09_scrape_ea_cfb25.py
-    python scripts/09_scrape_ea_cfb25.py --limit 500   # dev/test run
-    python scripts/09_scrape_ea_cfb25.py --no-headless  # visible browser for debugging
+    python scripts/08_harvest_ea_cfb25_ratings.py
+    python scripts/08_harvest_ea_cfb25_ratings.py --limit 500   # dev/test run
+    python scripts/08_harvest_ea_cfb25_ratings.py --no-headless  # visible browser for debugging
 """
 
 import argparse
 import difflib
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -174,7 +175,6 @@ def _parse_page(soup, page: int) -> tuple[list[dict], bool]:
     page_links = soup.select("a[href*='page=']")
     for link in page_links:
         href = link.get("href", "")
-        import re
         m = re.search(r"page=(\d+)", href)
         if m and int(m.group(1)) > page:
             has_next = True
@@ -266,9 +266,11 @@ def build_player_index() -> dict:
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT p.id, p.name, t.school
+            SELECT DISTINCT ON (p.id) p.id, p.name, t.school
             FROM players p
-            LEFT JOIN teams t ON t.id = p.team_id
+            JOIN player_seasons ps ON ps.player_id = p.id
+            JOIN teams t ON t.id = ps.team_id
+            ORDER BY p.id, ps.season DESC
         """)
         index: dict = {}
         for pid, name, school in cur.fetchall():

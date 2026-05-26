@@ -1,3 +1,7 @@
+# ARCHIVED: One-time migration utility. Already run. Do not re-run.
+# Original purpose: dump every Supabase table to local JSON for local-arch migration.
+# All data now lives in data/raw/*.json. This script is kept for reference only.
+
 """Dump every Supabase table to local JSON.
 
 Writes one file per table to data/raw/{table}.json.
@@ -19,12 +23,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 load_dotenv()
 
 from utils.db import get_connection
 
-DEFAULT_OUTPUT = Path(__file__).parent.parent / "data" / "raw"
+DEFAULT_OUTPUT = Path(__file__).parent.parent.parent / "data" / "raw"
 
 ALL_TABLES = [
     "teams",

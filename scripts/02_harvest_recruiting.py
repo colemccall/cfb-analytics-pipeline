@@ -163,7 +163,7 @@ def build_player_name_index() -> dict:
         if not pid or not name:
             continue
         key = name.lower()
-        for school in ps_map.get(int(pid), {""}) :
+        for school in ps_map.get(int(pid), {""}):
             entry = (int(pid), school)
             lst = index.setdefault(key, [])
             if entry not in lst:
@@ -216,7 +216,7 @@ def fuzzy_match_player(name: str, committed_team: str | None,
 # Save to local JSON
 # ---------------------------------------------------------------------------
 
-def save_recruiting(recruits: list[dict], player_index: dict, team_index: dict) -> None:
+def upsert_recruiting(recruits: list[dict], player_index: dict, team_index: dict) -> None:
     rows = []
     unmatched = 0
     for r in recruits:
@@ -249,7 +249,7 @@ def save_recruiting(recruits: list[dict], player_index: dict, team_index: dict) 
             ex_rank  = existing.get("national_rank")
             if cur_rank is not None and (ex_rank is None or cur_rank < ex_rank):
                 seen[key] = r
-    new_rows = {k: v for k, v in seen.items()}
+    new_rows = dict(seen)
 
     # Load existing and merge
     path = RAW_DIR / "recruiting.json"
@@ -261,12 +261,12 @@ def save_recruiting(recruits: list[dict], player_index: dict, team_index: dict) 
     # Build existing index, replace for matching (player_id, recruit_year)
     existing_map = {(r.get("player_id"), r.get("recruit_year")): r for r in existing_data}
     existing_map.update(new_rows)
-    combined = list(existing_map.values())
+    all_recruits = list(existing_map.values())
 
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(combined, f, separators=(",", ":"))
+        json.dump(all_recruits, f, separators=(",", ":"))
 
-    print(f"  Saved {len(new_rows)} recruiting rows ({unmatched} unmatched). Total: {len(combined)}")
+    print(f"  Saved {len(new_rows)} recruiting rows ({unmatched} unmatched). Total: {len(all_recruits)}")
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +294,7 @@ def main():
             recruits = scrape_247_class(year)
         print(f"  Got {len(recruits)} recruits")
         if recruits:
-            save_recruiting(recruits, player_index, team_index)
+            upsert_recruiting(recruits, player_index, team_index)
 
     print("\nDone.")
 

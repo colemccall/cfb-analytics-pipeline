@@ -26,6 +26,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -133,7 +134,8 @@ def roster_to_ovr(mean_top: float) -> float:
     return _interp_anchors(mean_top, ROSTER_OVR_ANCHORS)
 
 
-# Blend: SP+ is primary; roster talent adds the "eye test" feel.
+# Headline OVR blend: SP+ drives 75% (schedule-adjusted), roster talent 25%.
+# Sum must equal 1.0. Increase W_ROSTER_BLEND to weight raw talent more heavily.
 W_SP_BLEND = 0.75
 W_ROSTER_BLEND = 0.25
 
@@ -354,7 +356,6 @@ def store_team_season_stats(season: int, api_key: str, teams: list) -> None:
     if not rows:
         return
 
-    import pandas as pd
     new_df = pd.DataFrame(rows)
     existing = read_computed("team_season_stats")
     if not existing.empty:
@@ -530,7 +531,7 @@ def compute_team_splits(
     roster_by_pos: dict,
     raw: dict | None,
     sp_means: tuple,
-    rec_scaled: float | None,
+    recruiting_scaledcaled: float | None,
 ) -> dict:
     """SP+-anchored overall/offense/defense (0-99), blended with roster talent.
 
@@ -547,7 +548,7 @@ def compute_team_splits(
     if sp is not None:
         sp_ovr = sp_overall_to_ovr(sp["overall"])
         off    = sp_offense_to_ovr(sp["offense"])
-        deff   = sp_defense_to_ovr(sp["defense"])
+        def_rating   = sp_defense_to_ovr(sp["defense"])
         if roster_ovr is not None:
             overall = sp_ovr * W_SP_BLEND + roster_ovr * W_ROSTER_BLEND
         else:
@@ -555,17 +556,17 @@ def compute_team_splits(
     elif roster_ovr is not None:
         # No SP+ (e.g. FCS / unmatched) — fall back to roster talent only.
         overall = roster_ovr
-        off = deff = roster_ovr
+        off = def_rating = roster_ovr
     else:
-        overall = off = deff = 50.0
+        overall = off = def_rating = 50.0
 
     # --- Detail splits: position-weighted roster quality (drives the bars) ---
     ros = compute_roster_splits(roster_by_pos)
     # Blend roster splits toward the SP+ offense/defense headline so bars track OVR.
     pass_off = ros["pass_off"] * 0.6 + off  * 0.4
     run_off  = ros["run_off"]  * 0.6 + off  * 0.4
-    pass_def = ros["pass_def"] * 0.6 + deff * 0.4
-    run_def  = ros["run_def"]  * 0.6 + deff * 0.4
+    pass_def = ros["pass_def"] * 0.6 + def_rating * 0.4
+    run_def  = ros["run_def"]  * 0.6 + def_rating * 0.4
     special  = ros["special"]
 
     def r2(v): return round(float(v), 2)
@@ -578,7 +579,7 @@ def compute_team_splits(
         "special_teams":  r2(_clip(special)),
         "overall_rating": r2(_clip(overall)),
         "offense_rating": r2(_clip(off)),
-        "defense_rating": r2(_clip(deff)),
+        "defense_rating": r2(_clip(def_rating)),
         "composite":      r2(overall),
     }
 
@@ -628,9 +629,9 @@ def run_season(season: int, api_key: str) -> None:
         sp      = sp_map.get(team_id)
         by_pos  = dict(roster_map.get(team_id, {}))
         raw     = raw_map.get(team_id)
-        rec_s   = recruiting_map.get(team_id)
+        recruiting_scaled   = recruiting_map.get(team_id)
 
-        splits = compute_team_splits(team_id, sp, by_pos, raw, sp_means, rec_s)
+        splits = compute_team_splits(team_id, sp, by_pos, raw, sp_means, recruiting_scaled)
 
         sub_ratings = {
             "pass_off":           splits["pass_off"],
@@ -641,7 +642,7 @@ def run_season(season: int, api_key: str) -> None:
             "composite":          splits["composite"],
             "sp_offense_scaled":  round(sp_scaled(sp["offense"] if sp else None, sp_means[1]), 2),
             "sp_defense_scaled":  round(sp_scaled(sp["defense"] if sp else None, sp_means[2]), 2),
-            "recruiting_scaled":  round(rec_s, 2) if rec_s is not None else None,
+            "recruiting_scaled":  round(recruiting_scaled, 2) if recruiting_scaled is not None else None,
         }
 
         rows.append({
@@ -653,8 +654,7 @@ def run_season(season: int, api_key: str) -> None:
             "sp_overall":         round(sp["overall"], 2)  if sp else None,
             "sp_offense":         round(sp["offense"], 2)  if sp else None,
             "sp_defense":         round(sp["defense"], 2)  if sp else None,
-            "recruiting_score":   round(rec_s, 2) if rec_s is not None else None,
-            "avg_starter_rating": None,  # deprecated in v2; use sub_ratings
+            "recruiting_score":   round(recruiting_scaled, 2) if recruiting_scaled is not None else None,
             "starter_count":      sum(len(v) for v in by_pos.values()),
             "coaching_change":    team_id in coaching_change_teams,
             "sub_ratings":        json.dumps(sub_ratings),
@@ -666,7 +666,6 @@ def run_season(season: int, api_key: str) -> None:
         seen[(r["team_id"], r["season"])] = r
     rows = list(seen.values())
 
-    import pandas as pd
     new_df = pd.DataFrame(rows)
     existing = read_computed("team_ratings")
     if not existing.empty:

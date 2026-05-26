@@ -13,15 +13,16 @@ Formula:
 Outputs: upserts to ratings table with engine='engine_b'.
 
 Usage:
-    python scripts/11_compute_engine_b.py
-    python scripts/11_compute_engine_b.py --season 2025
-    python scripts/11_compute_engine_b.py --season 2024 --season 2025
+    python scripts/11_compute_engine_b_ratings.py
+    python scripts/11_compute_engine_b_ratings.py --season 2025
+    python scripts/11_compute_engine_b_ratings.py --season 2024 --season 2025
 """
 
 import argparse
 import json
 import math
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -121,7 +122,6 @@ def fetch_player_seasons(season: int, conn) -> list[dict]:
 
 def compute_nil_position_medians(rows: list[dict]) -> dict[str, float]:
     """Compute NIL valuation median per position group for ratio scaling."""
-    from collections import defaultdict
     vals_by_pos: dict[str, list[float]] = defaultdict(list)
     for r in rows:
         v = r.get("nil_valuation")

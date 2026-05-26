@@ -19,10 +19,10 @@ Rating architecture:
     players land 90-96 and average starters land 62-70.
 
 Usage:
-    python scripts/06_train_ratings.py              # 2025
-    python scripts/06_train_ratings.py --season 2024
-    python scripts/06_train_ratings.py --all-seasons
-    python scripts/06_train_ratings.py --position QB --season 2024
+    python scripts/07_compute_player_ratings.py              # 2025
+    python scripts/07_compute_player_ratings.py --season 2024
+    python scripts/07_compute_player_ratings.py --all-seasons
+    python scripts/07_compute_player_ratings.py --position QB --season 2024
 """
 
 import argparse
@@ -66,7 +66,7 @@ PLAYTIME_TIERS = {
     "P":    {"stat": "puntingNO",    "starter":  10, "role":  5,  "reserve": 1},
 }
 
-def classify_tier(pg: str, stats: dict, games_played: int = 1) -> str:
+def classify_playtime_tier(pg: str, stats: dict, games_played: int = 1) -> str:
     """Classify player into tier based on stat volume."""
     cfg = PLAYTIME_TIERS.get(pg)
     if not cfg or cfg["stat"] is None:
@@ -90,16 +90,13 @@ def classify_tier(pg: str, stats: dict, games_played: int = 1) -> str:
 
 # Recruiting fallback: how much the overall rating shifts from position average
 # based on recruiting stars when a player has NO usable stats.
-STARS_FALLBACK = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
+STARS_OVR_DELTA = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
 
 # Positions that can have EDGE scores (computed in script 08).
 # Offensive: QB, RB, WR, TE (play-level EPA)
 # Defensive: EDGE, DL, LB, CB, S (per-game stat composite × opponent SP+)
 # OL, K, P: never have EDGE
 EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "EDGE", "DL", "LB", "CB", "S", "DB"}
-
-# No hard ceiling — K/P rated by stat composite, scale_to_range handles distribution
-POSITION_CEILING: dict[str, int] = {}
 
 # All seasons used for cross-season normalization
 ALL_SEASONS = list(range(2008, 2026))
@@ -224,7 +221,7 @@ def compute_pre2016_classic_ovr(ints: float, rec_ovr: float, pg: str) -> float:
     return float(np.clip(ovr, 35.0, 99.0))
 
 
-def get_era(season: int) -> str:
+def get_rating_era(season: int) -> str:
     return "modern" if season >= 2016 else "pre2016"
 
 
@@ -243,7 +240,7 @@ def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
     return float(np.clip(np.interp(float(edge_score), xs, ys), 30.0, 99.0))
 
 
-def _f(stats, key):
+def _stat_float(stats, key):
     v = stats.get(key)
     try:
         return float(v) if v is not None else 0.0
@@ -251,7 +248,22 @@ def _f(stats, key):
         return 0.0
 
 
+def _si(v, default=0):
+    try:
+        return int(v) if v is not None and v == v else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _sf(v, default=0.0):
+    try:
+        return float(v) if v is not None and v == v else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _composite_to_100(score) -> float:
+    # 247Sports composite scores range 0.7–1.0; map to 0–100 for feature normalization.
     if not score:
         return 40.0
     return max(0.0, min(100.0, (float(score) - 0.7) / 0.3 * 100))
@@ -261,14 +273,14 @@ def _composite_to_100(score) -> float:
 # Supplementary stat features (secondary role for EDGE positions)
 # ---------------------------------------------------------------------------
 
-def extract_features(stats: dict, pg: str) -> dict:
+def compute_stat_features(stats: dict, pg: str) -> dict:
     """Return named production metrics for one player."""
     if pg == "QB":
-        att  = max(_f(stats, "passingATT"), 1)
-        comp = _f(stats, "passingCOMPLETIONS")
-        yds  = _f(stats, "passingYDS")
-        td   = _f(stats, "passingTD")
-        ints = _f(stats, "passingINT")
+        att  = max(_stat_float(stats, "passingATT"), 1)
+        comp = _stat_float(stats, "passingCOMPLETIONS")
+        yds  = _stat_float(stats, "passingYDS")
+        td   = _stat_float(stats, "passingTD")
+        ints = _stat_float(stats, "passingINT")
         return {
             "comp_pct":      comp / att,
             "yards_per_att": yds  / att,
@@ -277,9 +289,9 @@ def extract_features(stats: dict, pg: str) -> dict:
         }
 
     if pg == "RB":
-        car = max(_f(stats, "rushingCAR"), 1)
-        yds = _f(stats, "rushingYDS")
-        rec = _f(stats, "receivingREC")
+        car = max(_stat_float(stats, "rushingCAR"), 1)
+        yds = _stat_float(stats, "rushingYDS")
+        rec = _stat_float(stats, "receivingREC")
         return {
             "yards_per_carry":  yds / car,
             "yards_total":      yds,
@@ -288,9 +300,9 @@ def extract_features(stats: dict, pg: str) -> dict:
         }
 
     if pg in ("WR", "TE"):
-        rec = max(_f(stats, "receivingREC"), 1)
-        yds = _f(stats, "receivingYDS")
-        tds = _f(stats, "receivingTD")
+        rec = max(_stat_float(stats, "receivingREC"), 1)
+        yds = _stat_float(stats, "receivingYDS")
+        tds = _stat_float(stats, "receivingTD")
         return {
             "yards_per_rec":   yds / rec,
             "yards_total":     yds,
@@ -301,17 +313,17 @@ def extract_features(stats: dict, pg: str) -> dict:
 
     if pg == "OL":
         return {
-            "team_rush_ypa":      _f(stats, "team_rush_ypa"),
-            "team_sack_rate_inv": 1.0 - min(_f(stats, "team_sack_rate"), 1.0),
-            "award_tier":         _f(stats, "award_tier"),
+            "team_rush_ypa":      _stat_float(stats, "team_rush_ypa"),
+            "team_sack_rate_inv": 1.0 - min(_stat_float(stats, "team_sack_rate"), 1.0),
+            "award_tier":         _stat_float(stats, "award_tier"),
             "experience":         2.0,   # placeholder; overwritten below from players.year
         }
 
     if pg == "EDGE":
-        tot   = max(_f(stats, "defensiveTOT"), 1)
-        sacks = _f(stats, "defensiveSACKS")
-        tfl   = _f(stats, "defensiveTFL")
-        hur   = _f(stats, "defensiveQB HUR")
+        tot   = max(_stat_float(stats, "defensiveTOT"), 1)
+        sacks = _stat_float(stats, "defensiveSACKS")
+        tfl   = _stat_float(stats, "defensiveTFL")
+        hur   = _stat_float(stats, "defensiveQB HUR")
         return {
             "pass_rush_score":  sacks * 5.0 + hur * 1.5 + tfl * 2.0,   # sacks + pressure dominant for EDGE
             "disruption_rate":  (sacks + tfl) / tot,                     # impact per play
@@ -320,10 +332,10 @@ def extract_features(stats: dict, pg: str) -> dict:
         }
 
     if pg == "DL":
-        tot   = max(_f(stats, "defensiveTOT"), 1)
-        sacks = _f(stats, "defensiveSACKS")
-        tfl   = _f(stats, "defensiveTFL")
-        hur   = _f(stats, "defensiveQB HUR")
+        tot   = max(_stat_float(stats, "defensiveTOT"), 1)
+        sacks = _stat_float(stats, "defensiveSACKS")
+        tfl   = _stat_float(stats, "defensiveTFL")
+        hur   = _stat_float(stats, "defensiveQB HUR")
         return {
             "pass_rush_score":  sacks * 5.0 + hur * 1.5 + tfl * 1.0,   # sacks + pressure
             "run_stop_score":   tfl * 2.5 + (tot - sacks) * 0.4,        # run stuffs + tackle presence
@@ -332,11 +344,11 @@ def extract_features(stats: dict, pg: str) -> dict:
         }
 
     if pg == "LB":
-        tot    = max(_f(stats, "defensiveTOT"), 1)
-        sacks  = _f(stats, "defensiveSACKS")
-        tfl    = _f(stats, "defensiveTFL")
-        ints   = _f(stats, "interceptionsINT")
-        pbu    = _f(stats, "defensivePD")
+        tot    = max(_stat_float(stats, "defensiveTOT"), 1)
+        sacks  = _stat_float(stats, "defensiveSACKS")
+        tfl    = _stat_float(stats, "defensiveTFL")
+        ints   = _stat_float(stats, "interceptionsINT")
+        pbu    = _stat_float(stats, "defensivePD")
         return {
             "tackling_score":   tot * 0.5 + tfl * 2.0,                  # pursuit + run stop
             "pass_rush_score":  sacks * 4.0 + tfl * 1.0,                # blitz / pressure
@@ -346,11 +358,11 @@ def extract_features(stats: dict, pg: str) -> dict:
         }
 
     if pg == "CB":
-        tot   = max(_f(stats, "defensiveTOT"), 1)
-        sacks = _f(stats, "defensiveSACKS")
-        tfl   = _f(stats, "defensiveTFL")
-        ints  = _f(stats, "interceptionsINT")
-        pbu   = _f(stats, "defensivePD")
+        tot   = max(_stat_float(stats, "defensiveTOT"), 1)
+        sacks = _stat_float(stats, "defensiveSACKS")
+        tfl   = _stat_float(stats, "defensiveTFL")
+        ints  = _stat_float(stats, "interceptionsINT")
+        pbu   = _stat_float(stats, "defensivePD")
         return {
             "coverage_score":   ints * 4.0 + pbu * 2.0,                 # CB: ball skills dominant
             "tackling_score":   tot * 0.3 + tfl * 1.0,                  # run support (secondary)
@@ -360,11 +372,11 @@ def extract_features(stats: dict, pg: str) -> dict:
         }
 
     if pg == "S":
-        tot   = max(_f(stats, "defensiveTOT"), 1)
-        sacks = _f(stats, "defensiveSACKS")
-        tfl   = _f(stats, "defensiveTFL")
-        ints  = _f(stats, "interceptionsINT")
-        pbu   = _f(stats, "defensivePD")
+        tot   = max(_stat_float(stats, "defensiveTOT"), 1)
+        sacks = _stat_float(stats, "defensiveSACKS")
+        tfl   = _stat_float(stats, "defensiveTFL")
+        ints  = _stat_float(stats, "interceptionsINT")
+        pbu   = _stat_float(stats, "defensivePD")
         return {
             "coverage_score":   ints * 3.5 + pbu * 1.5,                 # S: coverage (less dominant than CB)
             "tackling_score":   tot * 0.6 + tfl * 2.0,                  # S: tackle more than CB
@@ -376,11 +388,11 @@ def extract_features(stats: dict, pg: str) -> dict:
     if pg == "DB":
         # Fallback: legacy "DB" generic should never appear post-v2 schema
         # but keep it for robustness
-        tot   = max(_f(stats, "defensiveTOT"), 1)
-        sacks = _f(stats, "defensiveSACKS")
-        tfl   = _f(stats, "defensiveTFL")
-        ints  = _f(stats, "interceptionsINT")
-        pbu   = _f(stats, "defensivePD")
+        tot   = max(_stat_float(stats, "defensiveTOT"), 1)
+        sacks = _stat_float(stats, "defensiveSACKS")
+        tfl   = _stat_float(stats, "defensiveTFL")
+        ints  = _stat_float(stats, "interceptionsINT")
+        pbu   = _stat_float(stats, "defensivePD")
         return {
             "coverage_score":   ints * 3.0 + pbu * 1.5,
             "tackling_score":   tot * 0.5 + tfl * 2.0,
@@ -390,21 +402,21 @@ def extract_features(stats: dict, pg: str) -> dict:
         }
 
     if pg == "K":
-        fga = max(_f(stats, "kickingFGA"), 1)
-        xpa = max(_f(stats, "kickingXPA"), 1)
+        fga = max(_stat_float(stats, "kickingFGA"), 1)
+        xpa = max(_stat_float(stats, "kickingXPA"), 1)
         return {
-            "fg_pct":       _f(stats, "kickingFGM") / fga,
-            "fg_long":      _f(stats, "kickingLNG"),
-            "xp_pct":       _f(stats, "kickingXPM") / xpa,
-            "volume_score": _f(stats, "kickingFGM"),
+            "fg_pct":       _stat_float(stats, "kickingFGM") / fga,
+            "fg_long":      _stat_float(stats, "kickingLNG"),
+            "xp_pct":       _stat_float(stats, "kickingXPM") / xpa,
+            "volume_score": _stat_float(stats, "kickingFGM"),
         }
 
     if pg == "P":
-        n = max(_f(stats, "puntingNO"), 1)
+        n = max(_stat_float(stats, "puntingNO"), 1)
         return {
-            "avg_yards":     _f(stats, "puntingYDS") / n,
-            "inside_20_pct": _f(stats, "puntingIn 20") / n,
-            "volume_score":  _f(stats, "puntingNO"),
+            "avg_yards":     _stat_float(stats, "puntingYDS") / n,
+            "inside_20_pct": _stat_float(stats, "puntingIn 20") / n,
+            "volume_score":  _stat_float(stats, "puntingNO"),
         }
 
     return {}
@@ -513,7 +525,7 @@ WEIGHTS = {
 }
 
 # When EDGE is missing for players with EDGE in their formula, fall back to stat-only
-WEIGHTS_NO_EDGE = {
+STAT_ONLY_WEIGHTS = {
     "QB": {
         "yards_per_att":   0.35,
         "td_int_ratio":    0.30,
@@ -586,6 +598,10 @@ WEIGHTS_NO_EDGE = {
         "recruit_composite": 0.10,
     },
 }
+
+# Percentile → OVR targets for the no-EDGE stat fallback in compute_edge_ratings.
+# Cap at 78: without opponent-adjusted EPA we can't confirm elite production.
+STAT_FALLBACK_TARGETS = [30.0, 38.0, 55.0, 64.0, 70.0, 76.0, 78.0]
 
 
 # ---------------------------------------------------------------------------
@@ -686,22 +702,10 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         year     = row.get("year")
         season   = row["season"]
         raw_stats = row.get("data") or {}
-        def _si(v, default=0):
-            try:
-                return int(v) if v is not None and v == v else default
-            except (TypeError, ValueError):
-                return default
-
-        def _sf(v, default=0.0):
-            try:
-                return float(v) if v is not None and v == v else default
-            except (TypeError, ValueError):
-                return default
-
         stars    = _si(row.get("stars"))
         cs       = row.get("composite_score")
 
-        feats = extract_features(raw_stats, pg)
+        feats = compute_stat_features(raw_stats, pg)
         if pg == "OL":
             feats["experience"] = _sf(year, 2.0)
         feats["recruit_composite"] = _composite_to_100(cs)
@@ -759,14 +763,14 @@ def is_starter(row: pd.Series, pg: str) -> bool:
         # No INTs but still a pre-2016 defender — use recruiting to classify
         rec = float(row.get("recruit_composite") or 40)
         return rec >= 60  # 3-star+ treat as starter for CLASSIC rating
-    return classify_tier(pg, row.to_dict()) == "starter"
+    return classify_playtime_tier(pg, row.to_dict()) == "starter"
 
 
 def get_tier(row: pd.Series, pg: str) -> str:
     """Classify player into tier: starter, role, reserve, or bench."""
     if _has_valid_edge(row):
         return "starter"
-    return classify_tier(pg, row.to_dict(), games_played=row.get("games_played", 1))
+    return classify_playtime_tier(pg, row.to_dict(), games_played=row.get("games_played", 1))
 
 
 def has_opp_score(row: pd.Series, pg: str = "") -> bool:
@@ -906,7 +910,7 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
 
     For players with a valid edge_score: OVR = edge_to_ovr(edge_score, pg).
     For players without EDGE data (pre-2016 defense, injured, etc.): use the
-    stat-only composite (WEIGHTS_NO_EDGE) scaled to [30–90] so historical
+    stat-only composite (STAT_ONLY_WEIGHTS) scaled to [30–90] so historical
     defensive players get meaningful variance instead of a flat 50.0 fallback.
 
     Returns:
@@ -915,7 +919,7 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
     """
     # Pre-compute stat-only composites for the whole df (used for no-EDGE fallback).
     # Features are already extracted columns in the dataframe (via _load_seasons → extract_features).
-    no_edge_weights = WEIGHTS_NO_EDGE.get(pg, {})
+    no_edge_weights = STAT_ONLY_WEIGHTS.get(pg, {})
     no_edge_features = list(no_edge_weights.keys())
     no_edge_w_arr = np.array([no_edge_weights[c] for c in no_edge_features]) if no_edge_features else np.array([])
 
@@ -931,10 +935,6 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
     valid_stat = [s for s in all_stat_scores if s is not None]
     if valid_stat:
         stat_pcts = np.percentile(valid_stat, [0, 10, 50, 75, 90, 99, 100])
-        # Cap at 78: without EDGE (opponent-adjusted EPA) we can't confirm elite
-        # production. Volume stats alone compress near the top — a 78 ceiling
-        # ensures pre-EDGE-era players are rated meaningfully but don't crowd 90+.
-        stat_targets = [30.0, 38.0, 55.0, 64.0, 70.0, 76.0, 78.0]
 
     final_scores   = []
     final_contribs = []
@@ -966,7 +966,7 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
             }
         elif all_stat_scores[i] is not None and valid_stat:
             # Stat-based fallback: scale within the no-EDGE pool, cap at 78
-            ovr = float(np.clip(np.interp(all_stat_scores[i], stat_pcts, stat_targets), 30.0, 78.0))
+            ovr = float(np.clip(np.interp(all_stat_scores[i], stat_pcts, STAT_FALLBACK_TARGETS), 30.0, 78.0))
             contrib = {"recruit_composite": round(float(row.get("recruit_composite") or 50.0), 2),
                        "stat_fallback": round(all_stat_scores[i], 4)}
         else:
@@ -1008,7 +1008,7 @@ def compute_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
 # so a G5 conference label would double-penalize what the model already handles.
 # For stat-only positions (WR/TE/OL/DL/LB/DB), raw counting stats don't carry
 # opponent context, so a modest discount still applies.
-def scale_to_range(scores: np.ndarray, low=30, high=99, pg: str = "") -> np.ndarray:
+def scale_to_range(scores: np.ndarray, low=30, high=99) -> np.ndarray:
     """Map composite scores (0-1) to rating range via piecewise linear interpolation.
 
     Uses the actual distribution of the all-season pool to compute percentile anchors,
@@ -1113,7 +1113,7 @@ def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame, pg: str = "") -
 
 
 def fallback_rating(stars: int, position_avg: float = 65.0) -> float:
-    offset = STARS_FALLBACK.get(min(stars, 5), -33)
+    offset = STARS_OVR_DELTA.get(min(stars, 5), -33)
     return max(30.0, min(99.0, round(position_avg + offset, 2)))
 
 
@@ -1263,7 +1263,7 @@ def rate_position(season: int, pg: str) -> list[dict]:
             # --- Stat composite + scale_to_range for OL/K/P ---
             raw_scores, contribs = compute_ratings(all_starter_df, pg)
             discounted = apply_conference_discount(raw_scores, all_starter_df, pg=pg)
-            scaled = scale_to_range(discounted, pg=pg)
+            scaled = scale_to_range(discounted)
 
         for i, rkey in enumerate(all_starter_df.index):
             if scaled[i] > 0:   # 0.0 = no EDGE data → let fallback handle it
@@ -1347,7 +1347,6 @@ def rate_position(season: int, pg: str) -> list[dict]:
     breakout_arr = compute_breakout(aligned_df, season_rats)
     breakout_map = dict(zip(season_pids, breakout_arr))
 
-    ceiling = POSITION_CEILING.get(pg)
     starters_this_season = season_df.apply(lambda r: is_starter(r, pg), axis=1).sum()
     edge_this_season = (
         season_df["edge_score"].notna().sum()
@@ -1362,8 +1361,6 @@ def rate_position(season: int, pg: str) -> list[dict]:
         ovr    = float(ratings_map.get(rkey, 50.0))
         tier   = get_tier(row, pg)
         tiers.append(ovr)  # for multi-tier treatment
-        if ceiling:
-            ovr = min(ovr, ceiling)
         rows.append({
             "player_season_id":     ps_id,
             "season":               int(season),
