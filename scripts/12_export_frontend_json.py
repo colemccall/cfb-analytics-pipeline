@@ -8,7 +8,7 @@ Exports:
   teams.json                — all teams with avg rating, player count
   team_ratings.json         — team OVR + sub-score splits
   ratings_by_position.json  — top 50 per position group
-  similar_players.json      — precomputed cosine similarity (OVR >= 55)
+  similar_players_{season}.json — precomputed z-score similarity (OVR >= 55, per season)
   rosters.json              — all team rosters by season  {team_id: {season: [...]}}
   schedules.json            — all games by team/season    {team_id: {season: [...]}}
   transfers.json            — all portal moves by team    {team_id: [...]}
@@ -420,10 +420,32 @@ def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Export: similar_players.json
+# Export: similar_players_{season}.json  (one file per season)
 # ---------------------------------------------------------------------------
 
+def _era_bucket(season: int) -> int:
+    """0=classic(2008-12), 1=transition(2013-17), 2=modern(2018+)."""
+    if season <= 2012:
+        return 0
+    if season <= 2017:
+        return 1
+    return 2
+
+
 def export_similar_players(T: dict, output_dir: Path) -> None:
+    """
+    Build per-season similar_players_{year}.json files using weighted
+    z-score Euclidean distance (replaces cosine on min-max normalized features).
+
+    Fixes vs old algorithm:
+    - Z-score standardization prevents score collapse in small position groups
+    - OVR band filter (±15) prevents elite/mediocre cross-matching
+    - games_played filter (>=5) excludes low-sample backups as comps
+    - Era cap: max 2 of 5 slots can be cross-era
+    - Stars default 2.5 (not 0) so missing recruiting data is neutral
+    """
+    import numpy as np
+
     rat  = T["ratings"]
     ps   = T["player_seasons"]
     pl   = T["players"]
@@ -434,63 +456,132 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
     if rat.empty:
         return
 
-    # ratings.player_id is Supabase internal; use player_seasons.player_id (CFB API id)
     print("  Building similarity matrix...")
+
+    # Build base dataframe: rated players with OVR >= 55
     df = rat[rat["overall_rating"] >= 55].copy()
-    df = df.merge(ps[["id", "player_id", "team_id", "position_group"]]
-                  .rename(columns={"id": "ps_id", "player_id": "cfb_player_id"}),
-                  left_on="player_season_id", right_on="ps_id", how="left")
-    df = df.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
-                  left_on="cfb_player_id", right_on="pl_id", how="left")
-    df = df.merge(tm[["id", "school"]].rename(columns={"id": "tm_id"}),
-                  left_on="team_id", right_on="tm_id", how="left")
+    df = df.merge(
+        ps[["id", "player_id", "team_id", "position_group"]]
+          .rename(columns={"id": "ps_id", "player_id": "cfb_player_id"}),
+        left_on="player_season_id", right_on="ps_id", how="left")
+    df = df.merge(
+        pl[["id", "name"]].rename(columns={"id": "pl_id"}),
+        left_on="cfb_player_id", right_on="pl_id", how="left")
+    df = df.merge(
+        tm[["id", "school"]].rename(columns={"id": "tm_id"}),
+        left_on="team_id", right_on="tm_id", how="left")
 
-    CONF_TIER = {"SEC": 1.0, "Big Ten": 1.0, "ACC": 0.9, "Big 12": 0.9,
-                 "Pac-12": 0.85, "Sun Belt": 0.5, "MAC": 0.5, "C-USA": 0.5,
-                 "Mountain West": 0.55, "American": 0.55}
+    # Join edge data for games_played filter and raw edge_score
+    if not edge.empty:
+        edge_slim = edge[["player_season_id", "edge_score", "games_played"]].copy()
+        df = df.merge(edge_slim, on="player_season_id", how="left")
+    else:
+        df["edge_score"] = 0.0
+        df["games_played"] = 0
 
-    def make_vector(row) -> list:
-        ovr        = _f(row.get("overall_rating"), 50)
-        edge_s     = _f(row.get("edge_score"), 0)
-        composite  = _f(row.get("composite_score"), 0)
-        trajectory = _f(row.get("trajectory_score"), 0)
-        conf       = CONF_TIER.get(row.get("school") or "", 0.6)
-        recency    = max(0.0, (int(row["season"]) - 2008) / 17)
-        return [ovr, edge_s, composite, trajectory, conf, recency]
+    # Join recruiting for stars (best match by player_id)
+    if not rec.empty:
+        best_stars = (
+            rec[rec["stars"].notna()]
+               .sort_values("stars", ascending=False)
+               .drop_duplicates(subset=["player_id"], keep="first")
+               [["player_id", "stars"]]
+        )
+        df = df.merge(
+            best_stars.rename(columns={"player_id": "rec_pid"}),
+            left_on="cfb_player_id", right_on="rec_pid", how="left")
+    else:
+        df["stars"] = None
 
-    import numpy as np
+    # Filter: require >= 5 games OR ATH/special (kickers often have fewer "games")
+    SPARSE_POS = {"K", "P", "ATH"}
+    mask_games = (
+        df["games_played"].fillna(0) >= 5
+    ) | df["position_group"].isin(SPARSE_POS)
+    df = df[mask_games].copy()
 
+    if df.empty:
+        return
+
+    # Feature weights: [ovr, edge_pctile, trajectory, stars, era_bucket]
+    WEIGHTS = np.array([0.35, 0.30, 0.15, 0.10, 0.10])
+    OVR_BAND = 15        # max OVR difference to consider as a comp
+    MAX_CROSS_ERA = 2    # max cross-era slots per player's 5 comps
+    SIM_SCALE = 0.5      # z-score distances are small; 0.5 spreads top-5 comps across 0.5–0.99
+    MAX_SIMILARITY = 0.99  # two distinct players are never 100% similar
+
+    # Group by position_group; compute all cross-season similarity within each group
     by_pos: dict = defaultdict(list)
     for _, row in df.iterrows():
         by_pos[row.get("position_group") or "ATH"].append(row.to_dict())
 
-    similar: dict = {}
+    # Accumulate results keyed by season: season_buckets[season][str(ps_id)] = [...]
+    season_buckets: dict = defaultdict(dict)
 
     for pg, group in by_pos.items():
         if len(group) < 2:
             continue
-        vectors = np.array([make_vector(r) for r in group], dtype=float)
 
-        # Min-max normalize each column
-        col_min = vectors.min(axis=0)
-        col_max = vectors.max(axis=0)
-        rng = col_max - col_min
-        rng[rng == 0] = 1.0
-        vectors = (vectors - col_min) / rng
+        # Compute edge percentile rank within this position group
+        raw_edges = np.array([_f(r.get("edge_score"), 0.0) for r in group])
+        if raw_edges.max() > raw_edges.min():
+            edge_pctiles = (
+                pd.Series(raw_edges).rank(pct=True) * 100
+            ).to_numpy()
+        else:
+            edge_pctiles = np.full(len(group), 50.0)
 
-        # Cosine similarity matrix via numpy
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        normed = vectors / norms
-        sim_matrix = normed @ normed.T  # shape (n, n)
+        # Build raw feature matrix
+        raw = np.array([
+            [
+                _f(r.get("overall_rating"), 50.0),
+                edge_pctiles[k],
+                _f(r.get("trajectory_score"), 0.0),
+                _f(r.get("stars"), 2.5),              # neutral default, not 0
+                float(_era_bucket(int(r.get("season") or 2025))),
+            ]
+            for k, r in enumerate(group)
+        ], dtype=float)
 
+        # Z-score standardize per column within position group
+        mean = raw.mean(axis=0)
+        std  = raw.std(axis=0)
+        std[std == 0] = 1.0    # zero-variance columns stay at 0; no collapse
+        z = (raw - mean) / std
+
+        # For each player: find top 5 comps with OVR band + era cap
         for i, row in enumerate(group):
-            scores = sim_matrix[i]
-            top_idx = np.argsort(scores)[::-1]
+            ovr_i  = _f(row.get("overall_rating"), 50.0)
+            era_i  = _era_bucket(int(row.get("season") or 2025))
+            z_i    = z[i]
+
+            # Weighted Euclidean distances to all other players
+            diffs = z - z_i                      # (n, 5)
+            dists = np.sqrt((WEIGHTS * diffs**2).sum(axis=1))
+            dists[i] = np.inf                    # exclude self
+
+            # Apply OVR band filter
+            for j, other in enumerate(group):
+                if abs(_f(other.get("overall_rating"), 50.0) - ovr_i) > OVR_BAND:
+                    dists[j] = np.inf
+
+            sorted_idx = np.argsort(dists)
+
             sims = []
-            for j in top_idx:
-                if j == i:
-                    continue
+            cross_era_count = 0
+            for j in sorted_idx:
+                if len(sims) == 5:
+                    break
+                if np.isinf(dists[j]):
+                    break
+                era_j = _era_bucket(int(group[j].get("season") or 2025))
+                is_cross_era = era_j != era_i
+                if is_cross_era:
+                    if cross_era_count >= MAX_CROSS_ERA:
+                        continue
+                    cross_era_count += 1
+                similarity = round(
+                    min(MAX_SIMILARITY, max(0.0, 1.0 - float(dists[j]) / SIM_SCALE)), 3)
                 other = group[j]
                 sims.append({
                     "id":         _i(other.get("cfb_player_id")),
@@ -499,16 +590,20 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
                     "season":     other.get("season"),
                     "team":       other.get("school"),
                     "ovr":        round(_f(other.get("overall_rating"), 0), 1),
-                    "similarity": round(float(scores[j]), 3),
+                    "similarity": similarity,
                 })
-                if len(sims) == 5:
-                    break
-            ps_id = _i(row.get("player_season_id"))
-            if ps_id is not None:
-                similar[ps_id] = sims
 
-    write_json(output_dir / "similar_players.json", similar)
-    print(f"  {len(similar)} player-seasons with similarity data")
+            ps_id = _i(row.get("player_season_id"))
+            season = row.get("season")
+            if ps_id is not None and season is not None:
+                season_buckets[int(season)][str(ps_id)] = sims
+
+    # Write one file per season
+    total = 0
+    for season, bucket in sorted(season_buckets.items()):
+        write_json(output_dir / f"similar_players_{season}.json", bucket)
+        total += len(bucket)
+    print(f"  {total} player-seasons with similarity data across {len(season_buckets)} seasons")
 
 
 # ---------------------------------------------------------------------------
@@ -755,8 +850,8 @@ def export_transfers(T: dict, output_dir: Path, season: int) -> None:
             "position_group": row.get("position_group"),
             "transfer_year":  season,
             "portal_date":    portal_date,
-            "from_school":    row.get("from_school"),
-            "to_school":      row.get("to_school"),
+            "from_school":    row.get("from_school") or "Unknown school",
+            "to_school":      row.get("to_school") or "Unknown school",
             "ovr_current":    round(ovr_current,  1) if ovr_current  else None,
             "ovr_previous":   round(ovr_previous, 1) if ovr_previous else None,
         }
@@ -890,6 +985,55 @@ def export_team_stats(T: dict, output_dir: Path, season: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Export: player_transfers.json — cross-season player-centric transfer history
+# ---------------------------------------------------------------------------
+
+def export_player_transfers(T: dict, output_dir: Path) -> None:
+    """Build player-centric transfer history.
+
+    Output: {str(player_id): [{transfer_year, from_school, to_school, portal_date, portal_entry_count}]}
+    Sorted by transfer_year asc within each player's list.
+    """
+    tr = T["transfers"]
+    tm = T["teams"]
+
+    if tr.empty:
+        return
+
+    # Only linked transfers
+    linked = tr[tr["player_id"].notna()].copy()
+    if linked.empty:
+        return
+
+    # Join school names
+    if not tm.empty:
+        from_schools = tm[["id", "school"]].rename(columns={"id": "from_id", "school": "from_school"})
+        to_schools   = tm[["id", "school"]].rename(columns={"id": "to_id",   "school": "to_school"})
+        linked = linked.merge(from_schools, left_on="from_team_id", right_on="from_id", how="left")
+        linked = linked.merge(to_schools,   left_on="to_team_id",   right_on="to_id",   how="left")
+
+    out: dict = {}
+    for _, row in linked.iterrows():
+        pid = _i(row.get("player_id"))
+        if pid is None:
+            continue
+        entry = {
+            "transfer_year":       _i(row.get("transfer_year")),
+            "from_school":         row.get("from_school") or "Unknown school",
+            "to_school":           row.get("to_school")   or "Unknown school",
+            "portal_date":         str(row["portal_date"]) if row.get("portal_date") else None,
+            "portal_entry_count":  _i(row.get("portal_entry_count")),
+        }
+        out.setdefault(str(pid), []).append(entry)
+
+    # Sort each player's list chronologically
+    for pid_key in out:
+        out[pid_key].sort(key=lambda e: e.get("transfer_year") or 0)
+
+    write_json(output_dir / "player_transfers.json", out)
+
+
+# ---------------------------------------------------------------------------
 # Export: research/index.json
 # ---------------------------------------------------------------------------
 
@@ -963,8 +1107,11 @@ def main():
     print("team_history.json...")
     export_team_history(T, output_dir)
 
-    print("similar_players.json...")
+    print("similar_players_{season}.json (per season)...")
     export_similar_players(T, output_dir)
+
+    print("player_transfers.json...")
+    export_player_transfers(T, output_dir)
 
     print("research/...")
     export_research(T, output_dir)

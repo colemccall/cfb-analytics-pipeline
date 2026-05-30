@@ -5,6 +5,7 @@ psycopg2-binary==2.9.10
 requests==2.32.3
 beautifulsoup4==4.12.3
 selenium==4.27.1
+playwright==1.44.0
 
 # Data / ML
 pandas==2.2.3
