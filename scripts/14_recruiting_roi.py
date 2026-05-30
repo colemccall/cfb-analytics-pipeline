@@ -3,6 +3,14 @@
 For each (team, recruit_year), computes what % of recruits became high-OVR
 contributors (peak OVR >= HIT_OVR_THRESHOLD across all rated seasons).
 
+Improvements vs v1:
+  - hit_rate_class_pct: n_contributors / n_recruits (vs n_rated) to expose
+    coverage gaps from unrated players
+  - avg_peak_ovr: mean peak OVR of all rated recruits in the class
+  - expected_development_seasons + maturing flag (< 3 seasons) to explain
+    why recent classes appear worse than older ones
+  - bc_hit_rate_pct only meaningful when n_bluechip >= 3; low sample flagged
+
 Output: cfb-analytics-app/data/recruiting_roi.json
 
 Usage:
@@ -10,6 +18,7 @@ Usage:
 """
 
 import sys
+import datetime
 from collections import defaultdict
 from pathlib import Path
 
@@ -23,9 +32,12 @@ OUTPUT_PATH = (
     / "cfb-analytics-app" / "data" / "recruiting_roi.json"
 )
 
-HIT_OVR_THRESHOLD = 75   # minimum peak OVR to count as a "contributor"
-BLUE_CHIP_STARS   = 4    # minimum stars to be a blue-chip recruit
-MIN_CLASS_SIZE    = 5    # skip classes too small to be meaningful
+HIT_OVR_THRESHOLD    = 75
+BLUE_CHIP_STARS      = 4
+MIN_CLASS_SIZE       = 5
+BC_MIN_SAMPLE        = 3    # bc_hit_rate_pct is unreliable below this
+MATURING_THRESHOLD   = 3    # classes with < 3 development seasons flagged
+CURRENT_YEAR         = datetime.date.today().year
 
 
 def main() -> None:
@@ -42,7 +54,6 @@ def main() -> None:
         print("ERROR: data/computed/ratings.json is empty — run script 06 first")
         return
 
-    # Team name / conference lookup
     team_info: dict = {}
     for _, t in teams.iterrows():
         tid = t.get("id")
@@ -56,10 +67,9 @@ def main() -> None:
     # Peak OVR per player (max overall_rating across all rated seasons)
     # -------------------------------------------------------------------------
     print("Computing peak OVR per player...")
-    peak_ovr: dict = defaultdict(float)   # player_id → peak OVR
+    peak_ovr: dict = defaultdict(float)
 
     if not player_seasons.empty and "player_season_id" in ratings.columns:
-        # Build player_season_id → player_id lookup
         psid_to_pid: dict = {}
         for _, ps in player_seasons.iterrows():
             psid = ps.get("id")
@@ -88,17 +98,16 @@ def main() -> None:
     # Aggregate per (committed_team_id, recruit_year)
     # -------------------------------------------------------------------------
     print("Aggregating by class...")
-    # class_data: (team_id, recruit_year) → {recruits, rated, contributors, bc_total, bc_contributors, stars_sum, composite_sum}
     class_data: dict = defaultdict(lambda: {
         "n_recruits": 0, "n_rated": 0, "n_contributors": 0,
         "n_bluechip": 0, "n_bc_contributors": 0,
-        "stars_sum": 0.0, "composite_sum": 0.0,
+        "stars_sum": 0.0, "composite_sum": 0.0, "ovr_sum": 0.0,
     })
 
     for _, r in recruiting.iterrows():
-        tid  = r.get("committed_team_id")
-        yr   = r.get("recruit_year")
-        pid  = r.get("player_id")
+        tid   = r.get("committed_team_id")
+        yr    = r.get("recruit_year")
+        pid   = r.get("player_id")
         stars = r.get("stars")
         comp  = r.get("composite_score")
 
@@ -132,7 +141,8 @@ def main() -> None:
                 continue
             p_ovr = peak_ovr.get(pid_int)
             if p_ovr is not None:
-                d["n_rated"] += 1
+                d["n_rated"]  += 1
+                d["ovr_sum"]  += p_ovr
                 if p_ovr >= HIT_OVR_THRESHOLD:
                     d["n_contributors"] += 1
                     if is_bc:
@@ -153,30 +163,37 @@ def main() -> None:
         n_cont  = d["n_contributors"]
         n_bc    = d["n_bluechip"]
         n_bc_c  = d["n_bc_contributors"]
+        dev_seasons = CURRENT_YEAR - yr
 
-        hit_rate     = round(n_cont / n_rated * 100, 1) if n_rated > 0 else None
-        bc_hit_rate  = round(n_bc_c / n_bc   * 100, 1) if n_bc > 0 else None
-        avg_stars    = round(d["stars_sum"] / n_rec, 2) if n_rec > 0 else None
-        avg_composite = round(d["composite_sum"] / n_rec, 4) if n_rec > 0 else None
+        hit_rate_rated = round(n_cont / n_rated * 100, 1) if n_rated > 0 else None
+        hit_rate_class = round(n_cont / n_rec   * 100, 1)
+        avg_peak_ovr   = round(d["ovr_sum"] / n_rated, 1) if n_rated > 0 else None
+        # Only report bc_hit_rate when sample is meaningful
+        bc_hit_rate    = round(n_bc_c / n_bc * 100, 1) if n_bc >= BC_MIN_SAMPLE else None
+        avg_stars      = round(d["stars_sum"] / n_rec, 2) if n_rec > 0 else None
+        avg_composite  = round(d["composite_sum"] / n_rec, 4) if n_rec > 0 else None
 
         info = team_info.get(tid, {})
         records.append({
-            "team_id":         tid,
-            "recruit_year":    yr,
-            "school":          info.get("school", "Unknown"),
-            "conference":      info.get("conference", ""),
-            "n_recruits":      n_rec,
-            "n_rated":         n_rated,
-            "n_contributors":  n_cont,
-            "hit_rate_pct":    hit_rate,
-            "n_bluechip":      n_bc,
-            "n_bc_contributors": n_bc_c,
-            "bc_hit_rate_pct": bc_hit_rate,
-            "avg_stars":       avg_stars,
-            "avg_composite":   avg_composite,
+            "team_id":                      tid,
+            "recruit_year":                 yr,
+            "school":                       info.get("school", "Unknown"),
+            "conference":                   info.get("conference", ""),
+            "n_recruits":                   n_rec,
+            "n_rated":                      n_rated,
+            "n_contributors":               n_cont,
+            "hit_rate_pct":                 hit_rate_rated,    # n_contributors / n_rated
+            "hit_rate_class_pct":           hit_rate_class,    # n_contributors / n_recruits
+            "avg_peak_ovr":                 avg_peak_ovr,
+            "n_bluechip":                   n_bc,
+            "n_bc_contributors":            n_bc_c,
+            "bc_hit_rate_pct":              bc_hit_rate,       # None when n_bluechip < 3
+            "avg_stars":                    avg_stars,
+            "avg_composite":                avg_composite,
+            "expected_development_seasons": dev_seasons,
+            "maturing":                     dev_seasons < MATURING_THRESHOLD,
         })
 
-    # Sort: recruit_year desc, hit_rate desc
     records.sort(key=lambda r: (-(r["recruit_year"] or 0), -(r["hit_rate_pct"] or 0)))
 
     write_json(OUTPUT_PATH, records)
