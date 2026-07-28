@@ -41,7 +41,7 @@ OUTPUT_PATH = (
 
 TRAIN_SEASONS  = range(2008, 2023)   # 2008–2022 for training
 TEST_SEASONS   = range(2023, 2025)   # 2023–2024 held out for evaluation
-PREDICT_SEASON = 2025                # predict 2026 OVR for these players
+PREDICT_SEASON = 2026                # predict 2027 OVR for these players
 
 SKILL_POSITIONS = {"QB", "RB", "WR", "TE", "DL", "LB", "DB"}
 POS_ENC = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "DL": 4, "LB": 5, "DB": 6}

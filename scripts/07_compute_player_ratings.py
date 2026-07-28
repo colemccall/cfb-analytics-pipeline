@@ -99,7 +99,7 @@ STARS_OVR_DELTA = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
 EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "EDGE", "DL", "LB", "CB", "S", "DB"}
 
 # All seasons used for cross-season normalization
-ALL_SEASONS = list(range(2008, 2026))
+ALL_SEASONS = list(range(2008, 2027))
 
 # ---------------------------------------------------------------------------
 # EDGE → OVR direct mapping (replaces weighted composite + scale_to_range
@@ -1485,7 +1485,7 @@ def main():
     parser.add_argument("--position",    type=str)
     args = parser.parse_args()
 
-    seasons = list(range(2008, 2026)) if args.all_seasons else [args.season]
+    seasons = list(range(2008, 2027)) if args.all_seasons else [args.season]
     positions = [args.position.upper()] if args.position else list(WEIGHTS.keys())
 
     for season in seasons:

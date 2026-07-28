@@ -596,11 +596,11 @@ def run_season(season: int, api_key: str) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Compute EDGE scores from local JSON stats")
     parser.add_argument("--season", type=int, default=2025)
-    parser.add_argument("--all-seasons", action="store_true", help="Run 2008-2025")
+    parser.add_argument("--all-seasons", action="store_true", help="Run 2008-2026")
     args = parser.parse_args()
 
     api_key = load_api_key()
-    seasons = list(range(2008, 2026)) if args.all_seasons else [args.season]
+    seasons = list(range(2008, 2027)) if args.all_seasons else [args.season]
     for s in seasons:
         run_season(s, api_key)
     print("\nDone.")

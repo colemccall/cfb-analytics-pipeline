@@ -219,10 +219,10 @@ def run_season(season: int, conn) -> int:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--season", type=int, action="append", dest="seasons",
-                        help="Season to process (default: 2021–2025). Repeatable.")
+                        help="Season to process (default: 2021–2026). Repeatable.")
     args = parser.parse_args()
 
-    seasons = args.seasons or list(range(2021, 2026))
+    seasons = args.seasons or list(range(2021, 2027))
     print(f"Engine B: processing seasons {seasons}")
 
     with get_connection() as conn:

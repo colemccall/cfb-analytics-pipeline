@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.store import read_raw, read_computed
 
 DEFAULT_OUTPUT = Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"
-CURRENT_SEASON = 2025
+CURRENT_SEASON = 2026
 TOP_N_PER_POSITION = 50
 
 
