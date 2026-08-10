@@ -2,6 +2,25 @@
 Generated: 2026-05-24
 Scope: Both repos — cfb-analytics-pipeline + cfb-analytics-app
 
+> **⚠ Historical snapshot — superseded 2026-08-10. Do not treat as current.**
+>
+> This captured the codebase as of 2026-05-24. Several of its findings have since
+> been acted on and its architecture map is out of date:
+>
+> - The "mixed architecture" it describes is gone. Scripts 04, 05, and 11 were
+>   ported to local JSON and the entire Supabase layer was deleted, including
+>   `utils/db.py`. Nothing in the pipeline talks to a database.
+> - The broken `build_player_index()` joins it flags in scripts 04/08/08b are
+>   moot: 08 and 08b were deleted (they never produced usable output) and
+>   replaced by `08_harvest_ea_cfb27_ratings.py`; 04 now uses `utils/matching.py`.
+> - Script 05's hardcoded year fallback is fixed.
+> - `api_client.py`'s `verify=False` is fixed.
+> - It predates scripts 13, 14, and 15 entirely.
+>
+> For current architecture see `README.md`; for design rationale and the bug
+> record see `AUDIT_FINDINGS.md`. Kept because its reasoning explains why
+> several of those changes were made.
+
 ---
 
 ## Architecture Map

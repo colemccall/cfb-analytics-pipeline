@@ -189,12 +189,15 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
     else:
         ratings_season["recruit_year"] = None
 
-    # EDGE — only need stats_measured/games_played (edge_score already in ratings)
+    # EDGE — edge_score lives in player_edge.json, NOT in the ratings table. It
+    # was previously omitted here, so every exported player had edge_score=null
+    # and the frontend's EDGE column rendered an em-dash for all 8,437 rows.
     if not edge.empty:
-        edge_slim = edge[["player_season_id", "stats_measured", "games_played"]] \
+        edge_slim = edge[["player_season_id", "edge_score", "stats_measured", "games_played"]] \
                         .rename(columns={"player_season_id": "edge_ps_id"})
         ratings_season = ratings_season.merge(edge_slim, left_on="player_season_id", right_on="edge_ps_id", how="left")
     else:
+        ratings_season["edge_score"] = None
         ratings_season["stats_measured"] = None
         ratings_season["games_played"] = None
 
