@@ -109,48 +109,40 @@ Scope: Both repos — cfb-analytics-pipeline + cfb-analytics-app
 
 ### Frontend Data Flow
 
-```
-cfb-analytics-app/data/*.json  (written by pipeline script 12)
-   │
-   ├── supabaseClient.js — _load(file) → in-memory _cache{}
-   │   ├── fetchAllPlayers(season) → players_{season}.json
-   │   ├── fetchPlayers(options)   → players_{season}.json (filtered)
-   │   ├── fetchTeams(season)      → teams.json + team_ratings.json (merged)
-   │   ├── fetchTeamRoster(id,season) → rosters_{season}.json[teamId]
-   │   ├── fetchTeamSchedule(id,season) → schedules_{season}.json[teamId]
-   │   ├── fetchTeamTransfers(id,season) → transfers_{season}.json[teamId]
-   │   ├── fetchPlayerProfile(id,season) → players_{season}.json (find by id)
-   │   ├── fetchPlayerStats(id,season) → players_{season}.json[id].stats_*
-   │   ├── fetchPlayerRatingHistory(id) → scans players_2008..2025.json
-   │   └── fetchPlayerCareerStats(id)  → scans players_2008..2025.json
-   │
-   ├── playerSearch.js — loadSimilarPlayers() → similar_players.json
-   │
-   └── teams.html (inline JS)
-       ├── loadTeamRatings()     → team_ratings.json
-       ├── loadTeamStats(season) → team_stats_{season}.json
-       └── buildTeamHistoryHTML() → team_history.json (via _load from supabaseClient.js)
-```
+> **The app repo owns its own documentation.** For the authoritative frontend
+> architecture see `cfb-analytics-app/README.md` (script load order, theme system,
+> design-system primitives) and `cfb-analytics-app/CHANGELOG_v3.1_redesign.md`.
+> The summary below covers only the pipeline→frontend contract.
 
-### Frontend Script Load Order (per page)
+Script 12 (plus 13–15) writes `cfb-analytics-app/data/*.json`. `js/dataLoader.js` is the
+single fetch layer, with an in-memory `_load()` cache; nothing else fetches.
 
-| Page | Scripts Loaded |
-|------|---------------|
-| index.html | config.js → supabaseClient.js → playerSearch.js → inline |
-| players.html | config.js → supabaseClient.js → playerSearch.js → inline |
-| teams.html | config.js → supabaseClient.js → playerSearch.js → inline (huge) |
-| ratings.html | config.js → supabaseClient.js → playerSearch.js → ratingsDisplay.js → inline |
-| research.html | config.js → inline only |
-| info.html | config.js → inline only |
+| Export | Consumed by |
+|--------|-------------|
+| `players_{season}.json` | `fetchAllPlayers` / `fetchPlayers` / `fetchPlayerProfile` / `fetchPlayerStats`; career views scan all seasons |
+| `rosters_{season}.json` | `fetchTeamRoster` → team roster tab |
+| `schedules_{season}.json` | `fetchTeamSchedule`; `fetchSeasonGames` (home marquee + '26 hub) |
+| `transfers_{season}.json` | `fetchTeamTransfers` → team transfers tab (2021+ only) |
+| `similar_players_{season}.json` | player modal comps |
+| `team_stats_{season}.json` | team ratings tab stats panel |
+| `ratings_by_position_{season}.json` | Ratings page position leaderboards |
+| `teams.json`, `team_ratings.json`, `team_history.json` | `fetchTeams`, `fetchTeamOvrMap`, team history tab |
+| `player_transfers.json` | player modal career path |
+| `team_performance.json` (13), `recruiting_roi.json` (14), `trajectory.json` (15) | Research page tables + home storylines |
+| `research/index.json` | research "Published Findings" — **currently `[]`, `research_cache` is empty** |
 
-### Global Symbols Exposed
+**Known contract gaps (as of 2026-08-10):**
 
-- `config.js`: CONFIG, getRatingTier(), ratingColor(), ratingTextColor(), posColor(), trajHtml(), starsHtml()
-- `supabaseClient.js`: _cache, _load(), fetchAllPlayers(), fetchPlayers(), fetchTeams(), fetchTeamRoster(), fetchTeamSchedule(), fetchTeamTransfers(), fetchPlayerProfile(), fetchPlayerStats(), fetchPlayerRatingHistory(), fetchPlayerCareerStats()
-- `playerSearch.js`: openPlayerModal(), closeModal(), renderGrid(), initPlayerSearch(), loadSimilarPlayers()
-- `ratingsDisplay.js`: initRatings(), renderScatterPlot()
-
----
+- **Season constant is duplicated.** Script 12 has `CURRENT_SEASON = 2026`; the frontend
+  has `CONFIG.CURRENT_SEASON = 2025`. Script 12 therefore writes an empty
+  `ratings_by_position_2026.json` that nothing requests, and the '26 hub reaches 2026
+  schedule data only via a hardcoded constant in `season2026.js`. A `manifest.json`
+  export consumed by `config.js` would remove the split.
+- **Orphaned exports.** `data/rosters.json` (57 MB) and `data/schedules.json` (14 MB) have
+  zero consumers — leftovers from the pre-per-season format. Script 12's module docstring
+  still advertises them. Both should be deleted and the docstring corrected.
+- **Payload.** `players_{season}.json` is ~8.3 MB and is fetched by home, players and
+  ratings, though only the modal needs its `stats_*` and `shap` blobs.
 
 ## File Inventory
 
@@ -193,53 +185,25 @@ cfb-analytics-app/data/*.json  (written by pipeline script 12)
 | data/raw_backup_2026-05-22.zip | — | Snapshot backup of data/raw/ from 2026-05-22 | Backup — do not delete; not in script run order |
 | data/computed/team_season_stats.json | — | Intermediate team season aggregates consumed by script 12 | Active input to script 12; writer is script 10 (secondary output not in architecture map — see Quirk 30) |
 
-### Frontend — JS/
+### Frontend — files
 
-| File | Lines | Purpose | State |
-|------|-------|---------|-------|
-| js/config.js | 108 | CONFIG + helper globals | Active |
-| js/supabaseClient.js | 187 | Static JSON data loader (misnamed) | Active |
-| js/playerSearch.js | 654 | Player search, grid render, modal | Active |
-| js/ratingsDisplay.js | 206 | Scatter plot (ratings.html only) | Active |
+Inventory moved to `cfb-analytics-app/README.md` (it drifted twice while duplicated here).
+Shape as of v3.1: `js/` = config, shell, dataLoader, ui, dataTable + one module per page;
+`css/` = styles.css (tokens/layout) + components.css (components + design-system
+primitives), 1,446 lines total; `tools/contrast-check.mjs` gates palette changes.
 
-### Frontend — HTML/
+### Frontend — data/ (generated by pipeline scripts 12–15)
 
-| File | Lines | Purpose | Sidebar version? |
-|------|-------|---------|-----------------|
-| index.html | 369 | Home page | No |
-| players.html | 124 | Player search | No |
-| teams.html | 714 | Teams (with large inline JS) | No |
-| ratings.html | 121 | Scatter plot | No |
-| research.html | 163 | Research findings | No |
-| info.html | 488 | How ratings work | No |
+Per-season families: `players_`, `rosters_`, `schedules_`, `similar_players_`,
+`team_stats_`, `ratings_by_position_` (2008–2025; schedules also 2026),
+`transfers_` (2021–2025 only — the portal era).
+Season-agnostic: `teams.json`, `team_ratings.json`, `team_history.json`,
+`player_transfers.json`, `team_performance.json`, `recruiting_roi.json`,
+`trajectory.json`, `research/index.json`.
 
-### Frontend — CSS/
-
-| File | Lines | Purpose | State |
-|------|-------|---------|-------|
-| css/styles.css | 1232 | Main theme variables, layout, components | Active |
-| css/components.css | 511 | Animations, EA-card, page-hero, home sections | Active |
-
-### Frontend — data/ (generated by pipeline script 12)
-
-Season-specific files (current canonical set):
-
-- `players_{season}.json` — exists for 2008–2025
-- `rosters_{season}.json` — exists for 2008–2025
-- `schedules_{season}.json` — exists for 2008–2025
-- `ratings_by_position_{season}.json` — exists for 2008–2025
-- `team_stats_{season}.json` — exists for 2008–2025
-- `transfers_{season}.json` — **exists for 2021–2024 only** (not pre-2021; 2025 not yet generated)
-- `similar_players.json` — cross-season; indexed by player_season_id
-- `teams.json` — team identity/conference data
-- `team_ratings.json` — team OVR + sub-scores
-- `team_history.json` — conference realignment timeline
-- `research/index.json` — published research findings
-
-Legacy non-season-specific files (root of data/, potentially stale from prior export runs):
-
-- `players.json`, `ratings_by_position.json`, `rosters.json`, `schedules.json`, `transfers.json`
-  — These are holdovers from a previous export format. They may not reflect current data. Season-specific variants are canonical.
+Bare `players.json` / `transfers.json` / `similar_players.json` were deleted as stale
+duplicates. `rosters.json` and `schedules.json` are the same kind of leftover and are
+still present — see the contract gaps above.
 
 ---
 
@@ -292,18 +256,18 @@ Legacy non-season-specific files (root of data/, potentially stale from prior ex
 15. **script 05 line 230**: `start_season = int(years[0]) if years else 2024` — hardcoded fallback year. Will quietly produce wrong data after 2024. Should be `datetime.date.today().year`.
 16. **script 02 line 166**: `for school in ps_map.get(int(pid), {""}) :` — trailing space before colon. Harmless but non-PEP-8.
 17. **index.html lines 269–284**: `posColor_fn()` and `_ratingColor()` defined inline — duplicates of `posColor()` and `ratingColor()` from config.js but with a different palette. The `_ratingColor()` uses a green/yellow/orange/red scale vs config.js's theme-aware blue/gold scale. These are intentionally slightly different for the home page summary display, but the duplication is confusing.
-18. **supabaseClient.js naming**: File is named `supabaseClient.js` and its comment says "Static JSON data loader — replaces Supabase REST client" — the name is misleading post-local-arch.
+18. ~~**supabaseClient.js naming**~~ — **RESOLVED (v3.0):** renamed to `js/dataLoader.js`; the Supabase-era file no longer exists.
 19. **schema.sql line 33**: `players` table still has `team_id` column in the base CREATE statement. The v2 design (CLAUDE.md) says players is "identity-only." The DB does have this column; scripts 01+ no longer write to it but it's not been dropped. The broken SQL in 04/08/08b exploits this stale column.
 20. **index.html sidebar**: Has a `<div class="sidebar-season-wrap">` (season selector) not present in any other page's sidebar. The other pages have their own season selectors in the main filter bar.
-21. **teams.html**: References `_load("team_history.json")` inline (line 671) — relies on `_load` being in scope from supabaseClient.js. Works because supabaseClient.js loads first, but creates a hidden coupling dependency.
-22. **research.html**: Does NOT load supabaseClient.js or playerSearch.js — correct, it only fetches research/index.json via native fetch. But the `openPlayerModal()` global would not be available here if ever needed.
+21. ~~**teams.html inline `_load` coupling**~~ — **RESOLVED (v3.0):** the inline script was extracted to `js/teamsPage.js`, which declares its dependency on `dataLoader.js` through the documented load order.
+22. ~~**research.html lacks the modal**~~ — **RESOLVED (v3.0):** research.html now loads `dataLoader.js`, `ui.js`, `dataTable.js` and `playerSearch.js`, so research tables link to players and open the modal like every other page.
 23. **script 12 DEFAULT_OUTPUT**: `Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"` — hardcoded relative path that assumes the two repos sit as siblings in the same parent directory. Works for this workspace layout (`CFB-Analytics-Portfolio/`).
 24. **script 12 animateCounter "stat-players" counter**: Hard-coded to 8421 (line 294 equivalent in index.html). This is in index.html, not script 12, and is a static fake number not tied to actual data.
 
 ### From Second-Pass Audit (Additional Findings)
 
 - **[S2-1] `data/computed/team_season_stats.json` writer is ambiguous**: Script 12 reads this file at line 131 via `read_computed("team_season_stats")`, but the architecture map only documents script 10 writing `team_ratings.json`. The `team_season_stats.json` file exists in `data/computed/` — it is most likely a secondary output of script 10, but this is not documented in script 10's docstring or in CLAUDE.md. Verify before modifying script 10.
-- **[S2-2] Transfers data gap in frontend**: `transfers_{season}.json` files exist only for 2021–2024. No transfer data for pre-2021 seasons; 2025 file not yet generated (requires script 12 re-run after 2025 transfer data harvest). `fetchTeamTransfers()` in supabaseClient.js will return an empty array for any season outside 2021–2024.
+- **[S2-2] Transfers data gap in frontend**: `transfers_{season}.json` exists for 2021–2025 only — there is no portal data before 2021. `fetchTeamTransfers()` (`dataLoader.js`) returns an empty array outside that range; since v3.0 the UI states the reason ("portal data begins in 2021") rather than showing a bare empty table.
 - **[S2-3] Legacy non-season-specific data files**: `data/players.json`, `data/ratings_by_position.json`, `data/rosters.json`, `data/schedules.json`, `data/transfers.json` exist in `cfb-analytics-app/data/` root. These are stale outputs from a prior export format. They are not loaded by any current JS code (all fetches use season-specific filenames). They are safe to remove in clean-arch after confirming no lingering HTML references.
 - **[S2-4] `bulk_upsert()` list conflict_col is valid**: Script 11 calls `bulk_upsert("ratings", deduped, ["player_season_id", "engine"])` passing a list. Confirmed correct — `db.py` line 63 handles `isinstance(conflict_col, str)` check and converts accordingly. This is NOT a bug.
 - **[S2-5] Script 11 wrong filename in its own docstring**: `11_compute_engine_b_ratings.py` line 17 references `python scripts/11_compute_engine_b.py` — missing `_ratings` suffix. Self-referential documentation error.
@@ -323,7 +287,7 @@ Legacy non-season-specific files (root of data/, potentially stale from prior ex
 
 All of the following were resolved during audit:
 
-1. **`supabaseClient.js` rename**: Plan says rename to `dataLoader.js` in clean-arch. Current name is misleading. All 4 HTML pages that load it (index, players, teams, ratings) will need the `<script src="">` tag updated.
+1. ~~**`supabaseClient.js` rename**~~ — **DONE (v3.0):** now `js/dataLoader.js`, referenced by all seven pages.
 
 2. **`utils/supabase_client.py` removal**: No active callers in local-arch. Remove file and remove `supabase==2.10.0` from requirements.txt in clean-arch. Scripts 04, 05, 08, 08b, 11 import `get_client()` directly — they need different treatment (they still use the DB).
 
