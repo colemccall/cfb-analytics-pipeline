@@ -1,7 +1,7 @@
-"""Local JSON data store — replaces psycopg2/Supabase for all pipeline reads/writes.
+"""Local JSON data store — the only persistence layer the pipeline uses.
 
-Raw source data lives in data/raw/{table}.json (populated by 00_dump_supabase.py
-or by API harvest scripts).
+Raw source data lives in data/raw/{table}.json, written by the harvest scripts
+(01-05, 08).
 
 Computed outputs live in data/computed/{table}.json (written by rating/export scripts).
 
@@ -19,6 +19,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
+
+from utils.json_utils import clean_nan
 
 _ROOT     = Path(__file__).parent.parent
 RAW_DIR   = _ROOT / "data" / "raw"
@@ -56,12 +58,32 @@ def read_computed(table: str) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
+def read_ratings(engine: str = "edge") -> pd.DataFrame:
+    """Load data/computed/ratings.json for a single engine.
+
+    ratings.json holds every engine's output in one file (edge, engine_b, ...),
+    keyed by (player_season_id, season, engine). Reading it unfiltered returns
+    several rows per player-season, which silently double-counts players on
+    export and contaminates any max()/mean() over overall_rating. Always filter.
+    """
+    df = read_computed("ratings")
+    if df.empty or "engine" not in df.columns:
+        return df
+    return df[df["engine"] == engine].copy()
+
+
 def write_computed(table: str, df: pd.DataFrame) -> None:
-    """Write DataFrame → data/computed/{table}.json."""
+    """Write DataFrame → data/computed/{table}.json.
+
+    NaN is scrubbed via clean_nan rather than DataFrame.where: `where` cannot put
+    None into a float64 column, so missing numerics survived as NaN and were
+    written as the literal token `NaN` — invalid JSON that breaks any strict
+    parser (including the browser's fetch().json()).
+    """
     COMPUTED_DIR.mkdir(parents=True, exist_ok=True)
     path = COMPUTED_DIR / f"{table}.json"
-    rows = df.where(pd.notna(df), other=None).to_dict(orient="records")
+    rows = clean_nan(df.where(pd.notna(df), other=None).to_dict(orient="records"))
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, separators=(",", ":"), cls=_Encoder)
+        json.dump(rows, f, separators=(",", ":"), cls=_Encoder, allow_nan=False)
     size_kb = path.stat().st_size / 1024
     print(f"  Wrote data/computed/{table}.json ({len(rows)} rows, {size_kb:.1f} KB)")

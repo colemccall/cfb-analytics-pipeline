@@ -1,32 +1,41 @@
-"""Scrape On3 NIL valuations → upsert to Supabase nil_valuations table.
+"""Scrape On3 NIL valuations → data/raw/nil_valuations.json.
 
 On3 is JS-rendered — uses Selenium headless Chrome to fetch pages.
 Re-run periodically (monthly or start of season) to refresh valuations.
 Only current-year data is fetched.
 
+STATUS: On3 actively blocks scraping, so this currently returns 0 rows and
+nil_valuations.json stays empty. Engine B (script 11) runs recruiting-only until
+a working NIL source lands. The scrape/parse path below is kept because the
+matching and storage half is source-agnostic — a replacement source only needs
+to produce {name, team, position, valuation_usd} dicts.
+
 Usage:
-    python scripts/04_scrape_nil.py
-    python scripts/04_scrape_nil.py --pages 10
+    python scripts/04_harvest_nil_valuations.py
+    python scripts/04_harvest_nil_valuations.py --pages 10
 """
 
 import argparse
-import difflib
 import sys
 import time
 from datetime import date
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
-load_dotenv()
 
-from utils.db import bulk_upsert, get_connection
+from utils.json_utils import write_json
+from utils.matching import build_player_index, match_player, resolve_collisions
+from utils.store import read_raw, RAW_DIR
 
 ON3_URL = "https://www.on3.com/nil/rankings/player/college/football/"
 SLEEP_SEC = 3.0
 MAX_PAGES = 20  # ~50 players/page → top ~1000 NIL earners
 PAGE_LOAD_WAIT = 10  # seconds to wait for JS render
+
+OUTPUT = RAW_DIR / "nil_valuations.json"
+
+# NIL rankings are current-roster; match against recent seasons only.
+MATCH_SEASONS = [2025, 2024]
 
 
 # ---------------------------------------------------------------------------
@@ -184,91 +193,42 @@ def _parse_nil_row(row) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Player matching
+# Save to local JSON
 # ---------------------------------------------------------------------------
 
-def build_player_index() -> dict:
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT ON (p.id) p.id, p.name, t.school
-            FROM players p
-            JOIN player_seasons ps ON ps.player_id = p.id
-            JOIN teams t ON t.id = ps.team_id
-            ORDER BY p.id, ps.season DESC
-        """)
-        index: dict = {}
-        for pid, name, school in cur.fetchall():
-            key = name.lower().strip()
-            team = (school or "").lower()
-            index.setdefault(key, []).append((pid, team))
-    return index
-
-
-def _strip_suffix(name: str) -> str:
-    for suffix in [" jr.", " jr", " sr.", " sr", " ii", " iii", " iv"]:
-        if name.endswith(suffix):
-            return name[: -len(suffix)].strip()
-    return name
-
-
-def match_player(name: str, team: str | None, player_index: dict, threshold: float = 0.85) -> int | None:
-    name_l = _strip_suffix(name.lower().strip())
-    team_l = team.lower().strip() if team else None
-
-    candidates = player_index.get(name_l, [])
-    if candidates:
-        if team_l:
-            for pid, t in candidates:
-                if t == team_l:
-                    return pid
-        return candidates[0][0]
-
-    matches = difflib.get_close_matches(name_l, player_index.keys(), n=3, cutoff=threshold)
-    for match in matches:
-        cands = player_index[match]
-        if team_l:
-            for pid, t in cands:
-                if t == team_l:
-                    return pid
-        if len(cands) == 1:
-            return cands[0][0]
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Upsert
-# ---------------------------------------------------------------------------
-
-def upsert_nil(entries: list[dict], player_index: dict) -> None:
+def save_nil(entries: list[dict], player_index: dict) -> None:
+    """Match scraped entries to our players and merge into nil_valuations.json."""
     today = date.today().isoformat()
-    rows = []
-    unmatched = 0
 
     for e in entries:
-        player_id = match_player(e["name"], e.get("team"), player_index)
-        if player_id is None:
-            unmatched += 1
-            continue
-        rows.append({
-            "player_id":     player_id,
-            "valuation_usd": e.get("valuation_usd"),
-            "source":        "on3",
-            "as_of_date":    today,
-        })
+        pid, psid, how = match_player(e["name"], e.get("team"), player_index)
+        e["player_id"]        = pid
+        e["player_season_id"] = psid
+        e["match_type"]       = how
+    dropped = resolve_collisions(entries)
+    if dropped:
+        print(f"  Dropped {dropped} ambiguous matches (shared names)")
 
-    # Dedup by (player_id, as_of_date) before upsert
-    seen = set()
-    deduped = []
-    for r in rows:
-        key = (r["player_id"], r["as_of_date"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(r)
+    rows = [{
+        "player_id":     e["player_id"],
+        "valuation_usd": e.get("valuation_usd"),
+        "source":        "on3",
+        "as_of_date":    today,
+    } for e in entries if e.get("player_id") is not None]
+    unmatched = len(entries) - len(rows)
 
-    if deduped:
-        bulk_upsert("nil_valuations", deduped, ["player_id", "as_of_date"])
-    print(f"  Upserted {len(deduped)} NIL valuations ({unmatched} unmatched)")
+    # Dedup by (player_id, as_of_date)
+    new_rows = {(r["player_id"], r["as_of_date"]): r for r in rows}
+
+    existing_df = read_raw("nil_valuations")
+    merged: dict = {}
+    if not existing_df.empty:
+        for r in existing_df.to_dict("records"):
+            merged[(r.get("player_id"), r.get("as_of_date"))] = r
+    merged.update(new_rows)
+
+    write_json(OUTPUT, list(merged.values()))
+    print(f"  Saved {len(new_rows)} NIL valuations ({unmatched} unmatched). Total: {len(merged)}")
 
 
 # ---------------------------------------------------------------------------
@@ -276,12 +236,12 @@ def upsert_nil(entries: list[dict], player_index: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="On3 NIL valuations -> data/raw/nil_valuations.json")
     parser.add_argument("--pages", type=int, default=MAX_PAGES, help="Max pages to scrape (default 20)")
     args = parser.parse_args()
 
     print("Building player index...")
-    player_index = build_player_index()
+    player_index = build_player_index(seasons=MATCH_SEASONS)
     print(f"  {len(player_index)} player names loaded")
 
     print(f"Scraping On3 NIL rankings (up to {args.pages} pages)...")
@@ -289,7 +249,10 @@ def main():
     print(f"Scraped {len(entries)} NIL entries")
 
     if entries:
-        upsert_nil(entries, player_index)
+        save_nil(entries, player_index)
+    else:
+        print("  No entries scraped - On3 blocks automated requests. "
+              "nil_valuations.json left unchanged.")
 
     print("Done.")
 

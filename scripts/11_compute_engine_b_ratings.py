@@ -10,7 +10,11 @@ Formula:
     recruiting_ovr: 247Sports composite (0–1.0 scale) mapped to [30, 99] via piecewise anchors.
     nil_ovr:        On3 NIL valuation (USD/year) log-scaled vs position median, mapped to [30, 99].
 
-Outputs: upserts to ratings table with engine='engine_b'.
+NIL data is currently empty (On3 blocks scraping — see script 04), so this runs
+recruiting-only until a working NIL source lands.
+
+Reads:  data/raw/{player_seasons,recruiting,nil_valuations}.json
+Writes: data/computed/ratings.json  (rows with engine='engine_b')
 
 Usage:
     python scripts/11_compute_engine_b_ratings.py
@@ -20,19 +24,23 @@ Usage:
 
 import argparse
 import json
-import math
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-
-from dotenv import load_dotenv
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-load_dotenv()
 
-from utils.db import bulk_upsert, get_connection
+from utils.store import read_raw, read_computed, write_computed
+
+ENGINE        = "engine_b"
+MODEL_VERSION = "engine_b_v1.1"
+
+# Recruiting classes are matched to a season within this lookback window —
+# a 2021 recruit is still "a 2021 recruit" in their 2025 senior season.
+RECRUIT_LOOKBACK_YEARS = 5
 
 # ---------------------------------------------------------------------------
 # Recruiting composite → OVR anchors
@@ -90,34 +98,75 @@ def nil_to_ovr(nil_val: float | None, position_median: float) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Data fetch
+# Data assembly (local JSON — replaces the old player_seasons/recruiting/NIL SQL join)
 # ---------------------------------------------------------------------------
 
-def fetch_player_seasons(season: int, conn) -> list[dict]:
-    """Return all player_seasons for the given season with recruiting + NIL data."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT
-            ps.id            AS player_season_id,
-            ps.player_id,
-            ps.season,
-            ps.team_id,
-            ps.position_group,
-            r.composite_score AS recruit_composite,
-            r.stars           AS recruit_stars,
-            r.recruit_year,
-            n.valuation_usd   AS nil_valuation
-        FROM player_seasons ps
-        LEFT JOIN recruiting r
-            ON r.player_id = ps.player_id
-            AND r.recruit_year BETWEEN ps.season - 5 AND ps.season
-        LEFT JOIN nil_valuations n
-            ON n.player_id = ps.player_id
-        WHERE ps.season = %s
-        ORDER BY ps.id
-    """, (season,))
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+def _best_recruiting_by_player(recruiting: pd.DataFrame) -> dict[int, list[dict]]:
+    """{player_id: [{recruit_year, composite_score, stars}, ...]} sorted newest first."""
+    by_player: dict[int, list[dict]] = defaultdict(list)
+    if recruiting.empty:
+        return by_player
+    for row in recruiting.to_dict("records"):
+        pid = row.get("player_id")
+        if pid is None or pd.isna(pid):
+            continue
+        by_player[int(pid)].append({
+            "recruit_year":    row.get("recruit_year"),
+            "composite_score": row.get("composite_score"),
+            "stars":           row.get("stars"),
+        })
+    for pid in by_player:
+        by_player[pid].sort(key=lambda r: -(r["recruit_year"] or 0))
+    return by_player
+
+
+def _nil_by_player(nil_df: pd.DataFrame) -> dict[int, float]:
+    if nil_df.empty or "player_id" not in nil_df.columns:
+        return {}
+    col = "valuation_usd" if "valuation_usd" in nil_df.columns else None
+    if col is None:
+        return {}
+    out: dict[int, float] = {}
+    for row in nil_df.to_dict("records"):
+        pid = row.get("player_id")
+        val = row.get(col)
+        if pid is None or val is None or pd.isna(pid) or pd.isna(val):
+            continue
+        out[int(pid)] = float(val)
+    return out
+
+
+def fetch_player_seasons(season: int, player_seasons: pd.DataFrame,
+                         recruiting_idx: dict, nil_idx: dict) -> list[dict]:
+    """Player-seasons for one season, joined to their recruiting profile and NIL value."""
+    if player_seasons.empty:
+        return []
+    season_rows = player_seasons[player_seasons["season"] == season]
+
+    rows = []
+    for ps in season_rows.to_dict("records"):
+        pid = ps.get("player_id")
+        pid = int(pid) if pid is not None and not pd.isna(pid) else None
+
+        recruit = None
+        for candidate in recruiting_idx.get(pid, []):
+            year = candidate.get("recruit_year")
+            if year is None:
+                continue
+            if season - RECRUIT_LOOKBACK_YEARS <= year <= season:
+                recruit = candidate
+                break
+
+        rows.append({
+            "player_season_id":  ps.get("id"),
+            "player_id":         pid,
+            "season":            season,
+            "position_group":    ps.get("position_group"),
+            "recruit_composite": (recruit or {}).get("composite_score"),
+            "recruit_stars":     (recruit or {}).get("stars"),
+            "nil_valuation":     nil_idx.get(pid),
+        })
+    return rows
 
 
 def compute_nil_position_medians(rows: list[dict]) -> dict[str, float]:
@@ -129,10 +178,7 @@ def compute_nil_position_medians(rows: list[dict]) -> dict[str, float]:
         if v and v > 0:
             vals_by_pos[pg].append(float(v))
 
-    medians = {}
-    for pg, vals in vals_by_pos.items():
-        medians[pg] = float(np.median(vals)) if vals else 0.0
-    return medians
+    return {pg: float(np.median(vals)) for pg, vals in vals_by_pos.items() if vals}
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +186,13 @@ def compute_nil_position_medians(rows: list[dict]) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 def compute_engine_b(row: dict, nil_medians: dict[str, float]) -> dict | None:
-    ps_id = row["player_season_id"]
-    pg    = row.get("position_group") or "ATH"
+    pg = row.get("position_group") or "ATH"
 
-    rec_ovr = recruit_to_ovr(row.get("recruit_composite"))
+    composite = row.get("recruit_composite")
+    if composite is not None and pd.isna(composite):
+        composite = None
+    rec_ovr = recruit_to_ovr(composite)
+
     nil_med = nil_medians.get(pg, 0.0)
     nil_ovr = nil_to_ovr(row.get("nil_valuation"), nil_med)
 
@@ -161,17 +210,16 @@ def compute_engine_b(row: dict, nil_medians: dict[str, float]) -> dict | None:
     if nil_ovr is not None:
         shap["nil_valuation"] = round(nil_ovr - 65.0, 3)
 
+    # Columns Engine B does not produce (position_rating, trajectory_*, breakout_*)
+    # are left out entirely rather than set to None — concat fills them as NaN and
+    # keeps the existing float dtypes instead of forcing object columns.
     return {
-        "player_season_id": ps_id,
-        "player_id":        row["player_id"],
+        "player_season_id": row["player_season_id"],
         "season":           row["season"],
-        "team_id":          row.get("team_id"),
         "overall_rating":   round(float(np.clip(ovr, 30.0, 99.0)), 2),
-        "engine":           "engine_b",
-        "stars":            row.get("recruit_stars"),
-        "composite_score":  row.get("recruit_composite"),
         "shap_values":      json.dumps(shap),
-        "model_version":    "engine_b_v1.0",
+        "model_version":    MODEL_VERSION,
+        "engine":           ENGINE,
     }
 
 
@@ -179,17 +227,20 @@ def compute_engine_b(row: dict, nil_medians: dict[str, float]) -> dict | None:
 # Main
 # ---------------------------------------------------------------------------
 
-def run_season(season: int, conn) -> int:
+def run_season(season: int, player_seasons: pd.DataFrame,
+               recruiting_idx: dict, nil_idx: dict) -> list[dict]:
     print(f"\n[Engine B] Season {season}")
-    rows = fetch_player_seasons(season, conn)
+    rows = fetch_player_seasons(season, player_seasons, recruiting_idx, nil_idx)
     print(f"  {len(rows)} player-seasons loaded")
+    if not rows:
+        return []
 
     nil_medians = compute_nil_position_medians(rows)
     has_nil = sum(1 for r in rows if r.get("nil_valuation"))
-    print(f"  {has_nil} players have NIL data; position medians: {nil_medians}")
+    print(f"  {has_nil} players have NIL data" +
+          (f"; position medians: {nil_medians}" if nil_medians else " (recruiting-only mode)"))
 
-    ratings = []
-    skipped = 0
+    ratings, skipped = [], 0
     for row in rows:
         r = compute_engine_b(row, nil_medians)
         if r is None:
@@ -197,27 +248,38 @@ def run_season(season: int, conn) -> int:
         else:
             ratings.append(r)
 
-    print(f"  Computed {len(ratings)} Engine B ratings ({skipped} skipped — no recruiting/NIL data)")
+    print(f"  Computed {len(ratings)} Engine B ratings ({skipped} skipped - no recruiting/NIL data)")
 
-    if not ratings:
-        return 0
-
-    # Dedup by player_season_id + engine
+    # Dedup by player_season_id (one Engine B rating per player-season)
     seen: set = set()
     deduped = []
     for r in ratings:
-        key = (r["player_season_id"], r["engine"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(r)
+        if r["player_season_id"] in seen:
+            continue
+        seen.add(r["player_season_id"])
+        deduped.append(r)
+    return deduped
 
-    bulk_upsert("ratings", deduped, ["player_season_id", "engine"])
-    print(f"  Upserted {len(deduped)} rows to ratings (engine_b)")
-    return len(deduped)
+
+def merge_into_ratings(new_rows: list[dict]) -> None:
+    """Replace this engine's rows for the affected seasons, keep every other engine."""
+    new_df   = pd.DataFrame(new_rows)
+    existing = read_computed("ratings")
+
+    if not existing.empty:
+        stale = (
+            (existing["engine"] == ENGINE) &
+            (existing["season"].isin(new_df["season"].unique()))
+        )
+        combined = pd.concat([existing[~stale], new_df], ignore_index=True)
+    else:
+        combined = new_df
+
+    write_computed("ratings", combined)
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Engine B ratings -> data/computed/ratings.json")
     parser.add_argument("--season", type=int, action="append", dest="seasons",
                         help="Season to process (default: 2021–2026). Repeatable.")
     args = parser.parse_args()
@@ -225,12 +287,23 @@ def main():
     seasons = args.seasons or list(range(2021, 2027))
     print(f"Engine B: processing seasons {seasons}")
 
-    with get_connection() as conn:
-        total = 0
-        for season in seasons:
-            total += run_season(season, conn)
+    print("Loading local JSON...")
+    player_seasons = read_raw("player_seasons")
+    recruiting_idx = _best_recruiting_by_player(read_raw("recruiting"))
+    nil_idx        = _nil_by_player(read_raw("nil_valuations"))
+    print(f"  {len(player_seasons)} player-seasons, {len(recruiting_idx)} recruits, "
+          f"{len(nil_idx)} NIL valuations")
 
-    print(f"\nDone. Total rows upserted: {total}")
+    all_rows: list[dict] = []
+    for season in seasons:
+        all_rows.extend(run_season(season, player_seasons, recruiting_idx, nil_idx))
+
+    if not all_rows:
+        print("\nNo Engine B ratings computed — nothing written.")
+        return
+
+    merge_into_ratings(all_rows)
+    print(f"\nDone. {len(all_rows)} engine_b rows written to data/computed/ratings.json")
 
 
 if __name__ == "__main__":

@@ -172,9 +172,48 @@ check the data first (contamination, stats mismatch). Only tune weights when the
 
 | Gap | Status | Notes |
 |-----|--------|-------|
-| OL individual differentiation | Future phase | Requires PFF grades or EA Sports OVR; team proxy is best available |
+| OL individual differentiation | Future phase | Requires PFF grades or EA Sports OVR; team proxy is best available. EA CFB 27 ratings now harvested (script 08) — a candidate input once matching coverage is assessed. |
 | Engine B (breakout XGBoost) | Separate project | Lagged 2021–2024 features → 2025 breakout prediction |
 | NIL data | Deferred | Playwright scraper needed; research-only when built |
 | Coaching changes (full) | Deferred | API for HC; manual for OC/DC; not in formula until complete |
 | Per-play opponent quality | Not needed | Per-game opp SP+ is sufficient granularity for this release |
 | Sub-ratings computation | Placeholder | `sub_ratings` column exists; script 06 doesn't populate it yet |
+
+---
+
+## 9. OL / K / P Forced Distribution Curve (fixed 2026-08-10)
+
+**Symptom:** The highest-rated player of the 2015 season was a UL Monroe offensive
+lineman at 99 OVR, ahead of Derrick Henry. 2008's top three were linemen at Florida
+International, San José State, and Utah State. Meanwhile 2025's OL topped out at
+exactly 85.
+
+**Cause:** OL/K/P did not use the fixed EDGE→OVR anchors. They went through
+`scale_to_range()`, which took percentiles *of the pool itself* and mapped
+`p100 → 99` and `p0 → 30`. Somebody is the max of any pool, so somebody was
+always a 99 — the exact "forced distribution curve" the EDGE design rejects.
+
+It broke worst on OL because the OL composite saturates. Its inputs are team
+proxies (team rush YPA, sack rate allowed) plus recruiting, and across 3,306
+pooled starters the composite takes only a handful of distinct values:
+
+```text
+OL composite:  p10=0.325  p50=0.398  p75=0.625  p90=0.625  p99=0.650  max=0.650
+```
+
+With `p90 == p99 == max`, the percentile anchors passed to `np.interp` were
+non-increasing, and every lineman sitting at 0.650 — an entire O-line on any team
+with a good rushing year — resolved to 99.
+
+**Fix:** `COMPOSITE_OVR_ANCHORS` + `composite_to_ovr()` in script 07, replacing
+`scale_to_range()`. Fixed absolute anchors per position, calibrated from the
+pooled composite distribution above, mirroring how EDGE positions map. If nobody
+reaches the top anchor in a season, nobody gets the top rating.
+
+**OL ceiling is 88, not 99, by design.** Team-proxy inputs cannot separate an
+All-American from an average starter on the same line, and the proxy saturates at
+the top. Rating a lineman 99 asserts a precision the inputs do not have.
+
+**Rule going forward:** any position mapped by pool percentile is a bug. Ratings
+are absolute or they are not comparable across seasons — which is the entire
+premise of the cross-era design.

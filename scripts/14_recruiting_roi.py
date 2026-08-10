@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.store import read_raw, read_computed
+from utils.store import read_raw, read_computed, read_ratings
 from utils.json_utils import write_json
 
 OUTPUT_PATH = (
@@ -44,7 +44,9 @@ def main() -> None:
     print("Loading data...")
     recruiting     = read_raw("recruiting")
     player_seasons = read_raw("player_seasons")
-    ratings        = read_computed("ratings")
+    # EDGE only — engine_b ratings are derived FROM recruiting, so counting them
+    # as "did this recruit pan out?" would make every blue-chip a hit by definition.
+    ratings        = read_ratings("edge")
     teams          = read_raw("teams")
 
     if recruiting.empty:

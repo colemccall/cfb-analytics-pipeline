@@ -32,7 +32,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.store import read_raw, read_computed
+from utils.store import read_raw, read_computed, read_ratings
 
 DEFAULT_OUTPUT = Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"
 CURRENT_SEASON = 2026
@@ -126,7 +126,7 @@ def load_tables() -> dict:
         "transfers":      read_raw("transfers"),
         "player_edge":    read_raw("player_edge"),
         "research_cache": read_raw("research_cache"),
-        "ratings":          read_computed("ratings"),
+        "ratings":          read_ratings("edge"),   # engine-filtered: see read_ratings
         "team_ratings":     read_computed("team_ratings"),
         "team_season_stats": read_computed("team_season_stats"),
     }

@@ -21,29 +21,30 @@ The pipeline turns raw college football data into meaningful player and team rat
 cfb-analytics-pipeline/
 ├── scripts/          # ETL and compute scripts (run in order)
 ├── utils/
-│   ├── db.py         # psycopg2 connection with auto-detect (direct + pooler)
+│   ├── store.py      # local JSON read/write — the only persistence layer
 │   ├── api_client.py # CFB Data API wrapper with .cache/ response caching
-│   └── store.py      # bulk_upsert helper with ON CONFLICT DO UPDATE
-├── tests/            # pytest unit tests (no DB or API required)
+│   ├── matching.py   # name→player matching for scraped sources
+│   └── json_utils.py # NaN-safe JSON writing
+├── tests/            # pytest unit tests (no network required)
 ├── data/
-│   ├── raw/          # API harvest output (gitignored)
+│   ├── raw/          # harvest output, one file per entity (gitignored)
 │   ├── computed/     # ratings engine output (gitignored)
 │   └── coaching_changes_seed.csv
-├── sql/              # schema definitions and migrations
+├── archive/sql/      # retired Supabase DDL — reference only, never executed
 └── .cache/           # API response cache by MD5 hash (gitignored)
 ```
 
 ### Key architectural decisions
 
-**psycopg2 only — never Supabase REST for bulk reads.** The REST API has a hard 1,000-row limit. All reads use `utils/db.get_connection()`. The Supabase client in `utils/supabase_client.py` is a reference-only fallback.
-
-**Auto-detecting DB connection.** `utils/db._get_working_url()` tries `DATABASE_URL` (direct/IPv6) first, then `DATABASE_URL_POOLER` (Session Pooler/IPv4), caching the working one for the process lifetime.
+**Local JSON, no database.** Every script reads and writes plain JSON through `utils/store.py` (`read_raw`, `read_computed`, `write_computed`). The project previously ran on Supabase/PostgreSQL; that layer is fully retired, and the only credential required now is a CFB Data API key. The retired DDL lives in `archive/sql/` as field-level documentation, since the JSON files mirror those tables one-to-one.
 
 **API response caching.** Every API response is cached as `.cache/{md5}.json`. Re-runs are near-instant. Never delete unless intentionally re-fetching.
 
 **`player_seasons` is the join anchor.** One row per player × season × team. `stats`, `ratings`, and `player_edge` all join on `player_season_id`. Two players named "John Smith" at different schools are distinct `player_seasons` rows.
 
-**Dedup before every bulk upsert.** `bulk_upsert()` uses `ON CONFLICT DO UPDATE`, which raises `CardinalityViolation` if the same conflict key appears twice in one batch. Always dedup before calling.
+**Strict name matching for scraped sources.** `utils/matching.py` accepts a match only when the name is exact and the school agrees, or the name is exact and unique in our data (which covers players who transferred since their last season). A *fuzzy* name hit always requires school confirmation — "Chaden Sullivan" and "Caden Sullivan" are one edit apart and are different people. `resolve_collisions()` then unmatches rows where two scraped players claim the same player of ours.
+
+**NaN never reaches disk.** `write_computed()` and `write_json()` both scrub NaN, which is invalid JSON and breaks the browser's `fetch().json()`. Note that `DataFrame.where(..., other=None)` does *not* do this on float columns — use the helpers.
 
 ---
 
@@ -61,18 +62,11 @@ pip install -r requirements.txt
 pip install -r requirements.txt --trusted-host pypi.org --trusted-host files.pythonhosted.org
 ```
 
-Copy `.env.example` to `.env` and fill in your credentials:
+Copy `.env.example` to `.env` and add your API key — it is the only credential needed:
 
 ```text
 CFB_API_KEY=...
-DATABASE_URL=postgresql://postgres:...@db.<project>.supabase.co:5432/postgres
-DATABASE_URL_POOLER=postgresql://postgres.<project>:...@aws-1-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require
-SUPABASE_URL=https://<project>.supabase.co
-SUPABASE_ANON_KEY=...
-SUPABASE_SERVICE_KEY=...
 ```
-
-> **Note:** Special characters in passwords must be URL-encoded in both connection strings (`*` → `%2A`, `%` → `%25`, `+` → `%2B`, `/` → `%2F`).
 
 ---
 
@@ -103,11 +97,8 @@ Scripts are numbered by their dependency chain. Run them in this order for a com
 07  Player ratings — Engine A  (requires EDGE from script 06)
     python scripts/07_compute_player_ratings.py --season 2025
 
-08  EA CFB 25 ratings  (requires Selenium)
-    python scripts/08_harvest_ea_cfb25_ratings.py
-
-08b EA CFB 26 ratings  (requires Selenium)
-    python scripts/08b_harvest_ea_cfb26_ratings.py
+08  EA CFB 27 ratings  (plain HTTP — no browser needed)
+    python scripts/08_harvest_ea_cfb27_ratings.py
 
 10  Team ratings  (requires script 07)
     python scripts/10_compute_team_ratings.py --season 2025
@@ -117,7 +108,20 @@ Scripts are numbered by their dependency chain. Run them in this order for a com
 
 12  Export static JSON for frontend  (requires scripts 07, 10)
     python scripts/12_export_frontend_json.py
+
+13  Team performance vs. recruiting talent  (requires scripts 02, 07)
+    python scripts/13_team_performance_evaluator.py
+
+14  Recruiting class ROI / hit rate  (requires scripts 02, 07)
+    python scripts/14_recruiting_roi.py
+
+15  Engine D — next-season OVR prediction  (requires script 07)
+    python scripts/15_predict_trajectories.py
+    python scripts/15_predict_trajectories.py --retrain   # refit the model
 ```
+
+Scripts 13–15 write straight into the frontend's `data/` directory; 12 writes
+the core player/team/roster files. Run 12 before 13–15 on a full refresh.
 
 ---
 
@@ -176,16 +180,16 @@ The `ratings.engine` column supports multiple rating systems per player-season:
 |--------|--------|--------|
 | `edge` | 07 | EDGE formula with opponent adjustment |
 | `engine_b` | 11 | 60% recruiting + 40% NIL valuation |
-| `ea_cfb25` | 08 | EA Sports CFB 25 scraped ratings |
-| `ea_cfb26` | 08b | EA Sports CFB 26 scraped ratings |
+| `ea_cfb27` | 08 | EA Sports CFB 27 ratings (2026 roster) |
 
 ---
 
-## Database Schema Highlights
+## Data Model
 
-All tables live in Supabase (PostgreSQL). Key relationships:
+Each entity is one JSON file (`data/raw/players.json`, `data/computed/ratings.json`, …),
+loaded as a DataFrame by `utils/store.py`. Relationships are by id, joined in pandas:
 
-```
+```text
 players              — identity only (no team, no year, no position)
   └── player_seasons — one row per player × season × team (the join anchor)
         ├── stats          — JSONB per game and season aggregate
@@ -196,11 +200,13 @@ transfers            — references player_id; team-gated fuzzy name matching
 plays                — raw play-by-play; player attribution via passer/rusher/receiver/defender IDs
 team_ratings         — OVR + sub-scores (pass_off, run_off, pass_def, run_def, special_teams)
 coaching_changes     — HC/OC/DC/ST roles with from/to school and year
+ea_ratings           — EA CFB 27 ratings, 54 attributes per player, linked to player_id
+nil_valuations       — On3 NIL values (currently empty — On3 blocks scraping)
 ```
 
-`stats.data` is JSONB — keys follow CFB Data API naming (`passingYds`, `rushingCar`, `defensiveTot`, etc.).
+`stats.data` is a nested dict — keys follow CFB Data API naming (`passingYds`, `rushingCar`, `defensiveTot`, etc.).
 
-`ratings.shap_values` is JSONB stored as a JSON string (`json.dumps({})`).
+`ratings.shap_values` is a JSON *string* (`json.dumps({})`), not a nested object.
 
 ---
 
@@ -229,13 +235,14 @@ pytest tests/ -v
 | `data/computed/` | Ratings engine output | No |
 | `data/coaching_changes_seed.csv` | Historical coaching data seed file | Yes |
 | `.cache/` | API response cache keyed by MD5 hash | No |
-| `sql/` | Schema definitions and migration scripts | Yes |
+| `archive/sql/` | Retired Supabase DDL, reference only | Yes |
 
 ---
 
 ## Notes
 
-- Script 04 (NIL) and scripts 08/08b (EA ratings) require Selenium + Chrome. All other scripts are headless.
+- Scripts 04 (On3 NIL) and 05 (ESPN coaching tracker) require Selenium + Chrome. Everything else runs over plain HTTP — script 08 reads EA's Next.js data route (`/_next/data/{buildId}/…/ratings.json?team=N`) directly, no browser needed.
+- On3 actively blocks scraping, so `nil_valuations.json` is empty and Engine B (script 11) runs recruiting-only until a working NIL source lands.
 - Script 01 with `--historical` fetches 2008–2020 data. Plays are the largest payload (~40k per season) and fetched last.
 - If you add a new season, re-run scripts 01 → 06 → 07 → 10 → 12 in order.
-- Transfer matching (script 03) requires `from_school` to match a `player_seasons` row — ambiguous name matches return `None` rather than guessing.
+- Transfer matching (script 03) requires `from_school` to match a `player_seasons` row — ambiguous name matches return `None` rather than guessing. Scraped-source matching (scripts 04, 08) uses the shared rules in `utils/matching.py`.

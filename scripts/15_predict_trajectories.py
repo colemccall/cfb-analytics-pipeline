@@ -3,7 +3,13 @@
 Trains an XGBoost regressor on historical player seasons (2008–2022) to
 predict next-season OVR. Produces predicted_ovr, trajectory_label
 (breakout / steady / decline), and the top SHAP feature driving each
-prediction for 2025-season players.
+prediction.
+
+Predictions are made FROM the most recent season we have data for, FOR the
+season after it — so with data through 2025, players' 2025 rows predict their
+2026 OVR. The source season is derived from the data rather than hardcoded
+(override with --predict-season); a hardcoded constant silently predicts nothing
+the moment it runs ahead of the harvest.
 
 Only skill positions with EDGE scores are modeled (QB/RB/WR/TE/DL/LB/DB).
 OL/K/P excluded — their ratings lack individual play attribution.
@@ -13,11 +19,12 @@ Data inputs (local JSON):
 
 Outputs:
   data/models/engine_d.json               (trained XGBoost model artifact)
-  cfb-analytics-app/data/trajectory.json  (predictions for 2025 roster)
+  cfb-analytics-app/data/trajectory.json  (predictions for the upcoming season)
 
 Usage:
     python scripts/15_predict_trajectories.py
     python scripts/15_predict_trajectories.py --retrain
+    python scripts/15_predict_trajectories.py --predict-season 2024
 """
 
 import argparse
@@ -30,7 +37,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.store import read_raw, read_computed
+from utils.store import read_raw, read_computed, read_ratings
 from utils.json_utils import write_json
 
 MODEL_PATH = Path(__file__).parent.parent / "data" / "models" / "engine_d.json"
@@ -41,7 +48,8 @@ OUTPUT_PATH = (
 
 TRAIN_SEASONS  = range(2008, 2023)   # 2008–2022 for training
 TEST_SEASONS   = range(2023, 2025)   # 2023–2024 held out for evaluation
-PREDICT_SEASON = 2026                # predict 2027 OVR for these players
+# Prediction source season defaults to the latest season present in the data —
+# see --predict-season.
 
 SKILL_POSITIONS = {"QB", "RB", "WR", "TE", "DL", "LB", "DB"}
 POS_ENC = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "DL": 4, "LB": 5, "DB": 6}
@@ -161,9 +169,6 @@ def build_dataset(ratings_df, player_seasons_df, player_edge_df,
     # pid+season → OVR (for next-season target)
     pid_season_ovr: dict = {}
     for _, row in ratings_df.iterrows():
-        engine = row.get("engine", "edge") or "edge"
-        if engine != "edge":
-            continue
         psid = row.get("player_season_id")
         ovr  = row.get("overall_rating")
         if psid is None or ovr is None:
@@ -178,9 +183,6 @@ def build_dataset(ratings_df, player_seasons_df, player_edge_df,
     print("  Building feature rows...")
     rows = []
     for _, row in ratings_df.iterrows():
-        engine = row.get("engine", "edge") or "edge"
-        if engine != "edge":
-            continue
         psid = row.get("player_season_id")
         ovr  = row.get("overall_rating")
         traj = row.get("trajectory_score")
@@ -286,10 +288,12 @@ def get_shap_top_features(model, X: np.ndarray) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Engine D — XGBoost trajectory predictor")
     parser.add_argument("--retrain", action="store_true", help="Force retrain even if model exists")
+    parser.add_argument("--predict-season", type=int, default=None,
+                        help="Season to predict FROM (default: latest season in the data)")
     args = parser.parse_args()
 
     print("Loading data...")
-    ratings_df        = read_computed("ratings")
+    ratings_df        = read_ratings("edge")
     player_seasons_df = read_raw("player_seasons")
     player_edge_df    = read_raw("player_edge")
     recruiting_df     = read_raw("recruiting")
@@ -311,12 +315,15 @@ def main() -> None:
         print("ERROR: no rows built — check data files")
         return
 
+    predict_season = args.predict_season or int(df["season"].max())
+
     df_has_target = df[df["next_season_ovr"].notna()].copy()
     df_train = df_has_target[df_has_target["season"].isin(TRAIN_SEASONS)]
     df_test  = df_has_target[df_has_target["season"].isin(TEST_SEASONS)]
-    df_pred  = df[df["season"] == PREDICT_SEASON].copy()
+    df_pred  = df[df["season"] == predict_season].copy()
 
-    print(f"  Train: {len(df_train)}  |  Test: {len(df_test)}  |  Predict(2025): {len(df_pred)}")
+    print(f"  Train: {len(df_train)}  |  Test: {len(df_test)}  |  "
+          f"Predict(from {predict_season}): {len(df_pred)}")
 
     if len(df_train) < 100:
         print("ERROR: insufficient training data (< 100 rows)")
@@ -342,10 +349,11 @@ def main() -> None:
         evaluate_model(model, df_test)
 
     if df_pred.empty:
-        print(f"WARNING: no {PREDICT_SEASON} rows to predict — run script 01 --season {PREDICT_SEASON} first")
+        print(f"WARNING: no {predict_season} rows to predict - run "
+              f"script 01 --season {predict_season} first")
         return
 
-    print(f"Predicting {PREDICT_SEASON + 1} OVR...")
+    print(f"Predicting {predict_season + 1} OVR from {predict_season} production...")
     X_pred = df_pred[FEATURE_COLS].values.astype(float)
     preds  = np.clip(model.predict(X_pred), 40, 99)
 

@@ -9,7 +9,7 @@ Rating architecture:
     Recruiting/NIL only for players below the stats_measured threshold.
 
   Non-EDGE positions (OL, K, P):
-    Stat-only composite with fixed absolute bounds, mapped via scale_to_range().
+    Stat-only composite with fixed absolute bounds, mapped via composite_to_ovr().
 
   EDGE_OVR_ANCHORS: fixed piecewise linear mapping from edge_score → OVR.
     Anchors are calibrated from known reference seasons and 2025 distributions.
@@ -102,7 +102,7 @@ EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "EDGE", "DL", "LB", "CB", "S", "DB"}
 ALL_SEASONS = list(range(2008, 2027))
 
 # ---------------------------------------------------------------------------
-# EDGE → OVR direct mapping (replaces weighted composite + scale_to_range
+# EDGE → OVR direct mapping (replaces weighted composite + percentile scaling
 # for all EDGE_POSITIONS)
 #
 # Piecewise linear: (edge_score, target_ovr) anchor pairs per position.
@@ -983,7 +983,7 @@ def compute_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
     """Stat-composite rating for non-EDGE positions (OL, K, P).
 
     Normalizes features via fixed absolute bounds and returns composite [0–1].
-    Call scale_to_range() on the result to convert to [30–99].
+    Call composite_to_ovr(scores, pg) on the result to convert to [30–99].
     """
     final_scores   = []
     final_contribs = []
@@ -1008,29 +1008,45 @@ def compute_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
 # so a G5 conference label would double-penalize what the model already handles.
 # For stat-only positions (WR/TE/OL/DL/LB/DB), raw counting stats don't carry
 # opponent context, so a modest discount still applies.
-def scale_to_range(scores: np.ndarray, low=30, high=99) -> np.ndarray:
-    """Map composite scores (0-1) to rating range via piecewise linear interpolation.
+# Composite → OVR anchors for the stat-only positions (OL / K / P).
+#
+# These are FIXED absolute anchors, matching how EDGE positions map through
+# EDGE_OVR_ANCHORS. They replace a percentile scaling that mapped whatever
+# happened to top the pool to 99 and whatever sat at the bottom to 30 — a forced
+# curve that guaranteed a 99 every season regardless of absolute quality.
+#
+# Calibrated from the pooled 2008-2025 starter composites:
+#   OL: p10=0.325  p50=0.398  p75=0.625  p90=0.625  max=0.650
+#   K : p10=0.170  p50=0.416  p75=0.531  p90=0.624  p99=0.689  max=0.707
+#   P : p10=0.289  p50=0.478  p75=0.583  p90=0.695  p99=0.854  max=0.980
+#
+# OL tops out at 88, deliberately below the skill-position ceiling: its inputs
+# are team proxies (team rush YPA, sack rate allowed) plus recruiting, which
+# cannot separate an All-American from an average starter on the same line.
+# Those proxies also saturate — the top ~10% of linemen share one composite
+# value — so a 99 would be an accuracy claim the inputs do not support.
+COMPOSITE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
+    "OL": [(0.00, 30), (0.25, 45), (0.325, 55), (0.40, 65),
+           (0.50, 72), (0.625, 80), (0.65, 88)],
+    "K":  [(0.00, 30), (0.05, 35), (0.17, 45), (0.28, 55), (0.42, 65),
+           (0.53, 75), (0.62, 84), (0.69, 92), (0.75, 96)],
+    "P":  [(0.00, 30), (0.05, 35), (0.29, 48), (0.38, 57), (0.48, 65),
+           (0.58, 75), (0.70, 85), (0.85, 93), (1.00, 97)],
+}
 
-    Uses the actual distribution of the all-season pool to compute percentile anchors,
-    then maps them to target rating targets. Because the pool is all seasons combined
-    (2021-2025), percentiles are absolute — a player's rating doesn't change based on
-    who else played the same year. A weak class will produce fewer high ratings.
 
-    Target distribution:
-      p10 → 40  (marginal starter)
-      p50 → 65  (average starter)
-      p75 → 77  (solid starter)
-      p90 → 85  (excellent)
-      p99 → 93  (elite/generational)
+def composite_to_ovr(scores: np.ndarray, pg: str, low=30, high=99) -> np.ndarray:
+    """Map stat-only composites [0-1] to OVR through fixed per-position anchors.
+
+    Absolute, not relative: if nobody reaches the top anchor in a given season,
+    nobody gets the top rating — the same guarantee EDGE positions have.
     """
-    if len(scores) < 5:
+    anchors = COMPOSITE_OVR_ANCHORS.get(pg)
+    if anchors is None:
         return np.full(len(scores), 65.0)
-    if np.std(scores) < 1e-9:
-        return np.full(len(scores), 65.0)
-
-    pct_vals = np.percentile(scores, [0, 10, 50, 75, 90, 99, 100])
-    targets  = [float(low), 40.0, 65.0, 77.0, 85.0, 93.0, float(high)]
-    result = np.interp(scores, pct_vals, targets)
+    xs = [a[0] for a in anchors]
+    ys = [float(a[1]) for a in anchors]
+    result = np.interp(np.asarray(scores, dtype=float), xs, ys)
     return np.clip(result, low, high).round(2)
 
 
@@ -1260,10 +1276,10 @@ def rate_position(season: int, pg: str) -> list[dict]:
                 p = np.percentile(edge_ovrs, [10, 25, 50, 75, 90, 99])
                 print(f"\n    [edge OVR] p10={p[0]:.1f} p25={p[1]:.1f} p50={p[2]:.1f} p75={p[3]:.1f} p90={p[4]:.1f} p99={p[5]:.1f}", end=" ")
         else:
-            # --- Stat composite + scale_to_range for OL/K/P ---
+            # --- Stat composite + fixed anchors for OL/K/P ---
             raw_scores, contribs = compute_ratings(all_starter_df, pg)
             discounted = apply_conference_discount(raw_scores, all_starter_df, pg=pg)
-            scaled = scale_to_range(discounted)
+            scaled = composite_to_ovr(discounted, pg)
 
         for i, rkey in enumerate(all_starter_df.index):
             if scaled[i] > 0:   # 0.0 = no EDGE data → let fallback handle it

@@ -1,4 +1,4 @@
-"""Scrape ESPN coaching changes + load seed CSV → upsert to coaching_changes table.
+"""Scrape ESPN coaching changes + load seed CSV → data/raw/coaching_changes.json.
 
 Two data sources:
   1. Seed CSV  — historical data (pre-2024), always loaded first
@@ -9,6 +9,7 @@ Usage:
     python scripts/05_load_coaching_changes.py --csv-only    # seed CSV only
     python scripts/05_load_coaching_changes.py --espn-only   # ESPN scrape only
     python scripts/05_load_coaching_changes.py --csv data/my.csv  # custom CSV path
+    python scripts/05_load_coaching_changes.py --espn-url https://...  # newer tracker article
 """
 
 import argparse
@@ -20,16 +21,16 @@ import sys
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
-load_dotenv()
 
-from utils.db import bulk_upsert, get_connection
+from utils.json_utils import write_json
+from utils.store import read_raw, RAW_DIR
 
 DEFAULT_CSV = Path(__file__).parent.parent / "data" / "coaching_changes_seed.csv"
+OUTPUT      = RAW_DIR / "coaching_changes.json"
 
-# 2024-25 coaching carousel tracker
+# ESPN publishes one tracker article per carousel; this is the 2024-25 one.
+# Pass --espn-url to point at a newer cycle without editing the script.
 ESPN_URL = "https://www.espn.com/college-football/story/_/id/38866719/college-football-coaching-changes-tracker-2024-25"
 
 SLEEP_SEC = 2.0
@@ -84,10 +85,12 @@ def _make_driver():
 
 def build_team_index() -> dict:
     """Return {school_lower: team_id}."""
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, school FROM teams")
-        return {school.lower().strip(): tid for tid, school in cur.fetchall()}
+    teams = read_raw("teams")
+    if teams.empty:
+        return {}
+    return {str(r["school"]).lower().strip(): int(r["id"])
+            for _, r in teams.iterrows()
+            if r.get("school") and r.get("id") is not None}
 
 
 def match_team(name: str, team_index: dict, threshold: float = 0.80) -> int | None:
@@ -142,7 +145,7 @@ def load_seed_csv(csv_path: Path, team_index: dict) -> list[dict]:
 # Source 2: ESPN coaching tracker (Selenium)
 # ---------------------------------------------------------------------------
 
-def scrape_espn_coaching(team_index: dict) -> list[dict]:
+def scrape_espn_coaching(team_index: dict, espn_url: str = ESPN_URL) -> list[dict]:
     """
     Scrape ESPN coaching changes tracker article.
     Article uses <h2>/<h3> headings per team, <p>/<li> for coach entries.
@@ -152,12 +155,12 @@ def scrape_espn_coaching(team_index: dict) -> list[dict]:
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 
-    print(f"  Loading: {ESPN_URL}")
+    print(f"  Loading: {espn_url}")
     driver = _make_driver()
     rows = []
 
     try:
-        driver.get(ESPN_URL)
+        driver.get(espn_url)
         try:
             WebDriverWait(driver, PAGE_LOAD_WAIT).until(
                 EC.presence_of_element_located(
@@ -253,12 +256,17 @@ def _parse_espn_coach_line(text: str, team_id: int) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Upsert
+# Save to local JSON
 # ---------------------------------------------------------------------------
 
-def upsert_coaching(rows: list[dict]) -> None:
+def _key(row: dict) -> tuple:
+    return (row.get("team_id"), row.get("coach_name"), row.get("role"), row.get("start_season"))
+
+
+def save_coaching(rows: list[dict]) -> None:
+    """Merge into data/raw/coaching_changes.json, keyed like the old upsert."""
     if not rows:
-        print("  No rows to upsert.")
+        print("  No rows to save.")
         return
 
     valid = [r for r in rows if r.get("coach_name") and r.get("role") and r.get("team_id")]
@@ -266,17 +274,30 @@ def upsert_coaching(rows: list[dict]) -> None:
     if skipped:
         print(f"  Skipped {skipped} rows missing required fields")
 
-    # Dedup by conflict key
-    seen: set = set()
-    deduped = []
-    for r in valid:
-        key = (r["team_id"], r["coach_name"], r["role"], r.get("start_season"))
-        if key not in seen:
-            seen.add(key)
-            deduped.append(r)
+    existing_df = read_raw("coaching_changes")
+    merged: dict = {}
+    if not existing_df.empty:
+        for r in existing_df.to_dict("records"):
+            merged[_key(r)] = r
 
-    bulk_upsert("coaching_changes", deduped, ["team_id", "coach_name", "role", "start_season"])
-    print(f"  Upserted {len(deduped)} coaching change rows")
+    next_id = max((r.get("id") or 0 for r in merged.values()), default=0) + 1
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    added = 0
+    for r in valid:
+        key = _key(r)
+        row = dict(r)
+        row["updated_at"] = now
+        if key in merged:
+            row["id"] = merged[key].get("id")
+        else:
+            row["id"] = next_id
+            next_id += 1
+            added += 1
+        merged[key] = row
+
+    write_json(OUTPUT, list(merged.values()))
+    print(f"  Saved {len(merged)} coaching change rows ({added} new)")
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +305,12 @@ def upsert_coaching(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Coaching changes -> data/raw/coaching_changes.json")
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
     parser.add_argument("--csv-only", action="store_true", help="Skip ESPN scrape")
     parser.add_argument("--espn-only", action="store_true", help="Skip seed CSV")
+    parser.add_argument("--espn-url", default=ESPN_URL,
+                        help="Tracker article to scrape (default: 2024-25 carousel)")
     args = parser.parse_args()
 
     print("Building team index...")
@@ -307,12 +330,12 @@ def main():
 
     if not args.csv_only:
         print("Scraping ESPN coaching changes tracker...")
-        espn_rows = scrape_espn_coaching(team_index)
+        espn_rows = scrape_espn_coaching(team_index, args.espn_url)
         print(f"  {len(espn_rows)} rows from ESPN")
         all_rows.extend(espn_rows)
 
     print(f"Total: {len(all_rows)} coaching change rows")
-    upsert_coaching(all_rows)
+    save_coaching(all_rows)
     print("Done.")
 
 

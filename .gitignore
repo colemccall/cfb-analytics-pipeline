@@ -20,7 +20,7 @@ output/
 # API response cache
 .cache/
 
-# Local data store (Supabase dump + computed outputs)
+# Local data store (harvest + computed outputs)
 data/raw/
 data/computed/
 
