@@ -17,6 +17,15 @@ BASE_URL = "https://api.collegefootballdata.com"
 # Cache lives next to the pipeline root, not next to this file
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", ".cache")
 
+# TLS verification is on. It was previously hardcoded off to work around a cert
+# failure on some Windows venvs; that no longer reproduces (the chain validates
+# against certifi). If you hit SSLError behind a corporate proxy that rewrites
+# certificates, prefer pointing requests at your proxy's CA bundle:
+#     REQUESTS_CA_BUNDLE=/path/to/corp-ca.pem
+# and only as a last resort set CFB_API_INSECURE=1, which disables verification
+# for this process.
+VERIFY_TLS = os.getenv("CFB_API_INSECURE", "").strip() not in ("1", "true", "True")
+
 
 def load_api_key() -> str:
     """Load CFB_API_KEY from .env. Raises RuntimeError if missing."""
@@ -64,7 +73,7 @@ def _get(api_key: str, path: str, params: dict | None = None, retries: int = 5) 
             headers=_headers(api_key),
             params=params,
             timeout=30,
-            verify=False,  # SSL cert validation disabled — CFB Data API cert fails on some Windows venvs; safe for this read-only endpoint
+            verify=VERIFY_TLS,
         )
         if resp.status_code == 429:
             wait = 5 * (2**attempt)  # 5, 10, 20, 40, 80s
