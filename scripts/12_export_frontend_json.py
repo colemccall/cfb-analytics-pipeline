@@ -3,17 +3,33 @@
 Reads from data/raw/ (API harvest) and data/computed/ (ratings engine output).
 No database required.
 
-Exports:
-  players.json              — all rated players (ratings, SHAP, recruiting, team)
-  teams.json                — all teams with avg rating, player count
-  team_ratings.json         — team OVR + sub-score splits
-  ratings_by_position.json  — top 50 per position group
-  similar_players_{season}.json — precomputed z-score similarity (OVR >= 55, per season)
-  rosters.json              — all team rosters by season  {team_id: {season: [...]}}
-  schedules.json            — all games by team/season    {team_id: {season: [...]}}
-  transfers.json            — all portal moves by team    {team_id: [...]}
+Every per-season file is written per season — there are no season-agnostic
+players/rosters/schedules blobs. Earlier versions wrote both; the bare copies
+were stale duplicates with no consumers and have been deleted.
+
+Seasons that have not been played carry engine="projected" ratings from script
+16 instead of engine="edge". ratings_for() picks the right frame per season, and
+every projected row exports provenance/projection_source/projection_confidence
+/projection_low/projection_high/ea_ovr so the UI cannot render a projection as
+an earned number.
+
+Exports (season-agnostic):
+  teams.json                — all teams with conference, colors, logo
+  team_ratings.json         — team OVR + sub-score splits, all seasons
   team_history.json         — year-by-year progression    {team_id: [{season,...}]}
+  player_transfers.json     — portal moves keyed by player
+  ea_ratings_{season}.json  — EA CFB 27 overalls, slimmed (cross-check column)
+  manifest.json             — seasons, last_played_season, projected_seasons
   research/index.json       — published findings index
+
+Exports (per season):
+  players_{season}.json     — rated players (ratings, SHAP, recruiting, team, stats)
+  rosters_{season}.json     — team rosters            {team_id: [...]}
+  schedules_{season}.json   — games by team           {team_id: [...]}
+  transfers_{season}.json   — portal moves by team    {team_id: [...]}
+  ratings_by_position_{season}.json — top 50 per position group
+  similar_players_{season}.json     — precomputed z-score similarity (OVR >= 55)
+  team_stats_{season}.json  — per-game team metrics
 
 Usage:
     python scripts/12_export_frontend_json.py
@@ -26,6 +42,7 @@ import json
 import math
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -127,6 +144,12 @@ def load_tables() -> dict:
         "player_edge":    read_raw("player_edge"),
         "research_cache": read_raw("research_cache"),
         "ratings":          read_ratings("edge"),   # engine-filtered: see read_ratings
+        # Seasons that have not been played have no earned ratings at all; their
+        # numbers come from script 16 under engine="projected". Kept as a
+        # separate frame so a projected rating can never be silently mixed into
+        # an earned season's export.
+        "ratings_projected": read_ratings("projected"),
+        "ea_ratings":       read_raw("ea_ratings"),
         "team_ratings":     read_computed("team_ratings"),
         "team_season_stats": read_computed("team_season_stats"),
     }
@@ -135,12 +158,29 @@ def load_tables() -> dict:
     return t
 
 
+def is_projected_season(T: dict, season: int) -> bool:
+    """True when a season's ratings come from the projection engine.
+
+    Derived from the data rather than a constant, so the app cannot drift out of
+    step with what the pipeline actually produced.
+    """
+    rp = T.get("ratings_projected")
+    if rp is None or rp.empty:
+        return False
+    return bool((rp["season"] == season).any())
+
+
+def ratings_for(T: dict, season: int) -> pd.DataFrame:
+    """The rating frame that applies to a season — projected or earned."""
+    return T["ratings_projected"] if is_projected_season(T, season) else T["ratings"]
+
+
 # ---------------------------------------------------------------------------
 # Export: players.json
 # ---------------------------------------------------------------------------
 
 def export_players(T: dict, output_dir: Path, season: int) -> None:
-    rat = T["ratings"]
+    rat = ratings_for(T, season)
     ps  = T["player_seasons"]
     pl  = T["players"]
     tm  = T["teams"]
@@ -260,6 +300,14 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
             "games_played":     _i(row.get("games_played")),
             "stats_season":     row.get("stats_season") if isinstance(row.get("stats_season"), dict) else None,
             "stats_postseason": row.get("stats_postseason") if isinstance(row.get("stats_postseason"), dict) else None,
+            # Provenance travels with the rating so the UI can never render a
+            # projection as an earned number. Null on played seasons.
+            "provenance":            row.get("provenance"),
+            "projection_source":     row.get("projection_source"),
+            "projection_confidence": row.get("projection_confidence"),
+            "projection_low":        _f(row.get("projection_low")),
+            "projection_high":       _f(row.get("projection_high")),
+            "ea_ovr":                _f(row.get("ea_ovr")),
         })
 
     players.sort(key=lambda p: p["overall_rating"] or 0, reverse=True)
@@ -272,7 +320,7 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
 
 def export_teams(T: dict, output_dir: Path, season: int) -> None:
     tm  = T["teams"]
-    rat = T["ratings"]
+    rat = ratings_for(T, season)
     ps  = T["player_seasons"]
 
     if tm.empty:
@@ -373,7 +421,7 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
 # ---------------------------------------------------------------------------
 
 def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
-    rat = T["ratings"]
+    rat = ratings_for(T, season)
     ps  = T["player_seasons"]
     pl  = T["players"]
     tm  = T["teams"]
@@ -616,7 +664,7 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
 def export_rosters(T: dict, output_dir: Path, season: int) -> None:
     ps  = T["player_seasons"]
     pl  = T["players"]
-    rat = T["ratings"]
+    rat = ratings_for(T, season)
     rec = T["recruiting"]
 
     if ps.empty:
@@ -632,8 +680,15 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
                         left_on="player_id", right_on="pl_id", how="left")
 
     if not rat.empty:
-        ratings_season = rat[rat["season"] == season][["player_season_id", "overall_rating",
-                     "trajectory_score", "breakout_probability", "shap_values"]].copy()
+        # Projection columns only exist on the projected engine, so select them
+        # conditionally — omitting them here silently exported every projected
+        # roster row with a null source and no EA cross-check.
+        want = ["player_season_id", "overall_rating", "trajectory_score",
+                "breakout_probability", "shap_values",
+                "provenance", "projection_source", "projection_confidence",
+                "projection_low", "projection_high", "ea_ovr"]
+        cols = [c for c in want if c in rat.columns]
+        ratings_season = rat[rat["season"] == season][cols].copy()
         merged = merged.merge(ratings_season, left_on="id", right_on="player_season_id",
                               how="left", suffixes=("", "_rat"))
 
@@ -676,6 +731,12 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
             "stars":            _i(row.get("rec_stars")),
             "composite_score":  _f(row.get("rec_composite")),
             "edge_score":       _f(row.get("edge_score")),
+            "provenance":            row.get("provenance"),
+            "projection_source":     row.get("projection_source"),
+            "projection_confidence": row.get("projection_confidence"),
+            "projection_low":        _f(row.get("projection_low")),
+            "projection_high":       _f(row.get("projection_high")),
+            "ea_ovr":                _f(row.get("ea_ovr")),
         })
 
     for tid in rosters:
@@ -687,35 +748,6 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
 # ---------------------------------------------------------------------------
 # Export: schedules.json
 # ---------------------------------------------------------------------------
-
-def _build_fcs_name_map() -> dict:
-    """Build {cfb_api_id: team_name} from cached API game responses for FCS lookup."""
-    cache_dir = Path(__file__).parent.parent / ".cache"
-    id_to_name: dict = {}
-    if not cache_dir.exists():
-        return id_to_name
-    for f in cache_dir.glob("*.json"):
-        try:
-            with open(f) as fp:
-                data = json.load(fp)
-            if not isinstance(data, list) or not data:
-                continue
-            first = data[0]
-            if not isinstance(first, dict) or "homeTeam" not in first:
-                continue
-            for g in data:
-                hid = g.get("homeId")
-                aid = g.get("awayId")
-                ht  = g.get("homeTeam")
-                at  = g.get("awayTeam")
-                if hid and ht:
-                    id_to_name[int(hid)] = ht
-                if aid and at:
-                    id_to_name[int(aid)] = at
-        except Exception:
-            continue
-    return id_to_name
-
 
 def export_schedules(T: dict, output_dir: Path, season: int) -> None:
     games = T["games"]
@@ -730,12 +762,17 @@ def export_schedules(T: dict, output_dir: Path, season: int) -> None:
         return
 
     tm_map = dict(zip(teams["id"], teams["school"])) if not teams.empty else {}
-    # Supplement with FCS team names from API cache
-    fcs_map = _build_fcs_name_map()
-    def _team_name(tid):
-        if tid is None:
-            return None
-        return tm_map.get(tid) or fcs_map.get(tid) or f"FCS opponent"
+
+    def _team_name(tid, stored_name):
+        """Resolve an opponent, falling back to the name harvested with the game.
+
+        FCS opponents have no row in our teams table, so tid is None for them.
+        The name harvested alongside the game is what keeps them from rendering
+        as "TBD" — they are known opponents, just not rated ones.
+        """
+        if tid is not None and tm_map.get(tid):
+            return tm_map[tid]
+        return stored_name or None
 
     schedules: dict = {}
 
@@ -754,7 +791,11 @@ def export_schedules(T: dict, output_dir: Path, season: int) -> None:
                 continue  # skip games where this side has no known team_id
             tid        = str(team_id_val)
             opp_id     = away_id if is_home else home_id
-            opponent   = _team_name(opp_id)
+            opp_name   = g.get("away_team_name") if is_home else g.get("home_team_name")
+            opponent   = _team_name(opp_id, opp_name)
+            # An opponent with no id of ours is FCS (or otherwise unrated); the
+            # UI needs to know not to try linking it to a team page.
+            opp_is_fbs = opp_id is not None and opp_id in tm_map
             team_score = home_sc if is_home else away_sc
             opp_score  = away_sc if is_home else home_sc
             # Result: if opp_score is null but team_score exists, treat opp as 0 (FCS game)
@@ -772,6 +813,7 @@ def export_schedules(T: dict, output_dir: Path, season: int) -> None:
                 "is_home":      is_home,
                 "neutral_site": bool(g.get("neutral_site")),
                 "opponent":     opponent,
+                "opp_is_fbs":   opp_is_fbs,
                 "team_score":   team_score,
                 "opp_score":    opp_score,
                 "result":       result,
@@ -1040,6 +1082,78 @@ def export_player_transfers(T: dict, output_dir: Path) -> None:
 # Export: research/index.json
 # ---------------------------------------------------------------------------
 
+def export_ea_ratings(T: dict, output_dir: Path) -> None:
+    """EA CFB 27 overalls, slimmed to what the side-by-side needs.
+
+    The raw table carries 54 attributes per player (12 MB). Nothing in the UI
+    reads them yet, so only the identifying fields and the overall ship.
+    """
+    ea = T.get("ea_ratings")
+    if ea is None or ea.empty:
+        print("  ea_ratings: none on file — skipping")
+        return
+
+    tm = T["teams"]
+    ps = T["player_seasons"]
+    # EA's team names are its own; map through our player_seasons where matched
+    # so the frontend can group by the same team_id it uses everywhere else.
+    season = int(ea["ea_season"].max()) if "ea_season" in ea.columns else None
+    tid_by_pid = {}
+    if season is not None and not ps.empty:
+        for r in ps[ps["season"] == season].itertuples(index=False):
+            if pd.notna(r.player_id) and pd.notna(r.team_id):
+                tid_by_pid[int(r.player_id)] = int(r.team_id)
+    school_by_tid = dict(zip(tm["id"], tm["school"])) if not tm.empty else {}
+
+    rows = []
+    for r in ea.itertuples(index=False):
+        pid = _i(getattr(r, "player_id", None))
+        tid = tid_by_pid.get(pid) if pid else None
+        rows.append({
+            "ea_player_id": _i(getattr(r, "ea_player_id", None)),
+            "player_id":    pid,
+            "name":         getattr(r, "name", None),
+            "team_id":      tid,
+            "team":         school_by_tid.get(tid) or getattr(r, "ea_team", None),
+            "position":     getattr(r, "position", None),
+            "class_year":   getattr(r, "class_year", None),
+            "ovr":          _i(getattr(r, "ovr", None)),
+        })
+    rows.sort(key=lambda x: x["ovr"] or 0, reverse=True)
+    name = f"ea_ratings_{season}.json" if season else "ea_ratings.json"
+    write_json(output_dir / name, rows)
+
+
+def export_manifest(T: dict, output_dir: Path) -> None:
+    """One source of truth for which seasons exist and which are projected.
+
+    The frontend previously hardcoded its own CURRENT_SEASON, which drifted from
+    the pipeline's (2025 vs 2026). A contract test asserts these agree.
+
+    Always describes EVERY season on disk, never just the subset this run
+    exported — a `--season 2026` run once rewrote the manifest as
+    first_season=2026, which would have told the frontend that eighteen seasons
+    of data did not exist.
+    """
+    seasons = sorted(int(p.stem.split("_")[-1]) for p in output_dir.glob("players_*.json"))
+    if not seasons:
+        seasons = list(ALL_SEASONS)
+    projected = sorted(s for s in seasons if is_projected_season(T, s))
+    played = [s for s in seasons if s not in projected]
+    manifest = {
+        "generated_at":       datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "first_season":       min(seasons),
+        "last_played_season": max(played) if played else max(seasons),
+        "current_season":     max(seasons),
+        "projected_seasons":  projected,
+        "seasons":            sorted(seasons),
+    }
+    write_json(output_dir / "manifest.json", manifest)
+    print(f"    first={manifest['first_season']} "
+          f"last_played={manifest['last_played_season']} "
+          f"current={manifest['current_season']} projected={projected}")
+
+
 def export_research(T: dict, output_dir: Path) -> None:
     rc = T["research_cache"]
     research_dir = output_dir / "research"
@@ -1115,6 +1229,12 @@ def main():
 
     print("player_transfers.json...")
     export_player_transfers(T, output_dir)
+
+    print("ea_ratings_{season}.json...")
+    export_ea_ratings(T, output_dir)
+
+    print("manifest.json...")
+    export_manifest(T, output_dir)
 
     print("research/...")
     export_research(T, output_dir)

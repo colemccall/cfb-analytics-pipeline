@@ -241,6 +241,39 @@ def upsert_teams(teams_raw: list) -> dict:
 # Players + player_seasons
 # ---------------------------------------------------------------------------
 
+def _dedupe_player_seasons(rows: list) -> list:
+    """A player plays for exactly one team in a season. Enforce it.
+
+    The upsert is keyed on (player_id, season, team_id) and only ever adds, so a
+    re-harvest that returns a corrected team leaves the OLD row in place forever.
+    That is how Chris Marshall ended up listed at Boise State and Texas A&M in
+    the same season, and how 6,999 rows from an early harvest survived a later,
+    correct one — 4,121 players with contaminated histories, which silently
+    double-counts rosters and corrupts any career trajectory built across them.
+
+    Keep the most recently written row per (player_id, season); drop the rest.
+    """
+    from collections import defaultdict as _dd
+    by_key = _dd(list)
+    for r in rows:
+        by_key[(r.get("player_id"), r.get("season"))].append(r)
+
+    kept, dropped = [], 0
+    for (pid, seas), group in by_key.items():
+        if len(group) == 1 or pid is None or seas is None:
+            kept.extend(group)
+            continue
+        # Newest wins; rows with no timestamp are from the current run.
+        group.sort(key=lambda r: (r.get("updated_at") or "9999"), reverse=True)
+        kept.append(group[0])
+        dropped += len(group) - 1
+
+    if dropped:
+        print(f"  Dropped {dropped} stale duplicate player_seasons "
+              f"(same player, same season, different team)")
+    return kept
+
+
 def upsert_players_and_seasons(rosters_by_team: dict, team_id_map: dict, season: int) -> tuple[dict, dict]:
     """Upsert players and player_seasons. Returns (cfb_api_id->db_id, player_id->ps_id)."""
     # Load existing
@@ -303,7 +336,7 @@ def upsert_players_and_seasons(rosters_by_team: dict, team_id_map: dict, season:
                 "year":           p.get("year"),
             })
 
-    ps_list = list(existing_ps.values())
+    ps_list = _dedupe_player_seasons(list(existing_ps.values()))
     _save_json(ps_path, ps_list)
     print(f"  Saved {len(ps_list)} player_seasons")
 
@@ -330,8 +363,10 @@ def save_games(games_raw: list, team_id_map: dict, season: int) -> dict:
         api_id = g.get("id")
         if not api_id:
             continue
-        home = (g.get("homeTeam") or g.get("home_team") or "").lower()
-        away = (g.get("awayTeam") or g.get("away_team") or "").lower()
+        home_name = g.get("homeTeam") or g.get("home_team") or ""
+        away_name = g.get("awayTeam") or g.get("away_team") or ""
+        home = home_name.lower()
+        away = away_name.lower()
         if api_id not in existing:
             max_id += 1
             existing[api_id] = {"id": max_id}
@@ -342,6 +377,12 @@ def save_games(games_raw: list, team_id_map: dict, season: int) -> dict:
             "season_type":  g.get("_seasonType", "regular"),
             "home_team_id": team_id_map.get(home),
             "away_team_id": team_id_map.get(away),
+            # Names are kept even when the id lookup misses. FCS opponents are
+            # not in our teams table, so without this their name is discarded
+            # and the schedule renders "TBD" against a team that is perfectly
+            # well known — Montana State is not an unknown fixture.
+            "home_team_name": home_name or None,
+            "away_team_name": away_name or None,
             "home_score":   g.get("homePoints") or g.get("home_points"),
             "away_score":   g.get("awayPoints") or g.get("away_points"),
             "neutral_site": g.get("neutralSite", False),

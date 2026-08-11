@@ -115,13 +115,38 @@ Scripts are numbered by their dependency chain. Run them in this order for a com
 14  Recruiting class ROI / hit rate  (requires scripts 02, 07)
     python scripts/14_recruiting_roi.py
 
-15  Engine D — next-season OVR prediction  (requires script 07)
+15  Engine D — next-season projection from career EDGE curves  (requires script 07)
     python scripts/15_predict_trajectories.py
     python scripts/15_predict_trajectories.py --retrain   # refit the model
+
+16  Projected ratings for an unplayed season  (requires 15; writes engine='projected')
+    python scripts/16_project_ratings.py --season 2026
 ```
 
 Scripts 13–15 write straight into the frontend's `data/` directory; 12 writes
 the core player/team/roster files. Run 12 before 13–15 on a full refresh.
+
+### Bringing an unplayed season online
+
+A season with no results still has rosters, and the app treats it as a first-class
+projected season. Order matters — each step needs the one before it:
+
+```bash
+python scripts/01_harvest_games_players_stats.py --year 2026   # rosters (stats will be empty)
+python scripts/02_harvest_recruiting.py --year 2026            # signing class
+python scripts/03_harvest_transfers.py  --year 2026            # portal cycle
+python scripts/15_predict_trajectories.py --retrain            # career-curve projections
+python scripts/16_project_ratings.py --season 2026             # engine='projected' player ratings
+python scripts/10_compute_team_ratings.py --season 2026 --engine projected
+python scripts/12_export_frontend_json.py                      # exports + manifest.json
+```
+
+Script 10 needs `--engine projected` because SP+ and team stats cannot exist for a season
+that has not been played; that path computes from the roster alone and calls no API.
+
+After exporting, update the season constants in the app's `js/config.js`
+(`LAST_PLAYED_SEASON`, `CURRENT_SEASON`, `PROJECTED_SEASONS`) to match the new
+`manifest.json`. `pytest tests/test_export_contract.py` fails if they disagree.
 
 ---
 

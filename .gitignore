@@ -40,3 +40,8 @@ Thumbs.db
 .cce/
 # Claude Code local settings written by cce init
 .claude/settings.local.json
+
+# Local safety backups taken before destructive repairs. These are working-copy
+# insurance, not artifacts — raw_backup_2026-05-22.zip predates this rule and is
+# left tracked rather than rewritten out of history.
+data/raw_backup_pre_*.zip

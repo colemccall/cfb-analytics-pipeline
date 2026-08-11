@@ -221,8 +221,13 @@ def avg_top(ratings: list, n: int) -> float:
     return float(np.mean(sorted(ratings, reverse=True)[:n]))
 
 
-def load_starter_ratings_by_position(season: int) -> dict:
-    """Return {team_id: {QB: [r1,r2,...], RB: [...], ...}} for starter-tier players."""
+def load_starter_ratings_by_position(season: int, engine: str = "edge") -> dict:
+    """Return {team_id: {QB: [r1,r2,...], RB: [...], ...}} for starter-tier players.
+
+    `engine` selects which ratings to read: "edge" for played seasons, "projected"
+    for an upcoming one. Reading unfiltered would mix engines and double-count
+    every player who has rows in more than one.
+    """
     rat_df = read_computed("ratings")
     ps_df  = read_raw("player_seasons")[["id", "team_id", "position_group"]].rename(columns={"id": "ps_id"})
 
@@ -231,7 +236,7 @@ def load_starter_ratings_by_position(season: int) -> dict:
 
     rat_df = rat_df[
         (rat_df["season"] == season) &
-        (rat_df["engine"] == "edge") &
+        (rat_df["engine"] == engine) &
         (rat_df["overall_rating"] >= 55) &
         rat_df["overall_rating"].notna()
     ]
@@ -705,6 +710,89 @@ def run_season(season: int, api_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Projected seasons — roster only
+# ---------------------------------------------------------------------------
+
+def run_projected_season(season: int) -> None:
+    """Team ratings for a season that has not been played.
+
+    SP+, team stats and results do not exist for an unplayed season, so the only
+    honest signal is the roster itself. compute_team_splits already falls back to
+    roster-only when sp is None, so this path reuses it rather than forking the
+    math — the difference is which ratings feed it and that no API is touched.
+    """
+    print(f"\n{'='*60}")
+    print(f"Computing PROJECTED Team Ratings - Season {season}")
+    print(f"{'='*60}")
+
+    teams = load_teams()
+    roster_map = load_starter_ratings_by_position(season, engine="projected")
+    print(f"  {len(roster_map)} teams have projected starter ratings")
+    if not roster_map:
+        print(f"  ERROR: no projected player ratings for {season} — run script 16 first")
+        sys.exit(1)
+
+    recruiting_map = load_recruiting_scores(season)
+    sp_means = (0.0, 0.0, 0.0)
+
+    rows = []
+    school_map = {t[0]: t[1] for t in teams}
+    for team_id, school, conference in teams:
+        by_pos = dict(roster_map.get(team_id, {}))
+        if not by_pos:
+            continue
+        splits = compute_team_splits(team_id, None, by_pos, None, sp_means,
+                                     recruiting_map.get(team_id))
+        rec = recruiting_map.get(team_id)
+        sub_ratings = {
+            "pass_off":          splits["pass_off"],
+            "run_off":           splits["run_off"],
+            "pass_def":          splits["pass_def"],
+            "run_def":           splits["run_def"],
+            "special_teams":     splits["special_teams"],
+            "composite":         splits["composite"],
+            "sp_offense_scaled": None,
+            "sp_defense_scaled": None,
+            "recruiting_scaled": round(rec, 2) if rec is not None else None,
+        }
+        rows.append({
+            "team_id":          team_id,
+            "season":           season,
+            "overall_rating":   splits["overall_rating"],
+            "offense_rating":   splits["offense_rating"],
+            "defense_rating":   splits["defense_rating"],
+            "sp_overall":       None,
+            "sp_offense":       None,
+            "sp_defense":       None,
+            "recruiting_score": round(rec, 2) if rec is not None else None,
+            "starter_count":    sum(len(v) for v in by_pos.values()),
+            "coaching_change":  False,
+            "engine":           "projected",
+            "provenance":       "projected",
+            "sub_ratings":      json.dumps(sub_ratings),
+        })
+
+    new_df = pd.DataFrame(rows)
+    existing = read_computed("team_ratings")
+    if not existing.empty:
+        # Replace only this season's projected rows; earned rows are untouched.
+        eng = existing["engine"] if "engine" in existing.columns else pd.Series(
+            ["edge"] * len(existing), index=existing.index)
+        mask = ~((existing["season"] == season) & (eng == "projected"))
+        combined = pd.concat([existing[mask], new_df], ignore_index=True)
+    else:
+        combined = new_df
+
+    write_computed("team_ratings", combined)
+    print(f"  {len(rows)} projected team rating rows written")
+
+    top = sorted(rows, key=lambda r: r["overall_rating"] or 0, reverse=True)[:10]
+    print(f"\n  Projected top 10 — {season}")
+    for rank, r in enumerate(top, 1):
+        print(f"   {rank:>2}. {school_map.get(r['team_id'], '?'):<28} {r['overall_rating']:>5.1f}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -715,7 +803,15 @@ def main() -> None:
     parser.add_argument("--season", type=int, default=2025)
     parser.add_argument("--all-seasons", action="store_true",
                         help="Compute for all seasons 2008-2026")
+    parser.add_argument("--engine", choices=["edge", "projected"], default="edge",
+                        help="'projected' computes from projected player ratings "
+                             "with no API calls — for seasons not yet played")
     args = parser.parse_args()
+
+    if args.engine == "projected":
+        run_projected_season(args.season)
+        print("\nDone.")
+        return
 
     api_key = load_api_key()
     seasons = list(range(2008, 2027)) if args.all_seasons else [args.season]

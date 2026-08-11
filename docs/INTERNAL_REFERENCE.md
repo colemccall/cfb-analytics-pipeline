@@ -131,18 +131,39 @@ single fetch layer, with an in-memory `_load()` cache; nothing else fetches.
 | `team_performance.json` (13), `recruiting_roi.json` (14), `trajectory.json` (15) | Research page tables + home storylines |
 | `research/index.json` | research "Published Findings" — **currently `[]`, `research_cache` is empty** |
 
+**Resolved in v3.2 (2026-08-10):**
+
+- ~~**Season constant is duplicated.**~~ — RESOLVED. Script 12 now exports
+  `manifest.json` (`first_season`, `last_played_season`, `current_season`,
+  `projected_seasons`, `seasons`). `js/config.js` mirrors it, and
+  `tests/test_export_contract.py::test_frontend_season_constants_agree` fails the build if
+  they drift. `config.js` is loaded synchronously before any fetch, so a runtime read of
+  the manifest was not an option — the test is the mechanism.
+- ~~**Orphaned exports.**~~ — RESOLVED. `data/rosters.json` and `data/schedules.json`
+  (71 MB, zero consumers) deleted; the module docstring now describes what is actually
+  written, and a contract test asserts the bare duplicates stay gone.
+
 **Known contract gaps (as of 2026-08-10):**
 
-- **Season constant is duplicated.** Script 12 has `CURRENT_SEASON = 2026`; the frontend
-  has `CONFIG.CURRENT_SEASON = 2025`. Script 12 therefore writes an empty
-  `ratings_by_position_2026.json` that nothing requests, and the '26 hub reaches 2026
-  schedule data only via a hardcoded constant in `season2026.js`. A `manifest.json`
-  export consumed by `config.js` would remove the split.
-- **Orphaned exports.** `data/rosters.json` (57 MB) and `data/schedules.json` (14 MB) have
-  zero consumers — leftovers from the pre-per-season format. Script 12's module docstring
-  still advertises them. Both should be deleted and the docstring corrected.
 - **Payload.** `players_{season}.json` is ~8.3 MB and is fetched by home, players and
-  ratings, though only the modal needs its `stats_*` and `shap` blobs.
+  ratings, though only the modal needs its `stats_*` and `shap` blobs. A slim grid export
+  plus on-demand detail remains the fix.
+- **`trajectory_detail.json` is 5.5 MB** and fetched whole the first time any player modal
+  opens on a projected season. Acceptable (it is lazy and cached) but it wants the same
+  slim/detail treatment eventually.
+- **`research_cache` is still empty**, so `research/index.json` is `[]`. Either wire the
+  publishing path or delete it — one mechanism.
+- **Class year is the API's value and is unreliable.** Several players hold the same
+  `year` across four seasons. It feeds the cohort development curves, consistently in both
+  training and prediction, so it does not bias the projection — but it is not a
+  trustworthy display field.
+
+**Projected seasons (v3.2).** A season that has not been played carries
+`engine="projected"` rows from script 16 rather than `engine="edge"`. Consumers must go
+through `ratings_for(T, season)` — reading `T["ratings"]` directly returns an empty frame
+for such a season, which is how `ratings_by_position_2026.json` was silently `{}`. Every
+projected row exports `provenance`, `projection_source`, `projection_confidence`,
+`projection_low`, `projection_high` and `ea_ovr`; contract tests assert all of them.
 
 ## File Inventory
 
