@@ -1,9 +1,13 @@
 # How players are rated and projected — and where it breaks
 
-*Written 2026-08-11. **Nothing in this document is implemented.** It is a walk-through of
-the current logic, a measurement of where it fails, and an argument about what EA CFB 27
-could fix. Every number here was computed from the data in this repo; the queries are
-reproducible from the tables named alongside them.*
+*Written 2026-08-11. Originally an analysis-only document; **§9 records what has since been
+acted on.** Every number here was computed from the data in this repo.*
+
+> ## Update — v3.3 shipped the position-family split
+>
+> Three of the failures below are now addressed. Projections are split by position family,
+> **OL is no longer projected at all**, and offensive skill gained the opportunity model.
+> See §9. The EA CFB 27 options in §6 remain unimplemented.
 
 ---
 
@@ -307,3 +311,82 @@ The two cheapest honest wins:
 
 Both should be labelled, kept alongside the existing values for a season, and judged
 against what actually happens in 2026.
+
+---
+
+## 9. What v3.3 changed (2026-08-11)
+
+Three of the failures above are now addressed. The EA options in §6 are not.
+
+### Projections split by position family
+
+One model over all positions was averaging good inputs with bad ones. Now:
+
+| Family | Model | Holdout (naive → model) | Confidence |
+|---|---|---|---|
+| Offensive skill (QB/RB/WR/TE) | Career curve + cohort + **opportunity** | 9.11 → **8.23** | high |
+| Defense (EDGE/DL/LB/CB/S/DB) | Career curve + cohort | 9.41 → **8.28** | **low**, stated in the UI |
+| Specialists (K/P) | Carried forward | — | **low** |
+| **OL** | **Not projected** | — | — |
+
+Both models beat naive carry-forward, and each carries its own calibration and
+interval quantiles — their error distributions are different shapes, so sharing them
+mis-covered both.
+
+### OL is no longer projected — 2,902 player-seasons dropped
+
+§4c argued the OL number is a recruiting ranking in costume. It is now excluded from the
+projection engine entirely rather than carried forward. Rosters show *"not projected"*
+with the reason on hover instead of a number nobody should trust. Team ratings absorb the
+absence uniformly (every team loses the same OL contribution), so relative ordering holds.
+
+**This does not fix the OL rating itself** — earned OL ratings still exist for played
+seasons and are still 77% recruiting. §6 Option 1 is the fix for that and remains open.
+
+### Opportunity, for offensive skill
+
+The missing idea: what a player did last season only tells you what he will do next once
+you know whether he will get the ball. Three new feature families — his share of his
+position room's production, his depth-chart rank on **next** season's roster (computed
+from who is actually returning), and how much production is departing **ahead of him**.
+
+Measured on 2023–24:
+
+| Production ahead of him that departs | n | Yards | OVR |
+|---|---:|---|---:|
+| Nothing (<2%) | 4,283 | 1,080 → 1,022 | −2.6 |
+| Some (2–15%) | 1,196 | 891 → 822 | −2.5 |
+| A lot (15–35%) | 1,329 | 743 → 752 | −1.4 |
+| **The job is wide open (>35%)** | **1,561** | **599 → 820** | **+1.7** |
+
+A 280-yard swing driven purely by opportunity, entirely invisible to a career curve.
+Opportunity features improve *yards* prediction by ~9% and *OVR* by ~1.8% — the gap is
+itself informative: OVR is per-game and volume-normalised by construction, so it
+deliberately strips out most of what opportunity drives.
+
+### A breakout now requires a path to the ball
+
+Regression toward the mean makes any regressor optimistic about players near the rating
+floor. Without a gate the breakout list filled with fourth-stringers: one 58-yard WR sat
+**third** on his depth chart behind players who were **all returning** and still scored
++18.9 against his cohort.
+
+A breakout label now additionally requires one of: top-2 on the new depth chart, ≥25% of
+the work ahead departing, or ≥300 yards of his own. **67 calls were demoted to steady.**
+The top calls now all carry a real opportunity story — 90%, 82%, 97% of the production
+ahead of them leaving.
+
+### Also fixed
+
+Season-aggregate stat rows were missing or empty for 176 offensive skill players who do
+have game-level rows. Left unfilled they counted as zero production, corrupting their whole
+position room's shares and vacancy. Now backfilled by summing game rows.
+
+### Still open
+
+- Everything in §6 — EA blocking attributes for OL, a talent prior for the
+  production-blind majority, separating Production from Talent as two scales.
+- §4d top-end survivorship.
+- §4e opportunity blindness for **defense**, which has no touches to count. Defensive
+  ratings need reworking before their projections mean much; they ship marked low
+  confidence in the meantime.

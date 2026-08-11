@@ -85,6 +85,27 @@ SOS_CAP  = 1.5
 
 CONFIDENCE = {"engine_d": "high", "carry": "medium", "recruiting": "low", "ea_cfb27": "low"}
 
+# Positions we refuse to project. OL has no individual blocking data in any
+# public source, so its rating is 77% recruiting composite (measured) and
+# anti-correlates with the only independent assessment available. Carrying that
+# forward would publish a recruiting ranking under the label "projection".
+# See docs/RATING_AND_PROJECTION_MODEL.md §4c.
+EXCLUDED_POSITIONS = {"OL"}
+
+# Confidence is capped by position family regardless of source. Defensive and
+# special-teams ratings are built on inputs that describe production far less
+# completely, so even an engine_d projection for them is not "high".
+FAMILY_CAP = {
+    **{p: "high" for p in ("QB", "RB", "WR", "TE")},
+    **{p: "low" for p in ("EDGE", "DL", "LB", "CB", "S", "DB", "K", "P")},
+}
+_CONF_ORDER = {"high": 3, "medium": 2, "low": 1}
+
+def _confidence(source: str, pos: str) -> str:
+    src = CONFIDENCE.get(source, "low")
+    cap = FAMILY_CAP.get(pos, "low")
+    return src if _CONF_ORDER[src] <= _CONF_ORDER[cap] else cap
+
 
 def _position_ceilings() -> dict:
     """Per-position OVR ceilings, read from script 07's anchors — not restated.
@@ -247,6 +268,9 @@ def main() -> None:
         if pid is None:
             continue
         pg = row.position_group
+        if pg in EXCLUDED_POSITIONS:
+            counts["excluded_ol"] += 1
+            continue
         cy = row.year
         tid = int(row.team_id) if pd.notna(row.team_id) else None
         ea_ovr = ea_by_pid.get(pid)
@@ -312,7 +336,7 @@ def main() -> None:
             "engine":                "projected",
             "provenance":            "projected",
             "projection_source":     source,
-            "projection_confidence": CONFIDENCE.get(source, "low"),
+            "projection_confidence": _confidence(source, pg),
             "projection_low":        low,
             "projection_high":       high,
             "ea_ovr":                ea_ovr,

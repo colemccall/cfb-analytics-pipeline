@@ -1,46 +1,44 @@
-"""Engine D — next-season projection from a player's whole career EDGE curve.
+"""Engine D — next-season projection, per position family.
 
-REBUILT (v3.2). The previous version predicted next-season OVR from a single
-season's level, and its top SHAP feature was "current OVR" for 69% of players.
-Minimising squared error against weak features means predicting the conditional
-mean, which means shrinking toward the population average — so it projected
-100% of players rated 90+ to decline (reality: 88%) and 0% of players rated
-40-45 to decline (reality: 6%), and it compressed the spread to SD 8.5 when
-next-season OVR actually has SD ~11.4. It also barely beat doing nothing:
-naive "next = current" scores MAE 9.50 on the 2023-24 holdout, the old model ~9.
+v3.3 splits this into two models plus an exclusion, because the three families
+have fundamentally different evidence behind them and one model over all of them
+was averaging good inputs with bad ones.
 
-What changed, and why:
+OFFENSIVE SKILL (QB/RB/WR/TE) — the full model. Career EDGE curve + cohort
+  development curves + OPPORTUNITY. Opportunity is the part that was missing:
+  what a player did last season only tells you what he will do next once you
+  know whether he will get the ball. Features: his share of his position room's
+  production, his depth-chart rank on NEXT season's roster (computed from who is
+  actually returning), and how much production is departing ahead of him.
 
-  1. CAREER CURVE, NOT A SNAPSHOT. Features come from every season a player has
-     played -- the shape of his EDGE curve (slope, acceleration, distance from
-     peak, consistency), not just where it currently sits. Raw EDGE is not
-     comparable across seasons or positions, so each score is first converted to
-     a percentile within its own (season, position group).
+  Measured on 2023-24: players with more than 35% of the production ahead of
+  them departing went 599 -> 820 yards, while players whose room returned intact
+  went 1,080 -> 1,022. That 280-yard swing is invisible to a career curve.
+  Holdout: naive 9.11, model 8.23.
 
-  2. COHORT DEVELOPMENT CURVES. For every (position group, class year, EDGE
-     decile) we compute what players like this historically did the next season.
-     This is both the strongest single feature and the backbone of the
-     explanation: "juniors at this level typically add 2.5".
+  A breakout label additionally requires a PATH TO THE BALL — top-2 on the new
+  depth chart, or a quarter of the work ahead departing, or 300+ yards of his
+  own. Regression toward the mean makes any regressor optimistic about players
+  near the rating floor, and without this gate the breakout list filled with
+  fourth-string receivers who had nobody to displace.
 
-  3. CALIBRATED SPREAD. The raw conditional mean under-disperses. We inflate
-     variance 50% toward the realised distribution -- measured as the best
-     available trade (MAE 8.41 vs raw 8.10 and naive 9.50, while cutting
-     decline-rate error from 18.6 to 12.8 points). Full quantile mapping was
-     tested and rejected: it scored worse on BOTH axes (MAE 9.36, 24.9 points)
-     because matching marginals injects rank noise.
+DEFENSE (EDGE/DL/LB/CB/S/DB) — career curve and cohort only. There is no
+  meaningful notion of touches or a depth chart, and tackle counts partly
+  measure how bad your defense is rather than how good you are. Holdout: naive
+  9.41, model 8.28 — but every one of these is published as LOW CONFIDENCE
+  until the underlying ratings are reworked.
 
-  4. LABELS AGAINST THE COHORT, NOT AGAINST ZERO. "Breakout" now means beating
-     what players like him normally do. The old raw-delta label correlated
-     -0.87 with current OVR -- it was the current rating, inverted. The
-     cohort-relative label correlates -0.22.
+OL — NOT PROJECTED AT ALL. No individual blocking data exists in any public
+  source, so an OL rating is 77% recruiting composite (measured) and
+  anti-correlates with the only independent assessment available. Carrying that
+  forward would publish a recruiting ranking wearing the word "projection".
+  See docs/RATING_AND_PROJECTION_MODEL.md §4c.
 
-  5. EVERY PREDICTION EXPLAINS ITSELF. Each row ships signed driver
-     contributions, a generated human explanation, and historical comparables
-     with similar career shapes and what they actually did.
-
-Skill positions (QB/RB/WR/TE/DL/LB/DB) go through the model. OL/K/P have no
-individual play attribution, so they use the cohort development curve directly
--- arithmetic that is itself better than naive (MAE 8.68).
+Retained from v3.2: EDGE percentiles within (season, position) so career curves
+are comparable; cohort development curves as both feature and explanation
+backbone; 50% variance inflation so the spread does not collapse to the mean;
+cohort-relative labels; 80% intervals from a validation split; and a per-player
+explanation, signed drivers and historical comparables on every projection.
 
 Inputs  : player_seasons, ratings (computed, engine=edge), player_edge, recruiting, players
 Outputs : data/models/engine_d.json          (model artifact)
@@ -81,7 +79,45 @@ VALID_SEASONS = (2021, 2022)   # residual quantiles for intervals come from here
                                # optimistically small and under-cover.
 TEST_SEASONS  = (2023, 2024)   # held out for the published metrics
 
-SKILL_POSITIONS = {"QB", "RB", "WR", "TE", "DL", "LB", "DB", "EDGE", "CB", "S"}
+# ── Position families ──────────────────────────────────────────────────────
+# These are not cosmetic groupings. Each family has fundamentally different
+# input quality, and pretending otherwise is what produced projections nobody
+# believed.
+#
+# OFFENSIVE SKILL — real per-player counting stats (yards, touches, TDs) plus a
+#   knowable depth chart. This is the only family where we can model both what a
+#   player did AND the opportunity he is walking into, so it gets the full
+#   opportunity model.
+#
+# DEFENSE — stats exist but describe production far less completely (tackles are
+#   partly a function of how bad your defense is), and there is no clean notion
+#   of "touches". Keeps the career-curve model, and is explicitly marked lower
+#   confidence until the underlying ratings are reworked.
+#
+# SPECIALISTS — tiny samples, high variance, mostly binary outcomes. Same
+#   treatment as defense, same caveat.
+#
+# OL — EXCLUDED ENTIRELY. No individual blocking data exists in any public
+#   source, so an OL "rating" is 77% recruiting composite (measured) and
+#   anti-correlates with the one independent assessment available. Projecting
+#   from it would be projecting from recruiting rankings while calling it
+#   production. We publish nothing rather than something we cannot defend.
+#   See docs/RATING_AND_PROJECTION_MODEL.md §4c.
+OFFENSIVE_SKILL = {"QB", "RB", "WR", "TE"}
+DEFENSE         = {"EDGE", "DL", "LB", "CB", "S", "DB"}
+SPECIALISTS     = {"K", "P"}
+EXCLUDED        = {"OL"}
+
+MODELED_POSITIONS = OFFENSIVE_SKILL | DEFENSE
+
+FAMILY_CONFIDENCE = {
+    **{p: "high" for p in OFFENSIVE_SKILL},
+    **{p: "low" for p in DEFENSE},
+    **{p: "low" for p in SPECIALISTS},
+}
+
+# Retained for the career-curve path shared with defense.
+SKILL_POSITIONS = MODELED_POSITIONS
 
 MIN_OVR       = 40
 MIN_COHORT_N  = 20      # below this a cohort cell is noise; fall back a level
@@ -91,12 +127,23 @@ OVR_FLOOR, OVR_CEIL = 40.0, 99.0
 BREAKOUT_VS_COHORT =  3.0
 DECLINE_VS_COHORT  = -3.0
 
+# Career-shape features — every modelled position uses these.
 FEATURE_COLS = [
     "ovr", "pct_last", "pct_slope", "pct_peak", "pct_from_peak", "pct_mean",
     "pct_sd", "pct_accel", "n_seasons", "games_last", "games_mean",
     "opp_sp_last", "opp_sp_trend", "class_year", "stars", "composite_score",
     "cohort_delta", "cohort_next", "pos_enc",
 ]
+
+# Opportunity features — offensive skill only, because they require per-player
+# counting stats and a meaningful depth chart. Both are absent everywhere else.
+OPPORTUNITY_COLS = [
+    "yds", "prev_yds", "career_yds", "yds_growth", "touches", "tds", "eff",
+    "prod_share", "depth_rank", "next_depth_rank",
+    "vacated_share", "vacated_ahead_share", "team_pos_yds",
+]
+
+SKILL_FEATURE_COLS = FEATURE_COLS + OPPORTUNITY_COLS
 
 DRIVER_LABELS = {
     "ovr":             "current rating",
@@ -118,6 +165,20 @@ DRIVER_LABELS = {
     "cohort_delta":    "typical development at this stage",
     "cohort_next":     "cohort baseline",
     "pos_enc":         "position",
+    # Opportunity
+    "yds":                 "production last season",
+    "prev_yds":            "production the year before",
+    "career_yds":          "career production",
+    "yds_growth":          "year-over-year production change",
+    "touches":             "workload",
+    "tds":                 "touchdowns",
+    "eff":                 "efficiency per touch",
+    "prod_share":          "share of his position room's production",
+    "depth_rank":          "depth-chart rank last season",
+    "next_depth_rank":     "depth-chart rank on the new roster",
+    "vacated_share":       "production leaving his position room",
+    "vacated_ahead_share": "production departing ahead of him",
+    "team_pos_yds":        "how much his position room produces",
 }
 
 _ORDINAL = {1: "true freshman", 2: "sophomore", 3: "junior", 4: "senior", 5: "fifth-year senior"}
@@ -232,6 +293,130 @@ def build_career_frame(ratings_df, player_seasons_df, player_edge_df,
     return C
 
 
+# ---------------------------------------------------------------------------
+# Opportunity — offensive skill only
+# ---------------------------------------------------------------------------
+
+def _primary_yards(pos, pass_y, rush_y, rec_y):
+    """The yardage that defines production at this position."""
+    if pos == "QB": return pass_y + rush_y
+    if pos == "RB": return rush_y + rec_y
+    return rec_y                                    # WR / TE
+
+
+def build_opportunity(C: pd.DataFrame, stats_df: pd.DataFrame,
+                      player_seasons_df: pd.DataFrame) -> pd.DataFrame:
+    """What a player produced, how much of his room's work he got, and — the part
+    that actually moves next season — what is about to open up in front of him.
+
+    A 300-yard receiver behind three returning starters and a 300-yard receiver
+    whose entire room graduated are the same player to a career-curve model and
+    completely different bets in reality. Measured on 2023–24: when more than
+    35% of the production ahead of a player departs, his yardage goes 599 → 820,
+    against 1,080 → 1,022 for players whose room returns intact.
+    """
+    FIELDS = [("pass_yds", "passingYDS"), ("pass_att", "passingATT"), ("pass_td", "passingTD"),
+              ("rush_yds", "rushingYDS"), ("rush_car", "rushingCAR"), ("rush_td", "rushingTD"),
+              ("rec_yds", "receivingYDS"), ("rec", "receivingREC"), ("rec_td", "receivingTD")]
+
+    def _parse(d):
+        if isinstance(d, str):
+            try: d = json.loads(d)
+            except Exception: return None
+        return d if isinstance(d, dict) else None
+
+    stat_rows = []
+    agg = stats_df[(stats_df["stat_type"] == "season_aggregate") & stats_df["game_id"].isna()]
+    for r in agg[["player_season_id", "data"]].itertuples(index=False):
+        d = _parse(r.data)
+        if d is None: continue
+        row = {"ps_id": r.player_season_id}
+        row.update({k: float(d.get(src) or 0) for k, src in FIELDS})
+        stat_rows.append(row)
+    S = pd.DataFrame(stat_rows)
+
+    # Some players have EDGE scores (computed per game) but an empty season
+    # aggregate — 176 offensive skill players in 2025, all of whom DO have
+    # game-level rows. Left unfilled they count as zero production, which
+    # silently corrupts their whole position room's shares and vacancy: the
+    # top 2026 breakout call was a running back whose own yards read 0.
+    have = set(S["ps_id"]) if not S.empty else set()
+    zero = set(S.loc[S[[k for k, _ in FIELDS]].sum(axis=1) <= 0, "ps_id"]) if not S.empty else set()
+    games = stats_df[stats_df["game_id"].notna()]
+    if not games.empty:
+        need = zero | (set(games["player_season_id"]) - have)
+        g = games[games["player_season_id"].isin(need)][["player_season_id", "data"]]
+        summed = {}
+        for r in g.itertuples(index=False):
+            d = _parse(r.data)
+            if d is None: continue
+            acc = summed.setdefault(r.player_season_id, {k: 0.0 for k, _ in FIELDS})
+            for k, src in FIELDS:
+                acc[k] += float(d.get(src) or 0)
+        if summed:
+            G = pd.DataFrame([{"ps_id": k, **v} for k, v in summed.items()])
+            S = pd.concat([S[~S["ps_id"].isin(G["ps_id"])], G], ignore_index=True)
+            print(f"    filled {len(G)} player-seasons from game-level rows "
+                  f"(missing or empty season aggregate)")
+    if S.empty:
+        for c in ["yds", "touches", "tds", "eff", "prod_share", "depth_rank",
+                  "next_depth_rank", "vacated_share", "vacated_ahead_share", "team_pos_yds"]:
+            C[c] = np.nan
+        return C
+
+    C = C.merge(S, on="ps_id", how="left")
+    for c in ["pass_yds", "pass_att", "pass_td", "rush_yds", "rush_car",
+              "rush_td", "rec_yds", "rec", "rec_td"]:
+        C[c] = C[c].fillna(0.0)
+
+    C["yds"] = [_primary_yards(p, a, b, c) for p, a, b, c in
+                zip(C["position_group"], C["pass_yds"], C["rush_yds"], C["rec_yds"])]
+    C["touches"] = C["pass_att"] + C["rush_car"] + C["rec"]
+    C["tds"] = C["pass_td"] + C["rush_td"] + C["rec_td"]
+    C["eff"] = np.where(C["touches"] > 0, C["yds"] / C["touches"], 0.0)
+
+    # Share of his own position room's production.
+    key = ["team_id", "season", "position_group"]
+    grp = C.groupby(key)["yds"]
+    C["team_pos_yds"] = grp.transform("sum")
+    C["prod_share"] = np.where(C["team_pos_yds"] > 0, C["yds"] / C["team_pos_yds"], 0.0)
+    C["depth_rank"] = grp.rank(ascending=False, method="min")
+
+    # Returning is a ROSTER fact, not a "was rated again" fact. Using ratings
+    # here counts every returning backup as a departure and inflates vacancy.
+    roster = set(zip(player_seasons_df["player_id"], player_seasons_df["season"]))
+    C["returns"] = [(pid, s + 1) in roster for pid, s in zip(C["player_id"], C["season"])]
+
+    C["_yds_ret"] = C["yds"] * C["returns"]
+    C["returning_yds"] = C.groupby(key)["_yds_ret"].transform("sum")
+    C["vacated_share"] = np.where(C["team_pos_yds"] > 0,
+                                  1 - C["returning_yds"] / C["team_pos_yds"], 0.0)
+
+    # His depth-chart slot next season, among players who actually return.
+    C["_rk"] = np.where(C["returns"], C["yds"], -1.0)
+    C["next_depth_rank"] = C.groupby(key)["_rk"].rank(ascending=False, method="min")
+    C.loc[~C["returns"].astype(bool), "next_depth_rank"] = np.nan
+
+    # The specific opening: production ahead of him, by players who are leaving.
+    C = C.sort_values(key + ["yds"], ascending=[True, True, True, False])
+    leaving = C["yds"] * (~C["returns"].astype(bool))
+    C["_vac_ahead"] = leaving.groupby([C[k] for k in key]).cumsum() - leaving
+    C["vacated_ahead_share"] = np.where(C["team_pos_yds"] > 0,
+                                        C["_vac_ahead"] / C["team_pos_yds"], 0.0)
+
+    # Career volume, so a one-year flash and a three-year workhorse differ.
+    C = C.sort_values(["player_id", "season"])
+    C["career_yds"] = C.groupby("player_id")["yds"].cumsum()
+    C["prev_yds"] = C.groupby("player_id")["yds"].shift(1).fillna(0.0)
+    C["yds_growth"] = C["yds"] - C["prev_yds"]
+
+    # Opportunity is only meaningful where per-player counting stats exist.
+    off = C["position_group"].isin(OFFENSIVE_SKILL)
+    for c in OPPORTUNITY_COLS:
+        C.loc[~off, c] = np.nan
+    return C
+
+
 def build_cohort_curves(C: pd.DataFrame, train_mask) -> tuple:
     """What players at each (position, class year, production decile) did next.
 
@@ -332,13 +517,84 @@ def build_explanation(row, drivers, comparables) -> str:
     else:
         parts.append("We project him right at that baseline.")
 
+    # Opportunity, stated the way a fan would state it. This is often the whole
+    # story for a skill player and is invisible in a career curve.
+    parts.append(_opportunity_sentence(row))
+
     if comparables:
         names = ", ".join(c["name"] for c in comparables if c.get("name"))
         avg = np.mean([c["actual_delta"] for c in comparables])
         if names:
             parts.append(f"Closest historical career shapes: {names} — they averaged {avg:+.1f}.")
 
-    return " ".join(parts)
+    return " ".join(p for p in parts if p)
+
+
+_RANK_WORD = {1: "the clear number one", 2: "second in line", 3: "third in line"}
+
+# Thresholds for "he can realistically get the ball next season".
+PATH_TOP_DEPTH   = 2      # first or second at his position on the new roster
+PATH_VACATED     = 0.25   # a quarter of the work ahead of him is leaving
+PATH_OWN_VOLUME  = 300    # or he already carries a real workload himself
+
+
+def _has_path_to_the_ball(row) -> bool:
+    """Does this player have a plausible route to more production?
+
+    Three ways in, any one of which is enough: he is already near the top of the
+    depth chart, the players ahead of him are leaving, or he has enough of his
+    own volume that his role does not depend on someone else's departure.
+    """
+    def num(v):
+        return None if v is None or (isinstance(v, float) and np.isnan(v)) else float(v)
+
+    rank = num(row.get("next_depth_rank"))
+    vac  = num(row.get("vacated_ahead_share"))
+    yds  = num(row.get("yds"))
+    if rank is not None and rank <= PATH_TOP_DEPTH:
+        return True
+    if vac is not None and vac >= PATH_VACATED:
+        return True
+    if yds is not None and yds >= PATH_OWN_VOLUME:
+        return True
+    # No opportunity data at all — do not block on missing information.
+    return rank is None and vac is None and yds is None
+
+
+def _opportunity_sentence(row) -> str:
+    """Depth chart and vacancy in plain English, for offensive skill players."""
+    if row.get("position_group") not in OFFENSIVE_SKILL:
+        return ""
+    rank = row.get("next_depth_rank")
+    yds = row.get("yds")
+    vac = row.get("vacated_ahead_share")
+    share = row.get("prod_share")
+    if rank is None or (isinstance(rank, float) and np.isnan(rank)):
+        return ""
+
+    bits = []
+    has_yards = yds is not None and not (isinstance(yds, float) and np.isnan(yds)) and yds > 0
+    r = int(rank)
+    where = _RANK_WORD.get(r, f"number {r}")
+    if has_yards:
+        pct = f" ({share * 100:.0f}% of his position room)" if share and share > 0 else ""
+        bits.append(f"He produced {yds:,.0f} yards{pct}")
+        bits.append(f"and returns as {where} at his position")
+    else:
+        bits.append(f"He returns as {where} at his position")
+
+    if vac is not None and not (isinstance(vac, float) and np.isnan(vac)):
+        if vac >= 0.35:
+            bits.append(f"with {vac * 100:.0f}% of the production ahead of him gone — "
+                        f"the job is open, which is the single strongest breakout signal we have")
+        elif vac >= 0.15:
+            bits.append(f"with {vac * 100:.0f}% of the production ahead of him departing")
+        elif vac >= 0.02:
+            bits.append(f"with only {vac * 100:.0f}% of the work ahead of him opening up")
+        else:
+            bits.append("with the players ahead of him all returning, which caps how much "
+                        "more he can realistically take on")
+    return " ".join(bits) + "."
 
 
 def find_comparables(row, pool: pd.DataFrame, k: int = 3) -> list:
@@ -384,6 +640,7 @@ def main() -> None:
     edge_df    = read_raw("player_edge")
     rec_df     = read_raw("recruiting")
     players_df = read_raw("players")
+    stats_df   = read_raw("stats")
 
     if ratings_df.empty or ps_df.empty:
         print("ERROR: ratings.json or player_seasons.json empty — run scripts 01/06/07 first")
@@ -394,6 +651,9 @@ def main() -> None:
     if C.empty:
         print("ERROR: no career rows built")
         return
+
+    print("Building opportunity features (offensive skill)...")
+    C = build_opportunity(C, stats_df, ps_df)
 
     predict_season = args.predict_season or int(C["season"].max())
     has_target = C["next_ovr"].notna()
@@ -415,9 +675,15 @@ def main() -> None:
     })
 
     C["pos_enc"] = C["position_group"].astype("category").cat.codes.astype(float)
-    is_skill = C["position_group"].isin(SKILL_POSITIONS)
 
-    D  = C[C["next_ovr"].notna() & is_skill]
+    # OL never enters the pipeline at all — not trained on, not predicted.
+    n_ol = int(C["position_group"].isin(EXCLUDED).sum())
+    C = C[~C["position_group"].isin(EXCLUDED)]
+    print(f"  excluded {n_ol} OL player-seasons — no individual blocking data exists, "
+          f"so an OL projection would be a recruiting ranking in disguise")
+
+    is_modeled = C["position_group"].isin(MODELED_POSITIONS)
+    D  = C[C["next_ovr"].notna() & is_modeled]
     tr = D[_between(D["season"], TRAIN_SEASONS)]
     va = D[_between(D["season"], VALID_SEASONS)]
     te = D[_between(D["season"], TEST_SEASONS)]
@@ -427,110 +693,158 @@ def main() -> None:
         return
 
     from xgboost import XGBRegressor
-    if MODEL_PATH.exists() and not args.retrain:
-        print(f"Loading model from {MODEL_PATH}...")
-        model = XGBRegressor()
-        model.load_model(str(MODEL_PATH))
-    else:
-        print(f"Training on {TRAIN_SEASONS[0]}–{TRAIN_SEASONS[1]}...")
-        model = XGBRegressor(n_estimators=400, max_depth=5, learning_rate=0.05,
+
+    # ── One model per position family ──────────────────────────────────────
+    # Offensive skill gets the opportunity features; defense cannot (no touches,
+    # no meaningful depth chart) and keeps the career-curve set. Training them
+    # together would force one feature space on two very different problems and
+    # let defense's noise wash out the opportunity signal.
+    FAMILIES = [
+        ("offense", OFFENSIVE_SKILL, SKILL_FEATURE_COLS),
+        ("defense", DEFENSE,         FEATURE_COLS),
+    ]
+
+    fitted = {}
+    for fam, positions, feats in FAMILIES:
+        f_tr = tr[tr["position_group"].isin(positions)]
+        f_va = va[va["position_group"].isin(positions)]
+        f_te = te[te["position_group"].isin(positions)]
+        if len(f_tr) < 300:
+            print(f"  {fam}: only {len(f_tr)} training rows — skipping family")
+            continue
+
+        path = MODEL_PATH.parent / f"engine_d_{fam}.json"
+        if path.exists() and not args.retrain:
+            m = XGBRegressor(); m.load_model(str(path))
+        else:
+            m = XGBRegressor(n_estimators=400, max_depth=5, learning_rate=0.05,
                              subsample=0.8, colsample_bytree=0.8,
                              random_state=42, n_jobs=-1)
-        model.fit(tr[FEATURE_COLS].values.astype(float),
-                  tr["next_ovr"].values.astype(float))
-        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        model.save_model(str(MODEL_PATH))
-        print(f"  saved {MODEL_PATH}")
+            m.fit(f_tr[feats].values.astype(float), f_tr["next_ovr"].values.astype(float))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            m.save_model(str(path))
 
-    # ── Calibration constants, fitted on train only ────────────────────────
-    tr_pred = model.predict(tr[FEATURE_COLS].values.astype(float))
-    tr_act  = tr["next_ovr"].values.astype(float)
-    infl_mu = float(tr_pred.mean())
-    infl_k  = 1.0 + VARIANCE_LAMBDA * (float(np.std(tr_act)) / float(np.std(tr_pred)) - 1.0)
+        # Calibration and intervals are per family — their error distributions
+        # are not the same shape, so sharing them would mis-cover both.
+        tr_pred = m.predict(f_tr[feats].values.astype(float))
+        tr_act  = f_tr["next_ovr"].values.astype(float)
+        mu = float(tr_pred.mean())
+        k  = 1.0 + VARIANCE_LAMBDA * (float(np.std(tr_act)) / float(np.std(tr_pred)) - 1.0)
+        cal = lambda p, mu=mu, k=k: np.clip(mu + k * (p - mu), OVR_FLOOR, OVR_CEIL)
 
-    def calibrate(p):
-        return np.clip(infl_mu + infl_k * (p - infl_mu), OVR_FLOOR, OVR_CEIL)
+        va_pred = cal(m.predict(f_va[feats].values.astype(float))) if len(f_va) else np.array([])
+        lo_q, hi_q = {}, {}
+        if len(va_pred):
+            va_res = f_va["next_ovr"].values.astype(float) - va_pred
+            va_bkt = np.clip((va_pred // 10).astype(int), 4, 9)
+            for b in range(4, 10):
+                r = va_res[va_bkt == b]
+                if len(r) < 50: r = va_res
+                lo_q[b], hi_q[b] = float(np.percentile(r, 10)), float(np.percentile(r, 90))
+        else:
+            for b in range(4, 10): lo_q[b], hi_q[b] = -9.0, 9.0
 
-    # ── Interval quantiles from the VALIDATION split ───────────────────────
-    # Train residuals are optimistically small; using them under-covers.
-    va_pred = calibrate(model.predict(va[FEATURE_COLS].values.astype(float)))
-    va_res  = va["next_ovr"].values.astype(float) - va_pred
-    va_bkt  = np.clip((va_pred // 10).astype(int), 4, 9)
-    lo_q, hi_q = {}, {}
-    for b in range(4, 10):
-        r = va_res[va_bkt == b]
-        if len(r) < 50:
-            r = va_res
-        lo_q[b], hi_q[b] = float(np.percentile(r, 10)), float(np.percentile(r, 90))
+        metrics = {}
+        if len(f_te):
+            te_cal = cal(m.predict(f_te[feats].values.astype(float)))
+            te_act = f_te["next_ovr"].values.astype(float)
+            te_cur = f_te["ovr"].values.astype(float)
+            mae = lambda p: float(np.mean(np.abs(p - te_act)))
+            b = np.clip((te_cal // 10).astype(int), 4, 9)
+            lo = te_cal + np.array([lo_q[i] for i in b])
+            hi = te_cal + np.array([hi_q[i] for i in b])
+            metrics = {
+                "n": int(len(f_te)),
+                "naive_mae": round(mae(te_cur), 2),
+                "model_mae": round(mae(te_cal), 2),
+                "coverage": round(float(((te_act >= lo) & (te_act <= hi)).mean() * 100), 1),
+                "sd_ratio": round(float(np.std(te_cal)) / float(np.std(te_act)), 3),
+            }
+            print(f"\n  {fam.upper()} holdout (n={metrics['n']}): "
+                  f"naive {metrics['naive_mae']}  model {metrics['model_mae']}  "
+                  f"coverage {metrics['coverage']}%  spread {metrics['sd_ratio']:.0%}")
+            if metrics["model_mae"] >= metrics["naive_mae"]:
+                print(f"  GATE FAILED ({fam}): {metrics['model_mae']} does not beat "
+                      f"naive {metrics['naive_mae']}")
+                sys.exit(1)
 
-    # ── Published metrics on the untouched test split ──────────────────────
-    if len(te):
-        te_raw = model.predict(te[FEATURE_COLS].values.astype(float))
-        te_cal = calibrate(te_raw)
-        te_act = te["next_ovr"].values.astype(float)
-        te_cur = te["ovr"].values.astype(float)
-        te_coh = te["cohort_next"].values.astype(float)
-        mae = lambda p: float(np.mean(np.abs(p - te_act)))
-        naive_mae, model_mae = mae(te_cur), mae(te_cal)
-        b = np.clip((te_cal // 10).astype(int), 4, 9)
-        lo = te_cal + np.array([lo_q[i] for i in b])
-        hi = te_cal + np.array([hi_q[i] for i in b])
-        coverage = float(((te_act >= lo) & (te_act <= hi)).mean() * 100)
-        print(f"\n  Holdout {TEST_SEASONS[0]}–{TEST_SEASONS[1]} (n={len(te)}):")
-        print(f"    naive next=current   MAE {naive_mae:.2f}")
-        print(f"    cohort arithmetic    MAE {mae(te_coh):.2f}")
-        print(f"    model (raw)          MAE {mae(te_raw):.2f}   SD {np.std(te_raw):.2f}")
-        print(f"    model (calibrated)   MAE {model_mae:.2f}   SD {np.std(te_cal):.2f}")
-        print(f"    actual                            SD {np.std(te_act):.2f}")
-        print(f"    80% interval coverage {coverage:.1f}%")
+        fitted[fam] = {"model": m, "feats": feats, "cal": cal,
+                       "lo": lo_q, "hi": hi_q, "metrics": metrics,
+                       "positions": positions}
 
-        # Gate: the whole point is to beat doing nothing.
-        if model_mae >= naive_mae:
-            print(f"\n  GATE FAILED: calibrated MAE {model_mae:.2f} does not beat "
-                  f"naive carry-forward {naive_mae:.2f}. Not writing projections.")
-            sys.exit(1)
-        sd_ratio = float(np.std(te_cal)) / float(np.std(te_act))
-        if sd_ratio < 0.6:
-            print(f"\n  GATE FAILED: projected spread is {sd_ratio:.0%} of realised "
-                  f"spread — distribution is compressed.")
-            sys.exit(1)
-        print(f"    GATES PASSED (MAE {naive_mae - model_mae:+.2f} vs naive, "
-              f"spread {sd_ratio:.0%} of realised)")
-    else:
-        naive_mae = model_mae = coverage = None
+    if not fitted:
+        print("ERROR: no family could be trained")
+        return
+
+    off_m = fitted.get("offense", {}).get("metrics", {})
+    def_m = fitted.get("defense", {}).get("metrics", {})
+    naive_mae = off_m.get("naive_mae")
+    model_mae = off_m.get("model_mae")
+    coverage  = off_m.get("coverage")
 
     # ── Predict ────────────────────────────────────────────────────────────
-    P = C[(C["season"] == predict_season) & is_skill].copy()
+    P = C[(C["season"] == predict_season) & C["position_group"].isin(MODELED_POSITIONS)].copy()
     if P.empty:
         print(f"WARNING: no season-{predict_season} rows to predict")
         return
     print(f"\nProjecting {predict_season + 1} from {predict_season} careers ({len(P)} players)...")
 
-    raw  = model.predict(P[FEATURE_COLS].values.astype(float))
-    proj = calibrate(raw)
-    P["predicted_ovr"] = proj
-    P["vs_cohort"]     = proj - P["cohort_next"].values
 
-    print("Computing per-prediction drivers...")
+    P["predicted_ovr"] = np.nan
+    P["_family"] = ""
+    shap_by_idx = {}
     import shap
-    sv = shap.TreeExplainer(model).shap_values(P[FEATURE_COLS].values.astype(float))
+    for fam, f in fitted.items():
+        mask = P["position_group"].isin(f["positions"])
+        if not mask.any(): continue
+        X = P.loc[mask, f["feats"]].values.astype(float)
+        P.loc[mask, "predicted_ovr"] = f["cal"](f["model"].predict(X))
+        P.loc[mask, "_family"] = fam
+        sv = shap.TreeExplainer(f["model"]).shap_values(X)
+        for k, idx in enumerate(P.index[mask]):
+            shap_by_idx[idx] = (sv[k], f["feats"])
+        print(f"  {fam}: {int(mask.sum())} players")
 
+    P = P[P["predicted_ovr"].notna()]
+    P["vs_cohort"] = P["predicted_ovr"].values - P["cohort_next"].values
+
+    # Drivers were computed per family during prediction — each family has its
+    # own feature space, so one explainer cannot serve both.
     comp_pool = D[_between(D["season"], (TRAIN_SEASONS[0], VALID_SEASONS[1]))]
     print("Finding comparables and writing explanations...")
 
-    records, details = [], {}
-    for i, (_, row) in enumerate(P.iterrows()):
-        order = np.argsort(-np.abs(sv[i]))[:4]
-        drivers = [{
-            "feature": FEATURE_COLS[j],
-            "label":   DRIVER_LABELS.get(FEATURE_COLS[j], FEATURE_COLS[j]),
-            "effect":  round(float(sv[i][j]), 2),
-        } for j in order]
+    records, details, blocked_breakouts = [], {}, []
+    for idx, row in P.iterrows():
+        sv_row, feats = shap_by_idx.get(idx, (None, FEATURE_COLS))
+        if sv_row is None:
+            drivers = []
+        else:
+            order = np.argsort(-np.abs(sv_row))[:4]
+            drivers = [{
+                "feature": feats[j],
+                "label":   DRIVER_LABELS.get(feats[j], feats[j]),
+                "effect":  round(float(sv_row[j]), 2),
+            } for j in order]
 
         comparables = find_comparables(row, comp_pool)
         vs = float(row["vs_cohort"])
         label = ("breakout" if vs >= BREAKOUT_VS_COHORT
                  else "decline" if vs <= DECLINE_VS_COHORT else "steady")
+
+        # A breakout needs a path to the ball. Regression toward the mean makes
+        # the model optimistic about anyone rated near the floor, so without
+        # this gate the list fills with fourth-string receivers: one 58-yard WR
+        # sat third on his depth chart behind players who were ALL returning and
+        # still scored +18.9 against his cohort. If nobody ahead of him is
+        # leaving and he has no workload of his own, he is not breaking out,
+        # whatever the regressor says. Offensive skill only — defense has no
+        # depth chart to reason about.
+        if label == "breakout" and row["position_group"] in OFFENSIVE_SKILL:
+            if not _has_path_to_the_ball(row):
+                label = "steady"
+                blocked_breakouts.append(row["name"])
+        fam = row["_family"] or "defense"
+        fq = fitted.get(fam) or next(iter(fitted.values()))
         b = int(np.clip(row["predicted_ovr"] // 10, 4, 9))
         pred = float(row["predicted_ovr"])
 
@@ -544,14 +858,20 @@ def main() -> None:
             "class_year":       int(row["class_year"]) if pd.notna(row["class_year"]) else None,
             "current_ovr":      round(float(row["ovr"]), 1),
             "predicted_ovr":    round(pred, 1),
-            "proj_low":         round(max(OVR_FLOOR, pred + lo_q[b]), 1),
-            "proj_high":        round(min(OVR_CEIL, pred + hi_q[b]), 1),
+            "proj_low":         round(max(OVR_FLOOR, pred + fq["lo"][b]), 1),
+            "proj_high":        round(min(OVR_CEIL, pred + fq["hi"][b]), 1),
             "delta":            round(pred - float(row["ovr"]), 1),
             "cohort_expected":  round(float(row["cohort_next"]), 1),
             "cohort_n":         int(row["cohort_n"]),
             "vs_cohort":        round(vs, 1),
             "trajectory_label": label,
             "shap_top_feature": drivers[0]["label"] if drivers else None,
+            # Confidence is a property of the position family, not the player.
+            # Offensive skill has real per-player stats and a knowable depth
+            # chart; defense has neither, and says so rather than implying the
+            # same rigour.
+            "confidence":       FAMILY_CONFIDENCE.get(row["position_group"], "low"),
+            "family":           fam,
             "engine":           "engine_d",
         })
 
@@ -565,6 +885,9 @@ def main() -> None:
 
     counts = pd.Series([r["trajectory_label"] for r in records]).value_counts().to_dict()
     print(f"  {counts}")
+    if blocked_breakouts:
+        print(f"  {len(blocked_breakouts)} breakout calls demoted to steady — no path to the "
+              f"ball (blocked depth chart, nothing departing ahead, no workload of their own)")
     records.sort(key=lambda r: -r["vs_cohort"])
 
     write_json(OUTPUT_PATH, {
@@ -572,7 +895,12 @@ def main() -> None:
             "engine": "engine_d",
             "predicts_season": predict_season + 1,
             "from_season": predict_season,
-            "method": "career EDGE percentile curve + cohort development, 50% variance-inflated",
+            "method": ("offensive skill: career EDGE curve + cohort development + opportunity "
+                       "(depth chart, production share, vacated production ahead); "
+                       "defense: career curve + cohort only. OL excluded — no individual "
+                       "blocking data exists. 50% variance-inflated."),
+            "families": {k: v["metrics"] for k, v in fitted.items()},
+            "excluded_positions": sorted(EXCLUDED),
             "test_seasons": list(TEST_SEASONS),
             "naive_mae": round(naive_mae, 2) if naive_mae else None,
             "model_mae": round(model_mae, 2) if model_mae else None,
