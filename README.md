@@ -264,6 +264,16 @@ pytest tests/ -v
 
 ---
 
+## Documentation
+
+| Document | What it covers |
+|----------|----------------|
+| [`docs/RATING_AND_PROJECTION_MODEL.md`](docs/RATING_AND_PROJECTION_MODEL.md) | How ratings and projections are built, **where they measurably fail**, and what EA CFB 27 could fix. Read this before changing either engine — it quantifies the OL problem (77% recruiting), the production-blind majority (67% of any roster), and the backup→starter blind spot (r = +0.10). Analysis only; nothing in it is implemented. |
+| [`docs/INTERNAL_REFERENCE.md`](docs/INTERNAL_REFERENCE.md) | File inventory, the export→frontend contract, and known contract gaps. |
+| [`docs/AUDIT_FINDINGS.md`](docs/AUDIT_FINDINGS.md) | Historical audit; §9 is the standing argument for absolute anchors over pool-relative scaling. |
+
+---
+
 ## Notes
 
 - Scripts 04 (On3 NIL) and 05 (ESPN coaching tracker) require Selenium + Chrome. Everything else runs over plain HTTP — script 08 reads EA's Next.js data route (`/_next/data/{buildId}/…/ratings.json?team=N`) directly, no browser needed.
