@@ -233,7 +233,12 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
     # was previously omitted here, so every exported player had edge_score=null
     # and the frontend's EDGE column rendered an em-dash for all 8,437 rows.
     if not edge.empty:
-        edge_slim = edge[["player_season_id", "edge_score", "stats_measured", "games_played"]] \
+        _ecols = ["player_season_id", "edge_score", "stats_measured", "games_played"]
+        # A defensive back's overall IS his three archetypes, so the card has to
+        # be able to show them beside it.
+        _ecols += [c for c in ("archetypes", "archetype", "coverage_share")
+                   if c in edge.columns]
+        edge_slim = edge[_ecols] \
                         .rename(columns={"player_season_id": "edge_ps_id"})
         ratings_season = ratings_season.merge(edge_slim, left_on="player_season_id", right_on="edge_ps_id", how="left")
     else:
@@ -296,6 +301,9 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
             "recruit_year":     _i(row.get("recruit_year")),
             "season":           season,
             "edge_score":       _f(row.get("edge_score")),
+            "archetypes":       row.get("archetypes") if isinstance(row.get("archetypes"), dict) else None,
+            "archetype":        row.get("archetype") if isinstance(row.get("archetype"), str) else None,
+            "coverage_share":   _f(row.get("coverage_share")),
             "stats_measured":   _i(row.get("stats_measured")),
             "games_played":     _i(row.get("games_played")),
             "stats_season":     row.get("stats_season") if isinstance(row.get("stats_season"), dict) else None,
@@ -694,7 +702,9 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
 
     edge = T.get("player_edge", pd.DataFrame())
     if not edge.empty and "edge_score" in edge.columns:
-        edge_s = edge[["player_season_id", "edge_score"]].rename(
+        _rcols = ["player_season_id", "edge_score"]
+        _rcols += [c for c in ("archetypes", "archetype") if c in edge.columns]
+        edge_s = edge[_rcols].rename(
             columns={"player_season_id": "edge_ps_id"})
         merged = merged.merge(edge_s, left_on="id", right_on="edge_ps_id", how="left")
 
@@ -1082,11 +1092,71 @@ def export_player_transfers(T: dict, output_dir: Path) -> None:
 # Export: research/index.json
 # ---------------------------------------------------------------------------
 
-def export_ea_ratings(T: dict, output_dir: Path) -> None:
-    """EA CFB 27 overalls, slimmed to what the side-by-side needs.
+# The handful of EA attributes that actually describe a position, so a player's
+# card can show what EA thinks he is rather than only what it thinks he is worth.
+# Shipping all 54 would be a 12 MB file to say very little.
+EA_ATTRS_BY_POS = {
+    "QB":   ["throwPower", "throwAccuracyShort", "throwAccuracyMid", "throwAccuracyDeep",
+             "throwUnderPressure", "awareness", "speed"],
+    "RB":   ["speed", "acceleration", "agility", "breakTackle", "carrying", "bCVision", "trucking"],
+    "WR":   ["speed", "catching", "shortRouteRunning", "mediumRouteRunning",
+             "deepRouteRunning", "spectacularCatch", "catchInTraffic"],
+    "TE":   ["catching", "shortRouteRunning", "catchInTraffic", "runBlock", "speed", "strength"],
+    "OL":   ["passBlock", "runBlock", "passBlockPower", "runBlockPower",
+             "impactBlocking", "strength", "awareness"],
+    "EDGE": ["powerMoves", "finesseMoves", "blockShedding", "pursuit", "tackle",
+             "strength", "acceleration"],
+    "DL":   ["powerMoves", "finesseMoves", "blockShedding", "pursuit", "tackle",
+             "strength", "acceleration"],
+    "LB":   ["tackle", "hitPower", "pursuit", "playRecognition", "zoneCoverage",
+             "blockShedding", "speed"],
+    "CB":   ["manCoverage", "zoneCoverage", "press", "speed", "acceleration",
+             "playRecognition", "tackle"],
+    "S":    ["zoneCoverage", "manCoverage", "playRecognition", "tackle", "hitPower",
+             "speed", "pursuit"],
+    "DB":   ["manCoverage", "zoneCoverage", "press", "speed", "playRecognition", "tackle"],
+    "K":    ["kickPower", "kickAccuracy", "awareness"],
+    "P":    ["kickPower", "kickAccuracy", "awareness"],
+}
 
-    The raw table carries 54 attributes per player (12 MB). Nothing in the UI
-    reads them yet, so only the identifying fields and the overall ship.
+# EA's own position labels -> our 12 groups, for picking the attribute set.
+_EA_POS_TO_GROUP = {
+    "QB": "QB", "HB": "RB", "RB": "RB", "FB": "RB", "WR": "WR", "TE": "TE",
+    "LT": "OL", "LG": "OL", "C": "OL", "RG": "OL", "RT": "OL", "OL": "OL",
+    "LE": "EDGE", "RE": "EDGE", "DE": "EDGE", "EDGE": "EDGE", "LEDG": "EDGE", "REDG": "EDGE",
+    "DT": "DL", "DL": "DL",
+    "LOLB": "LB", "ROLB": "LB", "MLB": "LB", "LB": "LB",
+    "MIKE": "LB", "WILL": "LB", "SAM": "LB",
+    "CB": "CB", "FS": "S", "SS": "S", "S": "S", "DB": "DB", "K": "K", "P": "P",
+}
+
+_ATTR_LABELS = {
+    "throwPower": "Throw Power", "throwAccuracyShort": "Short Accuracy",
+    "throwAccuracyMid": "Mid Accuracy", "throwAccuracyDeep": "Deep Accuracy",
+    "throwUnderPressure": "Under Pressure", "awareness": "Awareness",
+    "speed": "Speed", "acceleration": "Acceleration", "agility": "Agility",
+    "breakTackle": "Break Tackle", "carrying": "Carrying", "bCVision": "Vision",
+    "trucking": "Trucking", "catching": "Catching",
+    "shortRouteRunning": "Short Routes", "mediumRouteRunning": "Mid Routes",
+    "deepRouteRunning": "Deep Routes", "spectacularCatch": "Spectacular Catch",
+    "catchInTraffic": "Catch in Traffic", "runBlock": "Run Block",
+    "passBlock": "Pass Block", "passBlockPower": "Pass Block Power",
+    "runBlockPower": "Run Block Power", "impactBlocking": "Impact Blocking",
+    "strength": "Strength", "powerMoves": "Power Moves",
+    "finesseMoves": "Finesse Moves", "blockShedding": "Block Shedding",
+    "pursuit": "Pursuit", "tackle": "Tackle", "hitPower": "Hit Power",
+    "playRecognition": "Play Recognition", "zoneCoverage": "Zone Coverage",
+    "manCoverage": "Man Coverage", "press": "Press",
+    "kickPower": "Kick Power", "kickAccuracy": "Kick Accuracy",
+}
+
+
+def export_ea_ratings(T: dict, output_dir: Path) -> None:
+    """EA CFB 27 overalls plus a position-relevant slice of their attributes.
+
+    The raw table carries 54 attributes per player (12 MB). Shipping the six or
+    seven that describe the position keeps the file small while letting a card
+    say what EA thinks a player *is*, not just what he is worth.
     """
     ea = T.get("ea_ratings")
     if ea is None or ea.empty:
@@ -1109,15 +1179,28 @@ def export_ea_ratings(T: dict, output_dir: Path) -> None:
     for r in ea.itertuples(index=False):
         pid = _i(getattr(r, "player_id", None))
         tid = tid_by_pid.get(pid) if pid else None
+        pos = getattr(r, "position", None)
+        grp = _EA_POS_TO_GROUP.get(pos)
+
+        attrs = getattr(r, "attributes", None)
+        picked = []
+        if isinstance(attrs, dict) and grp:
+            for key in EA_ATTRS_BY_POS.get(grp, []):
+                v = _i(attrs.get(key))
+                if v is not None:
+                    picked.append({"key": key, "label": _ATTR_LABELS.get(key, key), "value": v})
+
         rows.append({
             "ea_player_id": _i(getattr(r, "ea_player_id", None)),
             "player_id":    pid,
             "name":         getattr(r, "name", None),
             "team_id":      tid,
             "team":         school_by_tid.get(tid) or getattr(r, "ea_team", None),
-            "position":     getattr(r, "position", None),
+            "position":     pos,
+            "position_group": grp,
             "class_year":   getattr(r, "class_year", None),
             "ovr":          _i(getattr(r, "ovr", None)),
+            "attributes":   picked or None,
         })
     rows.sort(key=lambda x: x["ovr"] or 0, reverse=True)
     name = f"ea_ratings_{season}.json" if season else "ea_ratings.json"

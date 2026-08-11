@@ -268,12 +268,36 @@ def main() -> None:
         if pid is None:
             continue
         pg = row.position_group
-        if pg in EXCLUDED_POSITIONS:
-            counts["excluded_ol"] += 1
-            continue
         cy = row.year
         tid = int(row.team_id) if pd.notna(row.team_id) else None
         ea_ovr = ea_by_pid.get(pid)
+
+        # Positions we refuse to project still get a row, carrying no rating of
+        # ours but keeping EA's opinion. Declining to publish a number is not a
+        # reason to withhold the one number that does exist for these players —
+        # an offensive lineman's card should show EA's overall next to our
+        # stated refusal, not two blanks.
+        if pg in EXCLUDED_POSITIONS:
+            counts["excluded_ol"] += 1
+            out.append({
+                "player_season_id":      int(row.id),
+                "season":                season,
+                "overall_rating":        None,
+                "position_rating":       None,
+                "trajectory_score":      None,
+                "trajectory":            None,
+                "breakout_probability":  None,
+                "shap_values":           None,
+                "model_version":         "projected-v1",
+                "engine":                "projected",
+                "provenance":            "not_projected",
+                "projection_source":     None,
+                "projection_confidence": None,
+                "projection_low":        None,
+                "projection_high":       None,
+                "ea_ovr":                ea_ovr,
+            })
+            continue
 
         ovr = source = None
         low = high = None
@@ -347,9 +371,16 @@ def main() -> None:
         print("ERROR: nothing projected")
         sys.exit(1)
 
-    vals = np.array([r["overall_rating"] for r in out])
+    # Rows for positions we decline to project carry no rating and must not
+    # enter the distribution gate — a pile of Nones would poison every statistic.
+    vals = np.array([r["overall_rating"] for r in out if r["overall_rating"] is not None])
+    n_unrated = len(out) - len(vals)
+    if not len(vals):
+        print("ERROR: nothing projected")
+        sys.exit(1)
     print(f"  projected OVR: mean {vals.mean():.1f}  SD {vals.std():.1f}  "
-          f"min {vals.min():.1f}  max {vals.max():.1f}")
+          f"min {vals.min():.1f}  max {vals.max():.1f}"
+          + (f"   (+{n_unrated} rows carrying EA only, no rating of ours)" if n_unrated else ""))
 
     # Distribution gate — the standing rule is that a season's ratings must not
     # silently compress. Compare against last season's earned distribution.

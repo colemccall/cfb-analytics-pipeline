@@ -50,11 +50,22 @@ class TestPositionCeilings:
         out = composite_to_ovr(np.array([1.0, 0.65]), "OL")
         assert out.max() == pytest.approx(88.0)
 
-    def test_kickers_can_reach_the_mid_90s(self):
-        assert composite_to_ovr(np.array([0.75]), "K")[0] == pytest.approx(96.0)
+    @pytest.mark.parametrize("pg", ["K", "P"])
+    def test_specialists_stay_in_a_narrow_band(self, pg):
+        """A perfect specialist season tops out near 90, not in the high 90s.
 
-    def test_punters_can_reach_97(self):
-        assert composite_to_ovr(np.array([1.0]), "P")[0] == pytest.approx(97.0)
+        These positions used to reach 96-97, which put 38 punters at 85+ and 9 at
+        90+ in a single season — a punter outranked the receivers on his own team
+        page. Their impact range is genuinely narrower than a skill player's, so
+        their rating band is too.
+        """
+        assert composite_to_ovr(np.array([1.0]), pg)[0] == pytest.approx(90.0)
+
+    @pytest.mark.parametrize("pg", ["K", "P"])
+    def test_an_average_specialist_is_an_average_player(self, pg):
+        """Mid-range production must not read as a star. Was the whole problem."""
+        mid = composite_to_ovr(np.array([0.55 if pg == "K" else 0.60]), pg)[0]
+        assert 58 <= mid <= 68, f"{pg} mid-range composite rated {mid}"
 
     def test_nobody_lands_below_the_floor(self):
         for pg in ANCHORS:

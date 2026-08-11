@@ -127,12 +127,47 @@ OVR_FLOOR, OVR_CEIL = 40.0, 99.0
 BREAKOUT_VS_COHORT =  3.0
 DECLINE_VS_COHORT  = -3.0
 
+# ── Interrupted seasons: injury and redshirt ───────────────────────────────
+# A season cut short is not evidence of decline, but a career curve cannot tell
+# the difference — it sees the number fall and projects it to keep falling.
+#
+# Both failure directions showed up in real players. Whit Weeks played 12 games
+# in 2024 (98th percentile among LBs) and 6 in 2025 (69th); the curve read a knee
+# as a collapse. Jaden Mickey's 3-game 2024 at Notre Dame dragged his career mean
+# down and his SD up far enough that a career-best 2025 at Boise State looked
+# like an outlier to regress away — he projected DOWN 9.6 points off his best
+# season.
+#
+# The rule has to separate "hurt" from "backup". A true freshman who plays four
+# games is a reserve; a starter who plays four games is injured. What separates
+# them is whether he had ALREADY shown he could be available, so the test is
+# relative to his own prior best — and reads prior seasons only, so nothing
+# leaks backward from the season being predicted.
+AVAIL_INTERRUPTED = 0.60   # under 60% of his team's games, AND
+AVAIL_DROP_RATIO  = 0.60   # at most 60% of his own prior best availability,
+AVAIL_PRIOR_FLOOR = 0.50   # having previously reached 50% — a real contributor,
+                           # not a deep reserve whose game count is just noise.
+MIN_HEALTHY_SEASONS = 2    # below this there is nothing to be selective about
+
+# A bounceback is not a breakout. Returning to a level you already established is
+# a different claim than exceeding it, and calling both "breakout" made the label
+# useless for the players it most obviously described.
+BOUNCEBACK_MARGIN = 3.0    # OVR, both for "is he actually rising" and for
+                           # "is he merely returning to his own peak"
+
 # Career-shape features — every modelled position uses these.
 FEATURE_COLS = [
     "ovr", "pct_last", "pct_slope", "pct_peak", "pct_from_peak", "pct_mean",
     "pct_sd", "pct_accel", "n_seasons", "games_last", "games_mean",
     "opp_sp_last", "opp_sp_trend", "class_year", "stars", "composite_score",
     "cohort_delta", "cohort_next", "pos_enc",
+    # Availability, and the same career shape measured over healthy seasons
+    # only. Both readings are supplied rather than the healthy one replacing
+    # the raw one: the gap between them is itself the signal that a season was
+    # interrupted, and the model is free to learn how much to trust each.
+    "last_interrupted", "n_interrupted", "avail_last", "avail_prior_max",
+    "pct_last_healthy", "pct_slope_healthy", "pct_mean_healthy",
+    "pct_sd_healthy", "pct_peak_healthy", "pct_accel_healthy",
 ]
 
 # Opportunity features — offensive skill only, because they require per-player
@@ -165,6 +200,16 @@ DRIVER_LABELS = {
     "cohort_delta":    "typical development at this stage",
     "cohort_next":     "cohort baseline",
     "pos_enc":         "position",
+    "last_interrupted":  "last season cut short",
+    "n_interrupted":     "seasons lost to injury",
+    "avail_last":        "share of his team's games played",
+    "avail_prior_max":   "availability when healthy",
+    "pct_last_healthy":  "production in his last full season",
+    "pct_slope_healthy": "career trend excluding injured seasons",
+    "pct_mean_healthy":  "career average when healthy",
+    "pct_sd_healthy":    "consistency when healthy",
+    "pct_peak_healthy":  "best healthy season",
+    "pct_accel_healthy": "recent acceleration excluding injured seasons",
     # Opportunity
     "yds":                 "production last season",
     "prev_yds":            "production the year before",
@@ -210,6 +255,58 @@ def _recency_weighted_slope(seasons, values) -> float:
     return float(np.average((x - xm) * (y - ym), weights=w) / den)
 
 
+def flag_interruptions(avails) -> list:
+    """Which of these seasons were cut short, judged only from what came before.
+
+    Prior-only by construction: season i is compared against seasons < i, never
+    against the future. A model that could see forward here would be learning
+    from information it will not have at prediction time.
+    """
+    flags, prior_max = [], 0.0
+    for a in avails:
+        a = float(a or 0.0)
+        flags.append(bool(
+            a < AVAIL_INTERRUPTED
+            and prior_max >= AVAIL_PRIOR_FLOOR
+            and a <= AVAIL_DROP_RATIO * prior_max
+        ))
+        prior_max = max(prior_max, a)
+    return flags
+
+
+def derive_class_year(seasons, recruit_years, first_seasons) -> np.ndarray:
+    """Class year, derived — because the stored one is not a class year at all.
+
+    `player_seasons.year` is a static player attribute, not a per-season value.
+    Of 29,722 players with three or more seasons and a plausible stored value, it
+    is CONSTANT across the whole career for 84% and erratic for the rest; not one
+    increments correctly. On top of that it holds a calendar year outright for
+    114,612 of 269,552 rows, almost all before 2017.
+
+    That silently broke the cohort curves, which are the explainable backbone of
+    every projection: a cell keyed (position, class year) was not measuring what
+    juniors do next, it was mixing one player's freshman, sophomore and junior
+    seasons under whichever label he happened to carry. Jaden Mickey played four
+    seasons and was labelled a junior in all of them.
+
+    Two anchors, in order of trust:
+      1. recruit_year from the recruiting table — a real enrolment date,
+         available for 52% of player-seasons.
+      2. the first season we observe him — a FLOOR, not a truth: a career that
+         began before our data starts looks younger than it was.
+    Where both apply they agree exactly 72% of the time and within a year 90%.
+    """
+    seasons = np.asarray(seasons, dtype=float)
+    ry = pd.to_numeric(pd.Series(recruit_years).reset_index(drop=True),
+                       errors="coerce").to_numpy(dtype=float)
+    fs = np.asarray(first_seasons, dtype=float)
+
+    from_recruit = seasons - ry + 1.0
+    from_first = np.clip(seasons - fs + 1.0, 1, 6)
+    usable = np.isfinite(from_recruit) & (from_recruit >= 1) & (from_recruit <= 6)
+    return np.where(usable, from_recruit, from_first)
+
+
 def build_career_frame(ratings_df, player_seasons_df, player_edge_df,
                        recruiting_df, players_df) -> pd.DataFrame:
     """One row per player-season carrying the shape of that player's career so far."""
@@ -230,24 +327,71 @@ def build_career_frame(ratings_df, player_seasons_df, player_edge_df,
     # is comparable across eras and across positions.
     df["edge_pct"] = df.groupby(["season", "position_group"])["edge_score"].rank(pct=True) * 100
 
+    # Availability — what share of his team's season he was actually on the field
+    # for. A team's season length is the most games any of its rated players
+    # appeared in, which is robust to 12- vs 13-game years, to bowl games and to
+    # 2020. Raw games_played cannot serve here: 6 games means something entirely
+    # different in 2020 than in 2024.
+    tg = (df.groupby(["team_id", "season"])["games_played"].max()
+            .rename("team_games").reset_index())
+    df = df.merge(tg, on=["team_id", "season"], how="left")
+    df["avail"] = (df["games_played"].fillna(0)
+                   / df["team_games"].fillna(1).clip(lower=1)).clip(0, 1)
+
+    # Class year, derived rather than read — see derive_class_year.
+    _ry = pd.Series(dtype=float)
+    if not recruiting_df.empty and "recruit_year" in recruiting_df.columns:
+        _r = recruiting_df[recruiting_df["player_id"].notna()].copy()
+        _r["player_id"] = _r["player_id"].astype("int64")
+        _ry = (_r.sort_values("recruit_year").drop_duplicates("player_id")
+                 .set_index("player_id")["recruit_year"])
+    _stored = pd.to_numeric(df["class_year"], errors="coerce")
+    df["class_year"] = derive_class_year(
+        df["season"].to_numpy(),
+        df["player_id"].map(_ry) if len(_ry) else pd.Series([np.nan] * len(df)),
+        df.groupby("player_id")["season"].transform("min").to_numpy(),
+    )
+    _moved = int((_stored != df["class_year"]).sum())
+    print(f"  class year derived for {len(df)} rows "
+          f"({_moved} differ from the stored value, which does not increment)")
+
     df = df.sort_values(["player_id", "season"])
     career = defaultdict(list)
     for r in df.itertuples(index=False):
         career[r.player_id].append(
-            (r.season, r.edge_pct, r.games_played or 0, r.opponent_avg_sp or 0.0)
+            (r.season, r.edge_pct, r.games_played or 0, r.opponent_avg_sp or 0.0,
+             r.avail, r.ovr, r.class_year)
         )
 
     rows = []
     for pid, hist in career.items():
+        all_avails = [p[4] for p in hist]
+        all_flags  = flag_interruptions(all_avails)
+        all_class  = [p[6] for p in hist]
         for i in range(len(hist)):
             prior = hist[: i + 1]                       # career through this season
             seasons = [p[0] for p in prior]
             pcts    = [p[1] for p in prior]
             games   = [p[2] for p in prior]
             opps    = [p[3] for p in prior]
+            avails  = all_avails[: i + 1]
+            ovrs    = [p[5] for p in prior]
+            cut     = all_flags[: i + 1]
+
+            # Career shape over the seasons he was actually available. Falls back
+            # to the full career when there is not enough healthy history to be
+            # selective — with one healthy season there is no trend to measure.
+            keep = [j for j in range(len(prior)) if not cut[j]]
+            if len(keep) < MIN_HEALTHY_SEASONS:
+                keep = list(range(len(prior)))
+            h_seasons = [seasons[j] for j in keep]
+            h_pcts    = [pcts[j]    for j in keep]
+            h_ovrs    = [ovrs[j]    for j in keep if ovrs[j] == ovrs[j]]
+
             rows.append({
                 "player_id":     pid,
                 "season":        seasons[-1],
+                "class_year_fix": all_class[i],
                 "n_seasons":     len(prior),
                 "pct_last":      pcts[-1],
                 "pct_slope":     _recency_weighted_slope(seasons, pcts),
@@ -260,14 +404,37 @@ def build_career_frame(ratings_df, player_seasons_df, player_edge_df,
                 "games_mean":    float(np.mean(games)),
                 "opp_sp_last":   float(opps[-1]),
                 "opp_sp_trend":  float(opps[-1] - np.mean(opps[:-1])) if len(opps) > 1 else 0.0,
-                # kept for the explanation, not fed to the model
+                # Availability and the healthy-only career shape
+                "last_interrupted":  int(cut[-1]),
+                "n_interrupted":     int(sum(cut)),
+                "avail_last":        float(avails[-1]),
+                "avail_prior_max":   float(max(avails[:-1])) if len(avails) > 1 else float(avails[-1]),
+                "pct_last_healthy":  float(h_pcts[-1]),
+                "pct_slope_healthy": _recency_weighted_slope(h_seasons, h_pcts),
+                "pct_mean_healthy":  float(np.mean(h_pcts)),
+                "pct_sd_healthy":    float(np.std(h_pcts)) if len(h_pcts) > 1 else 0.0,
+                "pct_peak_healthy":  float(max(h_pcts)),
+                # Acceleration is a second difference, so a single interrupted
+                # season poisons it twice. Jaden Mickey's raw path 11 → 57 → 16*
+                # → 91 gives +116 — an unsustainable-looking leap that is
+                # entirely the 3-game season sitting in the middle. Over the
+                # seasons he played it is -12.
+                "pct_accel_healthy": ((h_pcts[-1] - h_pcts[-2]) - (h_pcts[-2] - h_pcts[-3]))
+                                     if len(h_pcts) >= 3 else 0.0,
+                # kept for the explanation and the labels, not fed to the model
+                "_ovr_peak_healthy": float(max(h_ovrs)) if h_ovrs else float("nan"),
                 "_pct_path":     [round(p, 1) for p in pcts[-4:]],
                 "_seasons_path": seasons[-4:],
+                "_cut_path":     [bool(c) for c in cut[-4:]],
             })
 
     C = pd.DataFrame(rows)
     C = C.merge(df[["player_id", "season", "ps_id", "position_group", "class_year", "ovr", "team_id"]],
                 on=["player_id", "season"], how="left")
+    # class_year on `df` is already the derived one; keep the per-row copy so a
+    # career's rows carry the value that belonged to that season.
+    C["class_year"] = C["class_year_fix"]
+    C = C.drop(columns=["class_year_fix"])
 
     if not recruiting_df.empty:
         rb = (recruiting_df.sort_values("composite_score", ascending=False)
@@ -426,7 +593,9 @@ def build_cohort_curves(C: pd.DataFrame, train_mask) -> tuple:
     T = C[train_mask]
     global_delta = float((T["next_ovr"] - T["ovr"]).mean())
 
-    T = T.assign(pct_bucket=(T["pct_last"] // 10).clip(0, 9))
+    # Bucket the cells exactly the way they will be looked up, or a player is
+    # compared against a cohort assembled under a different rule.
+    T = T.assign(pct_bucket=(_cohort_reference_pct(T) // 10).clip(0, 9))
     g = T.groupby(["position_group", "class_year", "pct_bucket"])
     full = g.apply(lambda d: pd.Series({
         "delta": float((d["next_ovr"] - d["ovr"]).mean()),
@@ -452,8 +621,21 @@ def build_cohort_curves(C: pd.DataFrame, train_mask) -> tuple:
     return lookup, global_delta
 
 
+def _cohort_reference_pct(C: pd.DataFrame) -> pd.Series:
+    """Which production level to look the cohort baseline up at.
+
+    A player whose last season was cut short belongs with the players he
+    resembles when healthy, not with the ones who genuinely produced that little.
+    Bucketing Whit Weeks on his 6-game 2025 filed him among replacement-level
+    linebackers and handed him their development curve.
+    """
+    if "last_interrupted" not in C.columns:
+        return C["pct_last"]
+    return C["pct_last"].where(C["last_interrupted"] != 1, C["pct_last_healthy"])
+
+
 def apply_cohort(C: pd.DataFrame, lookup: dict, global_delta: float) -> pd.DataFrame:
-    bucket = (C["pct_last"] // 10).clip(0, 9)
+    bucket = (_cohort_reference_pct(C) // 10).clip(0, 9)
     deltas, ns = [], []
     for pg, cy, pb in zip(C["position_group"], C["class_year"], bucket):
         hit = lookup["full"].get((pg, cy, pb)) or lookup["coarse"].get((pg, cy))
@@ -473,12 +655,30 @@ def apply_cohort(C: pd.DataFrame, lookup: dict, global_delta: float) -> pd.DataF
 # Explanation
 # ---------------------------------------------------------------------------
 
-def _describe_path(path, seasons) -> str:
+def _describe_path(path, seasons, cut=None) -> str:
+    """The career percentile path, marking seasons that were cut short.
+
+    Comparing only the endpoints called 50 → 81 → 12 → 60 a climb. Where a
+    season was interrupted, say so — a dip nobody was on the field for is not a
+    trend, and the sentence has to stop implying that it is.
+    """
     if len(path) < 2:
         return ""
-    arrows = " → ".join(f"{p:.0f}" for p in path)
-    direction = "climbed" if path[-1] > path[0] else "slipped" if path[-1] < path[0] else "held"
-    return f"His production percentile has {direction} across {len(path)} seasons ({arrows})."
+    cut = list(cut or [False] * len(path))
+    cut = cut[-len(path):] + [False] * max(0, len(path) - len(cut))
+    arrows = " → ".join(f"{p:.0f}{'*' if c else ''}" for p, c in zip(path, cut))
+
+    healthy = [p for p, c in zip(path, cut) if not c]
+    ref = healthy if len(healthy) >= 2 else path
+    direction = ("climbed" if ref[-1] > ref[0]
+                 else "slipped" if ref[-1] < ref[0] else "held")
+    s = f"His production percentile has {direction} across {len(path)} seasons ({arrows})."
+    if any(cut):
+        n = sum(cut)
+        s += (f" The starred {'season' if n == 1 else 'seasons'} "
+              f"{'was' if n == 1 else 'were'} cut short — that dip is availability, "
+              f"not decline.")
+    return s
 
 
 def build_explanation(row, drivers, comparables) -> str:
@@ -490,7 +690,7 @@ def build_explanation(row, drivers, comparables) -> str:
 
     path = row.get("_pct_path") or []
     seasons = row.get("_seasons_path") or []
-    trend = _describe_path(path, seasons)
+    trend = _describe_path(path, seasons, row.get("_cut_path"))
     if trend:
         parts.append(f"A {cls} {pos}. {trend}")
     else:
@@ -517,6 +717,20 @@ def build_explanation(row, drivers, comparables) -> str:
     else:
         parts.append("We project him right at that baseline.")
 
+    # Availability. When last season was cut short this is usually the single
+    # most important thing about the projection, and stating it is what keeps a
+    # large positive delta from reading as an unexplained jump.
+    if int(row.get("last_interrupted") or 0) == 1:
+        g = int(row.get("games_last") or 0)
+        peak = row.get("_ovr_peak_healthy")
+        s = (f"He played {g} game{'s' if g != 1 else ''} last season after being "
+             f"available for {float(row.get('avail_prior_max') or 0):.0%} of his team's "
+             f"games before that, so last year's rating understates him.")
+        if peak == peak and peak:
+            s += (f" We are projecting a return toward the {float(peak):.0f} he "
+                  f"posted in a full season, not new ground.")
+        parts.append(s)
+
     # Opportunity, stated the way a fan would state it. This is often the whole
     # story for a skill player and is invisible in a career curve.
     parts.append(_opportunity_sentence(row))
@@ -533,9 +747,16 @@ def build_explanation(row, drivers, comparables) -> str:
 _RANK_WORD = {1: "the clear number one", 2: "second in line", 3: "third in line"}
 
 # Thresholds for "he can realistically get the ball next season".
-PATH_TOP_DEPTH   = 2      # first or second at his position on the new roster
-PATH_VACATED     = 0.25   # a quarter of the work ahead of him is leaving
-PATH_OWN_VOLUME  = 300    # or he already carries a real workload himself
+#
+# How deep a room still counts as playing time is a property of the position,
+# not a constant. Most teams rotate three to five receivers through real snaps,
+# so a WR3 is a starter in everything but the depth chart's wording, while a QB2
+# is a spectator. Applying the same rank-2 cut everywhere buried exactly the
+# receivers whose ratings were already too low.
+PATH_TOP_DEPTH_BY_POS = {"WR": 4, "RB": 3, "TE": 2, "QB": 1}
+PATH_TOP_DEPTH        = 2      # anything else: first or second on the new roster
+PATH_VACATED          = 0.25   # a quarter of the work ahead of him is leaving
+PATH_OWN_VOLUME       = 300    # or he already carries a real workload himself
 
 
 def _has_path_to_the_ball(row) -> bool:
@@ -551,7 +772,8 @@ def _has_path_to_the_ball(row) -> bool:
     rank = num(row.get("next_depth_rank"))
     vac  = num(row.get("vacated_ahead_share"))
     yds  = num(row.get("yds"))
-    if rank is not None and rank <= PATH_TOP_DEPTH:
+    top_depth = PATH_TOP_DEPTH_BY_POS.get(row.get("position_group"), PATH_TOP_DEPTH)
+    if rank is not None and rank <= top_depth:
         return True
     if vac is not None and vac >= PATH_VACATED:
         return True
@@ -813,7 +1035,7 @@ def main() -> None:
     comp_pool = D[_between(D["season"], (TRAIN_SEASONS[0], VALID_SEASONS[1]))]
     print("Finding comparables and writing explanations...")
 
-    records, details, blocked_breakouts = [], {}, []
+    records, details, blocked_breakouts, bouncebacks = [], {}, [], []
     for idx, row in P.iterrows():
         sv_row, feats = shap_by_idx.get(idx, (None, FEATURE_COLS))
         if sv_row is None:
@@ -830,6 +1052,19 @@ def main() -> None:
         vs = float(row["vs_cohort"])
         label = ("breakout" if vs >= BREAKOUT_VS_COHORT
                  else "decline" if vs <= DECLINE_VS_COHORT else "steady")
+
+        # A player coming back from a lost season is not breaking out — he is
+        # returning to a level he already reached, which is a different and much
+        # better-supported claim. Whit Weeks was called a breakout off a 6-game
+        # 2025 when the season being projected was really a return to his 2024.
+        # Exceeding the healthy peak by more than the margin is still a breakout.
+        if int(row.get("last_interrupted") or 0) == 1:
+            peak = float(row.get("_ovr_peak_healthy") or float("nan"))
+            rising = float(row["predicted_ovr"]) - float(row["ovr"]) >= BOUNCEBACK_MARGIN
+            if rising and peak == peak and \
+                    float(row["predicted_ovr"]) <= peak + BOUNCEBACK_MARGIN:
+                label = "bounceback"
+                bouncebacks.append(row["name"])
 
         # A breakout needs a path to the ball. Regression toward the mean makes
         # the model optimistic about anyone rated near the floor, so without
@@ -865,6 +1100,14 @@ def main() -> None:
             "cohort_n":         int(row["cohort_n"]),
             "vs_cohort":        round(vs, 1),
             "trajectory_label": label,
+            # Availability travels with the projection: a number built off a
+            # half season should say so wherever it is rendered.
+            "last_interrupted": int(row.get("last_interrupted") or 0),
+            "games_last":       int(row.get("games_last") or 0),
+            "avail_last":       round(float(row.get("avail_last") or 0.0), 3),
+            "healthy_peak_ovr": (round(float(row["_ovr_peak_healthy"]), 1)
+                                 if row.get("_ovr_peak_healthy") == row.get("_ovr_peak_healthy")
+                                 else None),
             "shap_top_feature": drivers[0]["label"] if drivers else None,
             # Confidence is a property of the position family, not the player.
             # Offensive skill has real per-player stats and a knowable depth
@@ -881,6 +1124,7 @@ def main() -> None:
             "comparables":   comparables,
             "edge_pct_path": row["_pct_path"],
             "seasons_path":  [int(s) for s in row["_seasons_path"]],
+            "interrupted_path": [bool(c) for c in (row.get("_cut_path") or [])],
         }
 
     counts = pd.Series([r["trajectory_label"] for r in records]).value_counts().to_dict()
@@ -888,6 +1132,9 @@ def main() -> None:
     if blocked_breakouts:
         print(f"  {len(blocked_breakouts)} breakout calls demoted to steady — no path to the "
               f"ball (blocked depth chart, nothing departing ahead, no workload of their own)")
+    if bouncebacks:
+        print(f"  {len(bouncebacks)} projections relabelled bounceback — returning to a level "
+              f"already reached before a season cut short, not breaking new ground")
     records.sort(key=lambda r: -r["vs_cohort"])
 
     write_json(OUTPUT_PATH, {

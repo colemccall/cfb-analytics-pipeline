@@ -135,19 +135,32 @@ class TestProvenance:
     """A projected rating must never be able to pass as an earned one."""
 
     def test_projected_seasons_carry_provenance(self, manifest):
+        """Every row says what it is. "not_projected" is a legitimate answer —
+        offensive linemen are exported so EA's opinion can be shown beside our
+        refusal — but it must come with no rating of ours attached."""
         for s in manifest["projected_seasons"]:
             players = _load(f"players_{s}.json")
             assert players, f"players_{s}.json is empty"
-            unmarked = [p for p in players if p.get("provenance") != "projected"]
+            unmarked = [p for p in players
+                        if p.get("provenance") not in ("projected", "not_projected")]
             assert not unmarked, (
-                f"{len(unmarked)} rows in players_{s}.json lack "
-                f'provenance="projected" (e.g. {unmarked[0].get("name")})'
+                f"{len(unmarked)} rows in players_{s}.json lack a provenance "
+                f'(e.g. {unmarked[0].get("name")})'
+            )
+            leaked = [p for p in players
+                      if p.get("provenance") == "not_projected"
+                      and p.get("overall_rating") is not None]
+            assert not leaked, (
+                f'{len(leaked)} rows are marked "not_projected" yet carry a '
+                f'rating (e.g. {leaked[0].get("name")} = {leaked[0].get("overall_rating")})'
             )
 
     def test_projected_rows_name_their_source(self, manifest):
         valid = {"engine_d", "carry", "recruiting", "ea_cfb27"}
         for s in manifest["projected_seasons"]:
             for p in _load(f"players_{s}.json"):
+                if p.get("overall_rating") is None:
+                    continue          # nothing was projected, so nothing to source
                 assert p.get("projection_source") in valid, (
                     f"{p.get('name')} has projection_source={p.get('projection_source')!r}"
                 )

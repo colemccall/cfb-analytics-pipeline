@@ -390,3 +390,259 @@ position room's shares and vacancy. Now backfilled by summing game rows.
 - §4e opportunity blindness for **defense**, which has no touches to count. Defensive
   ratings need reworking before their projections mean much; they ship marked low
   confidence in the meantime.
+
+---
+
+## 10. Rating calibration, v4.2 (2026-08-11)
+
+§9 rebuilt *projections*. This pass rebuilds the *ratings* they project from, after a
+position-by-position review. Seven complaints came in; all seven reproduced against the data.
+
+### The instrument that made it checkable
+
+Every claim below is measured against **EA Sports CFB 27** (9,013 players, on disk since
+the v3.2 pass), used as an independent scouting consensus covering the same 136 FBS teams.
+
+EA is a **reference, not a target**. It never supplies a number. It answers one question —
+*are we too generous, too stingy, is the ceiling in the right place* — and our own EDGE
+distribution supplies the scale. Rank-matching to EA every season would have reintroduced
+exactly the pool-relative scaling that AUDIT_FINDINGS §9 exists to forbid.
+
+The reason to trust it as a reference is that it independently reproduced the one position
+judged correct. TE was called "amazing" with no knowledge of EA's numbers; EA rates 17 tight
+ends at 85+ and 3 at 90+, and so did we. **TE was therefore left completely untouched**, as
+was OL.
+
+### What was actually wrong
+
+| Position | EA 85+ / 90+ | Ours, before | Diagnosis |
+|---|---|---|---|
+| QB | 27 / 9 | 38 / 5 | ceiling flat, else fine |
+| RB | 70 / 15 | 24 / 7 | ceiling flat, else fine |
+| WR | 83 / 15 | 45 / 9 | **middle far too low** |
+| TE | 17 / 3 | 17 / 4 | correct — untouched |
+| EDGE | 32 / 12 | 18 / 7, max **99** | thin at the top, tip too high |
+| DL | 33 / 7 | **45 / 14** | too generous |
+| LB | 45 / 10 | 54 / 16 | mildly generous |
+| CB+S+DB | **113 / 24** | **53 / 15** | less than half what it should be |
+| K | 5 / 0 | **17 / 7** | too generous |
+| P | **1 / 0** | **38 / 9** | 38× too generous |
+
+### Coverage denial — why the secondary was broken
+
+A defensive back's best games leave no trace. Quarterbacks stop throwing at a corner who
+covers, so the counting stats every position's score is built from measure, for this one
+position group, *the opposite of what we want*: volume accrues to the DBs who get picked on.
+Caleb Downs — a player no credible top-five safety list omits — rated **22nd among safeties**.
+
+The machinery to know which defenses were good already existed — `def_context_modifier` —
+but it is **multiplicative**, and 1.1 × a suppressed composite is still suppressed. That is
+the whole bug in one line. Credit has to be **additive** to survive the suppression it is
+correcting.
+
+So a DB who is one of his secondary's five regulars is credited for how few passing yards his
+defense allowed, whether or not the ball came near him — the same reasoning OL already runs
+on, and carrying the same humility.
+
+Two details were each wrong once before they were right:
+
+- **The denial signal is z-scored across teams over their season means, not across games.**
+  Per-game standardization measures game-to-game noise, nobody clears it, and almost no
+  credit is paid.
+- **Participation is rank within the secondary, not share of its tackles.** Share re-imports
+  the suppression: the avoided corner tackles less, so he would be credited less. On a share
+  rule a covered corner scored 0.68 of a full-timer. `tests/test_coverage_credit.py` locks
+  this down — it is the test that caught it.
+
+Tuned against EA (Spearman of our DB score vs EA's OVR, 2025, n=954):
+
+| Coverage credit | Spearman |
+|---|---|
+| none | 0.6386 |
+| ×3 | 0.6570 |
+| **×4 (peak, shipped at ×3.5)** | **0.6576** |
+| ×8 | 0.6521 |
+| ×4, **randomly chosen** defenses credited | **0.6293** |
+
+The placebo is the load-bearing row: crediting the same magnitude to random defenses scores
+*below not crediting at all*, so the gain is the denial signal rather than the extra points.
+
+### Defensive-back archetypes
+
+"Defensive back" is three jobs wearing one label, and a single composite made them
+compete on an axis they do not share. Each player-season now carries three sub-scores on
+one 0-10 axis:
+
+| Sub-rating | Built from | Note |
+|---|---|---|
+| **Ball hawk** | interceptions, pass breakups, defensive TDs | |
+| **Lockdown** | playing time x how little his defense allowed per pass | no box-score input at all |
+| **Run support** | tackles, TFLs, sacks | the only place tackles count as *production* |
+
+Tackles do double duty deliberately: production in run support, and evidence of playing
+time for the coverage credit — which is what lets a corner nobody throws at still register
+as a full-time player.
+
+The overall is the weighted sum of the three, by position:
+
+| | coverage | ball hawk | run support |
+|---|---|---|---|
+| CB | 0.40 | 0.40 | 0.20 |
+| S | 0.20 | 0.30 | 0.50 |
+| DB | 0.33 | 0.33 | 0.33 |
+
+This costs a little accuracy and buys explainability: Spearman against EA goes 0.660 ->
+0.655 (2025) and 0.555 -> 0.540 (2024) versus the flat stat composite. Accepted so that a
+defensive back's overall is literally the three numbers printed beside it. Reverting is
+one line.
+
+Two ways of combining them were rejected on measurement:
+
+- **Best skill plus partial credit for the rest** scored 0.643 — taking a max discards the
+  information that a player is good at two things.
+- The first scale constants were carried over from a prototype with a different denial
+  signal, leaving coverage topping out at 7.1 on a 0-10 axis while run support reached 20.
+  Coverage could not win a comparison it existed to win, and **25 of 2,026 defensive backs
+  typed as coverage players**. The constants are now each archetype's own 90th percentile,
+  and must be re-measured whenever the inputs change.
+
+### Receivers, and why the middle was too low
+
+A team rotates three to five receivers through real snaps. The anchors priced the WR3
+nationally as a reserve, which is a category error about the position rather than a
+mis-estimate of the player. The 72 and 77 anchors are now the last man in a 3.5-deep rotation
+and the rank-286 receiver. The same fact was wrong in the projection gate, where a WR sitting
+third was treated as buried; `PATH_TOP_DEPTH_BY_POS` now reads WR 4, RB 3, TE 2, QB 1.
+
+### Specialists
+
+The tell was a punter outranking the receivers on his own team page. K and P now top out near
+90, and an average specialist is an average player. Their impact range is genuinely narrower
+than a skill player's, which EA concludes independently (its punters top out at 85, with one
+above it nationally).
+
+While recalibrating: **`fg_long` is 25% of the kicker composite and had been reading
+`kickingLNG`, a key that does not exist.** It returned 0.0 for every kicker ever rated, and
+the old anchors were fitted on top of that hole.
+
+### Ceilings
+
+Set from our own history, in opposite directions because the complaints were opposite:
+
+- **offensive skill** — the *weakest* season's best player is a 96, so the best player in the
+  country always reads like one;
+- **defense** — the *typical* season's best is a 96, so a monster year can still exceed it and
+  only a historic one nears 99. A 99 was going to a very good season rather than a
+  generational one.
+
+The single best season on record maps to 99 either way.
+
+### Still open
+
+Unchanged from §9, minus the secondary: EA blocking attributes for OL, a talent prior for the
+production-blind majority, separating Production from Talent as two scales, and §4d top-end
+survivorship. Defensive **front-seven** ratings remain counting-stat driven with no equivalent
+of the coverage correction, because there is no analogous team proxy for "he was doubled".
+
+---
+
+## 11. Interrupted seasons, and a class year that was never a class year (2026-08-11)
+
+Two reported projections, one root cause: a career curve cannot tell a season a player
+*missed* from a season a player *declined*.
+
+**Whit Weeks** (LSU LB) played 12 games in 2024 at the 98th percentile among linebackers and
+6 games in 2025 at the 69th. The model projected him up — correctly — but computed
+`vs_cohort` against a baseline anchored on his injured rating, produced +21.0, and labelled
+him a **breakout**. 2024 was the breakout. 2026 is a return to it.
+
+**Jaden Mickey** played 3 games at Notre Dame in 2024 and a career-best 11-game 2025 at Boise
+State. The lost season dragged `pct_mean` down and `pct_sd` up until his best year read as an
+outlier, and he projected **down 9.6** off it.
+
+### Detecting an interruption without reading the future
+
+The hard part is separating *hurt* from *backup*: a true freshman playing 4 games is a
+reserve, a starter playing 4 games is injured. Availability is measured against **his team's
+games** — the most any of its rated players appeared in — because raw game counts are not
+comparable across 12-game, 13-game and 2020 seasons.
+
+A first attempt required an absolute 75% prior availability to count as "established". It
+caught Weeks and **missed Mickey**, whose prior best was 9/13 = 0.69: he was a rotation corner
+at Notre Dame, never a full-time starter. The test is therefore relative to *his own* prior
+best, not to an absolute idea of a starter:
+
+```
+interrupted  ⟺  avail < 0.60  ∧  prior_max ≥ 0.50  ∧  avail ≤ 0.60 × prior_max
+```
+
+Prior seasons only. A test asserts that truncating a career cannot change an earlier verdict —
+otherwise the model would be trained on information it will not have at prediction time.
+About 5% of player-seasons qualify.
+
+### Both readings are supplied, not one replacing the other
+
+Career shape is computed twice — raw, and over healthy seasons only — and both go to the
+model. The *gap between them* is the signal that a season was interrupted, and the model
+learns how much to trust each. Nine features: `last_interrupted`, `n_interrupted`,
+`avail_last`, `avail_prior_max`, `pct_last_healthy`, `pct_slope_healthy`, `pct_mean_healthy`,
+`pct_sd_healthy`, `pct_peak_healthy`, plus `pct_accel_healthy`.
+
+Acceleration mattered more than the rest. It is a second difference, so one interrupted season
+poisons it twice: Mickey's raw path 11 → 57 → 16\* → 91 gives **+116**, an unsustainable-looking
+leap that is entirely the 3-game season sitting in the middle. Over the seasons he played it is
+**−12**.
+
+The cohort lookup also buckets on the healthy percentile. Bucketing Weeks on his 6-game season
+filed him among replacement-level linebackers and handed him their development curve.
+
+### `bounceback` is its own label
+
+Returning to a level already posted is a different and better-supported claim than breaking new
+ground. A projection is relabelled when the last season was interrupted, the projection rises by
+at least 3 OVR, and it lands at or below the healthy peak plus that margin. Exceeding the healthy
+peak by more is still a breakout. 250 of 5,645 projections qualify.
+
+### The class year was never a class year
+
+`player_seasons.year` is a **static player attribute**. Of 29,722 players with three or more
+seasons and a plausible stored value, it is constant across the entire career for **84%** and
+erratic for the rest — not one increments correctly. It also holds an outright calendar year
+for 114,612 of 269,552 rows, almost all before 2017.
+
+Cohort curves are the explainable backbone of every projection, and a cell keyed
+`(position, class_year)` was not measuring what juniors do next — it was mixing one player's
+freshman, sophomore and junior seasons under whichever label he happened to carry. Mickey
+played four seasons and was a "junior" in all of them.
+
+Derived instead, in order of trust: `season − recruit_year + 1` where recruiting has him (52%
+of rows), else `season − first_observed_season + 1` as a **floor** (a career starting before
+2008 looks younger than it was). Where both apply they agree exactly 72% of the time and
+within one year 90%. 53,348 of 64,024 rows changed. Usable cohort cells rose from 255 to 334.
+
+### Measured
+
+| | naive | before | after |
+|---|---|---|---|
+| Offence (n=2,094) | 9.09 | 8.19 | **8.19** |
+| Defence (n=3,985) | 9.67 | 8.50 | **8.39** |
+
+Interval coverage 78.5% → 79.9% on defence. `decline` fell from 1,580 to 1,417; most of that
+was players being charged for a season they missed.
+
+### Still open
+
+**Mickey is only half fixed** — −9.6 to −9.4. The mechanical defects are gone (his lost season
+no longer poisons slope, mean, SD or acceleration, and his class year is right), but the model
+still regresses him, and defensibly: excluding the interrupted year his career average is the
+53rd percentile with a single 91st-percentile season, the senior cohort at that level loses 4.5
+(n=28), and his three closest historical shapes averaged −7.1.
+
+The remaining lever is that **standard deviation is direction-blind**. `pct_sd_healthy` scores
+Mickey's monotonic 11 → 57 → 91 climb as "inconsistent" identically to a player oscillating
+between the same values. A monotonicity measure alongside SD would separate steady development
+from volatility. That is a general improvement, not a fit to one player — which is why it is
+listed here rather than applied as a per-player adjustment.
+
+`player_seasons.year` is still exported to the frontend by script 12, so a player card can
+read "Junior" for a fourth-year senior. Only script 15 derives it today.

@@ -92,6 +92,12 @@ def main() -> None:
                 if tid is None or yr is None or not cs:
                     continue
                 cs_f = float(cs)
+                # NaN is truthy, so `not cs` above lets it through. A single one
+                # makes np.percentile return nan, which propagated all the way to
+                # a TypeError formatting R² — 189 unrated recruits took the whole
+                # script down.
+                if cs_f != cs_f:
+                    continue
                 rec_by_team_year[(int(tid), int(yr))].append(cs_f)
                 all_composites.append(cs_f)
             except (ValueError, TypeError):

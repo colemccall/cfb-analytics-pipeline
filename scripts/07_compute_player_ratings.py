@@ -114,37 +114,66 @@ ALL_SEASONS = list(range(2008, 2027))
 # the formula change is minor (added hurries/PBUs to all positions).
 # ---------------------------------------------------------------------------
 
+# v4.2 calibration (2026-08-11).
+#
+# Every x-coordinate below is OUR OWN edge_score — specifically, the score posted
+# by the Nth-best player at that position in a typical (median) season across
+# 2021-2025. What had to be chosen is only what a given standing is *worth*, and
+# for that EA CFB 27 is consulted as an external scouting consensus: not to supply
+# numbers, but to answer "are we handing out too many 85s, too few, and is the
+# ceiling in the right place". Where EA and the earlier anchors already agreed
+# (TE: 17 players at 85+ and 3 at 90+ in both), nothing was touched.
+#
+# These remain ABSOLUTE constants, derived once. A weaker future crop simply
+# produces fewer 90s — the percentile-of-the-pool scaling this replaced is the
+# bug documented in AUDIT_FINDINGS.md §9, and rank-matching every season would
+# have reintroduced it.
+#
+# Ceilings follow from what each position needed:
+#   · offensive skill — the WEAKEST season's best player is a 96, so the best
+#     player in the country always reads like one (their tips were too low);
+#   · defense — the TYPICAL season's best is a 96, so a monster year can still
+#     exceed it and only a historic one nears 99 (their tips were too high; a 99
+#     was going to a very good season rather than a generational one).
+# The single best season on record maps to 99 in both cases.
 EDGE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
-    # Calibrated from all-time top-20 per position (2008-2025).
-    # Goal: top-20 all-time sets the bar for 99; #20 all-time ≈ 97.
-    #
     # Offensive: stat_composite × opp_mult / sqrt(games)
-    #   QB:   p50≈445, p90≈1085. All-time #1=2352 (Burrow 2019), #20=1773.
-    "QB":   [(0, 30), (150, 50), (445, 65), (750, 77), (1100, 85), (1450, 90), (1770, 97), (2400, 99)],
-    #   RB:   All-time #1=1003 (Gordon 2014), #20=803 (Ajayi 2014).
-    "RB":   [(0, 30), (40,  50), (120, 65), (240, 77), (500,  87), (650,  93), (803,  97), (1050, 99)],
-    #   WR:   All-time #1=926 (DeVonta Smith 2020), #20=663 (Jones 2022).
-    "WR":   [(0, 30), (35,  50), (120, 65), (210, 77), (400,  87), (550,  93), (663,  97), (950,  99)],
-    #   TE:   All-time #1=622 (Amaro 2013), #20=384 (Andrews 2017).
+    #   QB/RB validated as correct below the tip; only the ceiling moved.
+    #   QB all-time #1 = Burrow 2019.
+    "QB":   [(0, 30), (150, 50), (445, 65), (750, 77), (1100, 85), (1450, 90), (1676.9, 96), (2385, 99)],
+    #   RB all-time #1 = Gordon 2014.
+    "RB":   [(0, 30), (40,  50), (120, 65), (240, 77), (500,  87), (650,  93), (712.6,  96), (1029, 99)],
+    #   WR: the middle rises. A team rotates three to five receivers through real
+    #   snaps, so the WR3 nationally is a starter and was priced as a reserve —
+    #   the 72 and 77 anchors are the last man in a 3.5-deep rotation and the
+    #   rank-286 receiver. All-time #1 = DeVonta Smith 2020.
+    "WR":   [(0, 30), (35,  50), (101.5, 72), (173.3, 77), (319.1, 85), (459.9, 90), (611.4, 96), (950, 99)],
+    #   TE: unchanged — already matched the external consensus exactly.
     "TE":   [(0, 30), (25,  50), (75,  65), (160, 78), (270,  87), (384,  97), (650,  99)],
     #
-    # Defensive: stat_composite × opp_mult / sqrt(games). Weights v4.1.
-    # All-time top-20 sets 99 ceiling; #20 ≈ 97.
+    # Defensive: stat_composite × opp_mult / sqrt(games). Weights v4.1, plus the
+    # coverage-denial credit added to CB/S/DB in script 06.
     #
-    #   EDGE: All-time #1=81.4 (Chase Young 2019), #20=58.7 (Kennard 2024). Ceiling 65 per user spec.
-    "EDGE": [(0, 30), (3.0, 50), (11.0, 65), (22.0, 77), (38.0, 87), (58.7, 97), (65.0, 99)],
-    #   DL:   All-time #1=69.9 (Green 2023), #20=51.5 (Polite 2018). Ceiling 65 per user spec.
-    "DL":   [(0, 30), (2.5, 50), (7.0,  65), (15.0, 77), (30.0, 87), (51.5, 97), (65.0, 99)],
-    #   LB:   All-time #1=95.3 (Anderson 2021), #2=82.4 (Josh Allen 2018) — true anomalies.
-    #   #3=70.7 (Lloyd 2021), #20=63.7. Set 99 at 70 so Anderson/Allen go off-chart.
-    "LB":   [(0, 30), (4.0, 50), (11.0, 65), (22.0, 77), (40.0, 87), (63.7, 97), (70.0, 99)],
-    #   CB:   All-time #1=52.3 (Amerson 2011), #20=39.1 (Phillips 2022).
-    #   Team defensive context adjusts score. Ceiling reflects INT-heavy outliers.
-    "CB":   [(0, 30), (1.5, 50), (6.0,  65), (12.0, 74), (20.0, 83), (39.1, 97), (53.0, 99)],
-    #   S:    All-time #1=54.6 (Delpit 2018), #20=35.4 (Stevens 2019).
-    "S":    [(0, 30), (2.0, 50), (7.5,  65), (14.0, 74), (22.0, 83), (35.4, 97), (55.0, 99)],
-    #   DB:   All-time #1=52.3 (Golson 2014), #20=38.3 (Hayward 2011).
-    "DB":   [(0, 30), (1.5, 50), (6.5,  65), (12.0, 74), (20.0, 83), (38.3, 97), (53.0, 99)],
+    #   EDGE was thin at the top (too few genuinely elite) with a tip that was too
+    #   high — a 99 for a very good season.
+    "EDGE": [(0, 30), (3.0, 50), (11.0, 65), (22.0, 77), (30.3, 85), (40.8, 90), (65.7, 96), (82.8, 99)],
+    #   DL and LB were the opposite: too many 85s and 90s.
+    "DL":   [(0, 30), (2.5, 50), (7.0,  65), (15.0, 77), (30.5, 85), (43.0, 90), (59.9, 96), (71.0, 99)],
+    "LB":   [(0, 30), (4.0, 50), (11.0, 65), (22.0, 77), (39.0, 85), (52.1, 90), (70.9, 96), (96.7, 99)],
+    #   CB/S/DB: the secondary carried roughly half the elite ratings it should —
+    #   53 players at 85+ against an expected ~113 — because coverage suppresses
+    #   the counting stats these scores are built from. The credit in script 06
+    #   addresses the suppression; these anchors address the compression.
+    #
+    #   The x-scale here is much smaller than the other positions' because a
+    #   defensive back's score is no longer a raw stat composite: it is his three
+    #   archetypes on a 0-10 axis, weighted by position
+    #   (SECONDARY_ARCHETYPE_WEIGHTS in script 06). Anchors are per-position, so
+    #   the scales never have to agree — but these MUST be re-derived whenever
+    #   that composite or its scale constants change.
+    "CB":   [(0, 30), (1.5, 50), (3.8, 75), (7.4, 80), (11.6, 85), (16.5, 90), (19.1, 96), (24.2, 99)],
+    "S":    [(0, 30), (2.0, 50), (4.7, 75), (8.4, 80), (10.9, 85), (14.4, 90), (18.9, 96), (25.8, 99)],
+    "DB":   [(0, 30), (1.5, 50), (4.5, 75), (7.9, 80), (11.2, 85), (14.5, 90), (20.8, 96), (25.5, 99)],
 }
 
 
@@ -406,7 +435,11 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
         xpa = max(_stat_float(stats, "kickingXPA"), 1)
         return {
             "fg_pct":       _stat_float(stats, "kickingFGM") / fga,
-            "fg_long":      _stat_float(stats, "kickingLNG"),
+            # The API key is kickingLONG. This read "kickingLNG" and so returned
+            # 0.0 for every kicker who has ever been rated — a quarter of the K
+            # composite was a dead constant, and the anchors below were then
+            # calibrated on top of that hole.
+            "fg_long":      _stat_float(stats, "kickingLONG"),
             "xp_pct":       _stat_float(stats, "kickingXPM") / xpa,
             "volume_score": _stat_float(stats, "kickingFGM"),
         }
@@ -662,7 +695,10 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
     # EDGE scores
     edge_df = read_raw("player_edge")
     if not edge_df.empty:
-        edge_df = edge_df[["player_season_id", "edge_score", "stats_measured", "games_played", "opponent_avg_sp"]].copy()
+        cols = ["player_season_id", "edge_score", "stats_measured", "games_played", "opponent_avg_sp"]
+        if "coverage_share" in edge_df.columns:
+            cols.append("coverage_share")
+        edge_df = edge_df[cols].copy()
         ps_df = ps_df.merge(edge_df, left_on="id", right_on="player_season_id",
                             how="left", suffixes=("", "_edge"))
     else:
@@ -722,6 +758,11 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         feats["stats_measured"]    = _si(row.get("stats_measured"))
         feats["games_played"]      = _si(row.get("games_played"))
         feats["opp_avg_sp"]        = _sf(row.get("opponent_avg_sp"))
+        # How much of a secondary player's EDGE came from coverage denial rather
+        # than counting stats. This dict is rebuilt per row rather than carried
+        # from the frame, so a column that isn't copied here silently disappears —
+        # which is how the UI's coverage line came out empty for every DB.
+        feats["coverage_share"]    = _sf(row.get("coverage_share"), 0.0)
         feats["conference"]        = row.get("conference") or ""
         feats["_season"]           = season
         rows.append({"player_id": pid, **feats})
@@ -833,9 +874,13 @@ EDGE_SCORE_BOUNDS: dict[str, tuple[float, float]] = {
     "EDGE": (0.0, 21.5),  # p95=21.53 (defensive stat composite / sqrt(games))
     "DL":   (0.0, 14.4),  # p95=14.39
     "LB":   (0.0, 23.3),  # p95=23.35
-    "CB":   (0.0, 13.3),  # p95=13.33
-    "S":    (0.0, 19.8),  # p95=19.80
-    "DB":   (0.0, 16.9),  # p95=16.92 (legacy fallback)
+    # The secondary's score is now archetypes on a 0-10 axis (script 06), not a
+    # raw stat composite, so its scale is much smaller than the front seven's.
+    # Only reached on the no-EDGE fallback path, but a stale ceiling here would
+    # normalize every defensive back to 1.0.
+    "CB":   (0.0, 17.0),
+    "S":    (0.0, 16.0),
+    "DB":   (0.0, 17.0),
 }
 
 FEATURE_BOUNDS: dict[str, tuple[float, float]] = {
@@ -964,6 +1009,12 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
                 "opp_quality":    round(float(row.get("opp_avg_sp") or 0), 2),
                 "stats_measured": int(row.get("stats_measured") or 0),
             }
+            # How much of a defensive back's score is coverage denial rather than
+            # counting stats. Carried so the UI can say so — an unexplained bump
+            # on a player with modest numbers reads as a bug.
+            cov = row.get("coverage_share")
+            if pg in ("CB", "S", "DB") and cov is not None and float(cov or 0) > 0:
+                contrib["coverage_share"] = round(float(cov), 4)
         elif all_stat_scores[i] is not None and valid_stat:
             # Stat-based fallback: scale within the no-EDGE pool, cap at 78
             ovr = float(np.clip(np.interp(all_stat_scores[i], stat_pcts, STAT_FALLBACK_TARGETS), 30.0, 78.0))
@@ -1025,13 +1076,23 @@ def compute_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
 # cannot separate an All-American from an average starter on the same line.
 # Those proxies also saturate — the top ~10% of linemen share one composite
 # value — so a 99 would be an accuracy claim the inputs do not support.
+#
+# K and P were recalibrated in v4.2 (2026-08-11). They were the most inflated
+# thing in the system: 38 punters rated 85+ and 9 rated 90+ in 2025, against one
+# and zero in EA CFB 27. On a team page a punter outranked the receivers around
+# him, which is the tell — a specialist's impact range is genuinely narrower than
+# a skill player's, so his rating band should be too. Only a truly elite kicker
+# now earns a high number and an average one is an average player.
+#
+# The kicker composite also changed underneath these: fg_long is 25% of it and had
+# been reading a stat key that does not exist, so it was a dead constant.
 COMPOSITE_OVR_ANCHORS: dict[str, list[tuple[float, float]]] = {
     "OL": [(0.00, 30), (0.25, 45), (0.325, 55), (0.40, 65),
            (0.50, 72), (0.625, 80), (0.65, 88)],
-    "K":  [(0.00, 30), (0.05, 35), (0.17, 45), (0.28, 55), (0.42, 65),
-           (0.53, 75), (0.62, 84), (0.69, 92), (0.75, 96)],
-    "P":  [(0.00, 30), (0.05, 35), (0.29, 48), (0.38, 57), (0.48, 65),
-           (0.58, 75), (0.70, 85), (0.85, 93), (1.00, 97)],
+    "K":  [(0.00, 30), (0.05, 35), (0.23, 48), (0.42, 56), (0.55, 63),
+           (0.65, 71), (0.74, 78), (0.83, 87), (1.00, 90)],
+    "P":  [(0.00, 30), (0.05, 35), (0.41, 48), (0.52, 56), (0.60, 63),
+           (0.66, 71), (0.76, 78), (0.88, 87), (1.00, 90)],
 }
 
 
