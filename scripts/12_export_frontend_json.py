@@ -50,6 +50,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.store import read_raw, read_computed, read_ratings
+from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score
 
 DEFAULT_OUTPUT = Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"
 CURRENT_SEASON = 2026
@@ -59,6 +60,15 @@ TOP_N_PER_POSITION = 50
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _parse_stat_data(v) -> dict:
+    if isinstance(v, dict):
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return {}
+
 
 def _clean_nan(o):
     """Recursively replace float NaN/inf with None — literal NaN is invalid JSON
@@ -155,7 +165,58 @@ def load_tables() -> dict:
     }
     for name, df in t.items():
         print(f"  {name:<20} {len(df):>8} rows")
+    t["stats_index"] = build_stats_index(t["stats"])
     return t
+
+
+def build_stats_index(st: pd.DataFrame) -> dict:
+    """player_season_id -> season stat payload, on the same rule script 07 rates by.
+
+    Script 07 rates a player whose season aggregate is missing or holds nothing but
+    usage, by summing his game rows. Exporting only true aggregates would ship those
+    players to the site with a rating and a blank stat line — a player card asserting
+    an 89.9 next to no evidence for it.
+
+    Rebuilt payloads are marked `rebuilt_from_games` so a reader (and the next phase,
+    which reads usage) can tell a summed line from a reported one.
+    """
+    if st.empty:
+        return {}
+
+    # Keys are coerced to plain int on both sides of this lookup. A merge upstream
+    # can leave player_season_id as float64, and a float key silently matches
+    # nothing — which would ship every player with a blank stat line rather than
+    # erroring.
+    agg = st[(st["stat_type"] == "season_aggregate") & st["game_id"].isna()]
+    index: dict = {}
+    for r in agg[["player_season_id", "data"]].itertuples(index=False):
+        ps = _i(r.player_season_id)
+        if ps is not None:
+            index[ps] = _parse_stat_data(r.data)
+
+    need = {ps for ps, d in index.items() if not has_box_score(d)}
+    by_ps: dict = {}
+    for r in st[st["game_id"].notna()][["player_season_id", "data"]].itertuples(index=False):
+        ps = _i(r.player_season_id)
+        if ps is None or (ps in index and ps not in need):
+            continue
+        by_ps.setdefault(ps, []).append(_parse_stat_data(r.data))
+
+    rebuilt = 0
+    for ps, rows in by_ps.items():
+        summed = aggregate_game_stats(rows)
+        if not summed:
+            continue
+        # Usage, PPA and awards ride on endpoints the game rows never carried.
+        for k, v in (index.get(ps) or {}).items():
+            if k in META_KEYS and v:
+                summed[k] = v
+        summed["rebuilt_from_games"] = True
+        index[ps] = summed
+        rebuilt += 1
+
+    print(f"  stats_index          {len(index):>8} player-seasons ({rebuilt} rebuilt from game rows)")
+    return index
 
 
 def is_projected_season(T: dict, season: int) -> bool:
@@ -246,24 +307,17 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
         ratings_season["stats_measured"] = None
         ratings_season["games_played"] = None
 
-    # Stats (season aggregate)
-    def _parse_data(v):
-        if isinstance(v, dict): return v
-        try: return json.loads(v)
-        except: return {}
-
+    # Stats — the aggregate the API reported, or the sum of game rows script 07
+    # rated the player on. Built once in load_tables().
     st = T["stats"]
     if not st.empty:
-        st_agg = st[(st["stat_type"] == "season_aggregate") & st["game_id"].isna()] \
-                   [["player_season_id", "data"]].copy()
-        st_agg["data"] = st_agg["data"].apply(_parse_data)
-        ratings_season = ratings_season.merge(
-            st_agg.rename(columns={"player_season_id": "st_ps_id", "data": "stats_season"}),
-            left_on="player_season_id", right_on="st_ps_id", how="left")
+        _sidx = T.get("stats_index") or {}
+        ratings_season["stats_season"] = [
+            _sidx.get(_i(v)) for v in ratings_season["player_season_id"]]
 
         st_post = st[(st["stat_type"] == "postseason_aggregate") & st["game_id"].isna()] \
                     [["player_season_id", "data"]].copy()
-        st_post["data"] = st_post["data"].apply(_parse_data)
+        st_post["data"] = st_post["data"].apply(_parse_stat_data)
         ratings_season = ratings_season.merge(
             st_post.rename(columns={"player_season_id": "stp_id", "data": "stats_postseason"}),
             left_on="player_season_id", right_on="stp_id", how="left")

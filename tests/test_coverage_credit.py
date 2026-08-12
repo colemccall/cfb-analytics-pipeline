@@ -24,6 +24,7 @@ _s06 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_s06)
 
 denial_from_ypa              = _s06.denial_from_ypa
+shortfall_vs_expectation     = _s06.shortfall_vs_expectation
 _pass_attempts               = _s06._pass_attempts
 build_coverage_participation = _s06.build_coverage_participation
 COVERAGE_CREDIT              = _s06.COVERAGE_CREDIT
@@ -61,6 +62,56 @@ class TestPassDenial:
         d = denial_from_ypa(_ypa())
         vals = [d[i] for i in sorted(d)]
         assert all(a >= b for a, b in zip(vals, vals[1:]))
+
+
+class TestOpponentAdjustment:
+    """Raw yards-allowed-per-attempt cannot tell a defence that shut down good
+    passing teams from one that drew a soft schedule. Comparing each game to what
+    that offence normally does raised within-position agreement with EA in every
+    season tested (2025 .6507->.6588, 2024 .5357->.5421, 2023 .2756->.2818).
+    """
+
+    def _pg(self, entries):
+        # (game, offence, defence): (attempts, yards)
+        return {(g, o, d): (a, y) for g, o, d, a, y in entries}
+
+    def test_holding_an_offence_below_its_norm_scores_negative(self):
+        """Defence 99 faced an offence that averages 10 YPA and held it to 5."""
+        out = shortfall_vs_expectation(self._pg([
+            (1, 1, 99, 200, 1000),   # offence 1 vs defence 99: 5.0 YPA
+            (2, 1, 98, 200, 3000),   # offence 1 elsewhere:    15.0 YPA
+        ]))
+        assert out[99] < 0
+        assert out[98] > 0
+
+    def test_a_soft_schedule_does_not_look_like_a_good_defence(self):
+        """Two defences allow an identical 5.0 YPA. One faced an offence that
+        always throws for 5.0; the other held a 10.0 offence to it. Raw YPA calls
+        them equal; this must not."""
+        out = shortfall_vs_expectation(self._pg([
+            (1, 1, 91, 200, 1000),   # offence 1 is a 5.0 YPA offence everywhere
+            (2, 1, 92, 200, 1000),
+            (3, 2, 93, 200, 1000),   # offence 2 held to 5.0 here...
+            (4, 2, 94, 200, 3000),   # ...but throws 15.0 elsewhere
+        ]))
+        assert out[93] < out[91], "holding a good offence must beat facing a bad one"
+
+    def test_below_the_attempt_floor_is_excluded(self):
+        out = shortfall_vs_expectation(self._pg([(1, 1, 99, 5, 30), (2, 1, 98, 5, 10)]))
+        assert 99 not in out
+
+    def test_empty_in_empty_out(self):
+        assert shortfall_vs_expectation({}) == {}
+
+    def test_weighting_is_by_attempts_not_by_game(self):
+        """A 50-attempt game must count more than a 5-attempt one, or one garbage-
+        time series outweighs a whole afternoon of coverage."""
+        heavy = shortfall_vs_expectation(self._pg([
+            (1, 1, 99, 300, 600),    # 2.0 YPA over 300 attempts
+            (2, 1, 99, 10, 200),     # 20.0 YPA over 10
+            (3, 1, 98, 300, 3000),   # offence norm pulled up elsewhere
+        ]))
+        assert heavy[99] < 0, "the 300-attempt game should dominate the 10-attempt one"
 
 
 class TestAttemptParsing:

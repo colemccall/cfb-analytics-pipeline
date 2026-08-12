@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
 from utils.store import read_raw, read_computed, write_computed
+from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score
 
 MODEL_VERSION = "v4.0-edge-direct"
 
@@ -650,13 +651,117 @@ def load_position_data(season: int, pg: str) -> pd.DataFrame:
     return _load_seasons([season], pg)
 
 
+# Raw tables are read once per process, not once per (season × position). Every
+# call to _load_seasons used to re-parse all of data/raw — 255 MB of stats alone —
+# so a --all-seasons run parsed it 228 times (19 seasons × 12 groups) and spent
+# hours doing nothing but JSON. The tables are immutable for the life of the run.
+_RAW: dict[str, pd.DataFrame] = {}
+
+
+def _raw(table: str) -> pd.DataFrame:
+    if table not in _RAW:
+        _RAW[table] = read_raw(table)
+    return _RAW[table]
+
+
+# ratings.json is read once per position to find last season's number, and once
+# per season to merge — 228 reads of a 54 MB file across a full run. It is also
+# the one table this script writes, so the cache is replaced with what was
+# written rather than dropped: season N+1 must see season N's ratings.
+_RATINGS: pd.DataFrame | None = None
+
+
+def _computed_ratings() -> pd.DataFrame:
+    global _RATINGS
+    if _RATINGS is None:
+        _RATINGS = read_computed("ratings")
+    return _RATINGS
+
+
+def _parse_stat_data(val) -> dict:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except Exception:
+            pass
+    return {}
+
+
+_STATS_INDEX: dict | None = None
+
+
+def _stats_index() -> dict:
+    """player_season_id -> season stat payload, for every player we can build one.
+
+    The season aggregate where the API wrote a real one; a sum of that player's
+    game rows where it wrote nothing, or wrote a row carrying only usage and PPA.
+    Rating used to inner-join the aggregate alone, which dropped ~350-465
+    player-seasons a year: Jayden Virgin-Morgan played four seasons at Boise State
+    with 12-14 game rows each and was rated in none of them, so to a reader he had
+    no history at all.
+
+    Built once and the stats frame released, because it is the largest table in
+    the store by an order of magnitude and nothing downstream needs the rows.
+    """
+    global _STATS_INDEX
+    if _STATS_INDEX is not None:
+        return _STATS_INDEX
+
+    st_all = read_raw("stats")
+    if st_all.empty:
+        _STATS_INDEX = {}
+        return _STATS_INDEX
+
+    agg_rows = st_all[(st_all["stat_type"] == "season_aggregate") &
+                      (st_all["game_id"].isna())][["player_season_id", "data"]]
+    index: dict = {}
+    for r in agg_rows.itertuples(index=False):
+        index[r.player_season_id] = _parse_stat_data(r.data)
+
+    # Missing OR metadata-only. Both are the same failure to a rating: no
+    # production recorded for a player who took the field.
+    need = {ps for ps, d in index.items() if not has_box_score(d)}
+    game_rows = st_all[st_all["game_id"].notna()][["player_season_id", "data"]]
+    del st_all
+
+    by_ps: dict = {}
+    for r in game_rows.itertuples(index=False):
+        ps = r.player_season_id
+        if ps in index and ps not in need:
+            continue
+        by_ps.setdefault(ps, []).append(_parse_stat_data(r.data))
+    del game_rows
+
+    rebuilt = 0
+    for ps, rows in by_ps.items():
+        summed = aggregate_game_stats(rows)
+        if not summed:
+            continue
+        # Usage, PPA and awards come from endpoints the game rows do not carry.
+        # Whatever the original row knew is kept; only production is replaced.
+        old = index.get(ps) or {}
+        for k, v in old.items():
+            if k in META_KEYS and v:
+                summed[k] = v
+        summed["rebuilt_from_games"] = True
+        index[ps] = summed
+        rebuilt += 1
+
+    print(f"  Stats index: {len(index)} player-seasons "
+          f"({rebuilt} rebuilt from game rows)")
+    _STATS_INDEX = index
+    return _STATS_INDEX
+
+
 def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
     """Load one or more seasons of data for a position group from local JSON.
 
     Joins player_seasons → players → stats → player_edge → recruiting → teams.
     player_seasons is the join anchor: one row per player × season × team.
     """
-    ps_df   = read_raw("player_seasons")
+    ps_df   = _raw("player_seasons")
     if ps_df.empty:
         return pd.DataFrame()
 
@@ -669,31 +774,20 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     # Players — name lookup
-    pl_df = read_raw("players")[["id", "name"]].rename(columns={"id": "player_id"})
+    pl_df = _raw("players")[["id", "name"]].rename(columns={"id": "player_id"})
     ps_df = ps_df.merge(pl_df, on="player_id", how="left")
 
-    # Stats — season aggregate rows only
-    st_df = read_raw("stats")
-    st_df = st_df[
-        (st_df["stat_type"] == "season_aggregate") &
-        (st_df["game_id"].isna())
-    ][["player_season_id", "data"]].copy()
-
-    def _parse(val):
-        if isinstance(val, dict):
-            return val
-        if isinstance(val, str):
-            try:
-                return json.loads(val)
-            except Exception:
-                pass
-        return {}
-
-    st_df["data"] = st_df["data"].apply(_parse)
-    ps_df = ps_df.merge(st_df, left_on="id", right_on="player_season_id", how="inner")
+    # Stats — the season aggregate where the API wrote one, a sum of game rows
+    # where it did not. Mapping rather than merging keeps the old inner-join
+    # semantics (no payload, no rating) without a second copy of the frame.
+    index = _stats_index()
+    ps_df["data"] = ps_df["id"].map(index)
+    ps_df = ps_df[ps_df["data"].notna()].copy()
+    if ps_df.empty:
+        return pd.DataFrame()
 
     # EDGE scores
-    edge_df = read_raw("player_edge")
+    edge_df = _raw("player_edge")
     if not edge_df.empty:
         cols = ["player_season_id", "edge_score", "stats_measured", "games_played", "opponent_avg_sp"]
         if "coverage_share" in edge_df.columns:
@@ -708,7 +802,7 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         ps_df["opponent_avg_sp"] = 0.0
 
     # Recruiting — best record per player
-    rec_df = read_raw("recruiting")
+    rec_df = _raw("recruiting")
     if not rec_df.empty:
         rec_df = rec_df.sort_values("composite_score", ascending=False, na_position="last")
         rec_df = rec_df.drop_duplicates(subset=["player_id"], keep="first")
@@ -719,11 +813,11 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         ps_df["composite_score"] = None
 
     # Conference
-    tm_df = read_raw("teams")[["id", "conference"]].rename(columns={"id": "team_id"})
+    tm_df = _raw("teams")[["id", "conference"]].rename(columns={"id": "team_id"})
     ps_df = ps_df.merge(tm_df, on="team_id", how="left")
 
     # Transfer flag
-    tr_df = read_raw("transfers")
+    tr_df = _raw("transfers")
     if not tr_df.empty:
         tr_set = set(zip(tr_df["player_id"], tr_df["transfer_year"]))
     else:
@@ -1216,7 +1310,7 @@ def compute_trajectory(ratings_map: dict, prev_season: int, df: pd.DataFrame | N
 
     # Load prior ratings from computed output
     prev_ratings = {}
-    rat_df = read_computed("ratings")
+    rat_df = _computed_ratings()
     if not rat_df.empty and "season" in rat_df.columns and "player_season_id" in rat_df.columns:
         prev_rat = rat_df[rat_df["season"] == prev_season].copy()
         if not prev_rat.empty:
@@ -1226,8 +1320,8 @@ def compute_trajectory(ratings_map: dict, prev_season: int, df: pd.DataFrame | N
                 prev_ratings = dict(zip(prev_rat["player_id"], prev_rat["overall_rating"].astype(float)))
 
     # Load edge scores from raw dump
-    edge_df = read_raw("player_edge")
-    ps_df   = read_raw("player_seasons")[["id", "player_id", "season"]].rename(
+    edge_df = _raw("player_edge")
+    ps_df   = _raw("player_seasons")[["id", "player_id", "season"]].rename(
         columns={"id": "ps_id", "player_id": "ps_player_id", "season": "ps_season"})
     if not edge_df.empty and not ps_df.empty:
         merged = edge_df.merge(ps_df, left_on="player_season_id", right_on="ps_id", how="left")
@@ -1556,6 +1650,7 @@ def validate_distribution(rows: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 def main():
+    global _RATINGS
     parser = argparse.ArgumentParser()
     parser.add_argument("--season",      type=int, default=2025)
     parser.add_argument("--all-seasons", action="store_true")
@@ -1576,7 +1671,7 @@ def main():
             clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in all_rows]
 
             # Merge with any existing computed ratings (other seasons / engines)
-            existing = read_computed("ratings")
+            existing = _computed_ratings()
             new_df   = pd.DataFrame(clean_rows)
             if not existing.empty:
                 # Drop rows being replaced (same player_season_id + season + engine)
@@ -1590,6 +1685,9 @@ def main():
                 combined = new_df
 
             write_computed("ratings", combined)
+            # What was just written is what the next season must read.
+            global _RATINGS
+            _RATINGS = combined
             print(f"  Wrote {len(clean_rows)} rows")
 
     print("\nDone.")

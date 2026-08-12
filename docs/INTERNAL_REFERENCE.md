@@ -15,11 +15,15 @@ Scope: Both repos — cfb-analytics-pipeline + cfb-analytics-app
 >   replaced by `08_harvest_ea_cfb27_ratings.py`; 04 now uses `utils/matching.py`.
 > - Script 05's hardcoded year fallback is fixed.
 > - `api_client.py`'s `verify=False` is fixed.
-> - It predates scripts 13, 14, and 15 entirely.
+> - It predates scripts 13, 14, 15 and 16 entirely, along with
+>   `utils/stat_agg.py` (the shared missing-or-empty stats rule scripts 07, 12
+>   and 15 rebuild season aggregates by) and `scripts/validate_ratings.py` (the
+>   read-only distribution and EA-agreement report).
 >
-> For current architecture see `README.md`; for design rationale and the bug
-> record see `AUDIT_FINDINGS.md`. Kept because its reasoning explains why
-> several of those changes were made.
+> For current architecture see `README.md`; for what the ratings are and where
+> they fail see `RATING_AND_PROJECTION_MODEL.md`; for what is next see
+> `ROADMAP.md`; for design rationale and the bug record see `AUDIT_FINDINGS.md`.
+> Kept because its reasoning explains why several of those changes were made.
 
 ---
 

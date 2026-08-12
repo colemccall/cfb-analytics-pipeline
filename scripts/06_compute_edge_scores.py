@@ -306,8 +306,16 @@ def build_team_pass_denial(season: int) -> dict:
     added another 0.002 — under the 2-SD rule half the defenses in the country
     scored exactly zero, so most defensive backs got no coverage signal at all.
 
-    Taken across a whole season, never per game: one game's passing line is
-    mostly noise, a season's is the defense.
+    Measured against the offense actually faced. Raw YPA allowed cannot tell a
+    defense that shut down good passing teams from one that drew a soft schedule,
+    so each game is compared to what that offense does in its other games and the
+    shortfalls are attempt-weighted across the season. Within-position agreement
+    with EA: 0.6507 -> 0.6588 in 2025, 0.5357 -> 0.5421 in 2024, 0.2756 -> 0.2818
+    in 2023 — small, but the same direction every season, and a placebo that
+    credits the same magnitudes to shuffled teams scores BELOW crediting nobody.
+
+    Per game only for the comparison; the credit itself is still a season figure.
+    One game's passing line is mostly noise, a season of them is the defense.
 
     Credit only, never penalty. A porous pass defense scores 0 rather than
     negative; the multiplicative def_context_modifier already carries downside,
@@ -318,7 +326,8 @@ def build_team_pass_denial(season: int) -> dict:
     if off_rows.empty:
         return {}
 
-    faced: dict[int, list[float]] = {}
+    # (game, offense) -> [attempts, yards], and who they were throwing against.
+    per_game: dict[tuple, list] = {}
     for _, r in off_rows.iterrows():
         stats = r["data"] if isinstance(r["data"], dict) else {}
         att = _pass_attempts(stats)
@@ -332,12 +341,42 @@ def build_team_pass_denial(season: int) -> dict:
         opp = r["away_team_id"] if my_team == r["home_team_id"] else r["home_team_id"]
         if opp is None or pd.isna(opp):
             continue
-        e = faced.setdefault(int(opp), [0.0, 0.0])
+        e = per_game.setdefault((r["game_id"], int(my_team), int(opp)), [0.0, 0.0])
         e[0] += att
         e[1] += yds
 
-    return denial_from_ypa({t: y / a for t, (a, y) in faced.items()
-                            if a >= DENIAL_MIN_ATTEMPTS})
+    return denial_from_ypa(shortfall_vs_expectation(per_game))
+
+
+def shortfall_vs_expectation(per_game: dict) -> dict:
+    """{(game, offense, defense): (attempts, yards)} -> {defense: YPA vs par}.
+
+    Negative means offenses threw worse against this defense than they normally
+    do — the same direction as a low raw YPA, so the percentile band in
+    denial_from_ypa applies unchanged. Pure; testable.
+    """
+    if not per_game:
+        return {}
+
+    # Each offense's own season rate — the bar it is expected to clear.
+    base: dict[int, list] = {}
+    faced: dict[int, list] = {}
+    for (_g, off_t, def_t), (att, yds) in per_game.items():
+        b = base.setdefault(off_t, [0.0, 0.0]);  b[0] += att; b[1] += yds
+        f = faced.setdefault(def_t, [0.0, 0.0]); f[0] += att; f[1] += yds
+    base_ypa = {t: y / a for t, (a, y) in base.items() if a > 0}
+
+    short: dict[int, list] = {}
+    for (_g, off_t, def_t), (att, yds) in per_game.items():
+        if att <= 0 or off_t not in base_ypa:
+            continue
+        delta = (yds / att) - base_ypa[off_t]
+        s = short.setdefault(def_t, [0.0, 0.0])
+        s[0] += att
+        s[1] += delta * att
+
+    return {t: w / a for t, (a, w) in short.items()
+            if a > 0 and faced.get(t, [0])[0] >= DENIAL_MIN_ATTEMPTS}
 
 
 def denial_from_ypa(ypa: dict) -> dict:

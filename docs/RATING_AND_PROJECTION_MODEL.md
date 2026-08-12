@@ -446,9 +446,10 @@ on, and carrying the same humility.
 
 Two details were each wrong once before they were right:
 
-- **The denial signal is z-scored across teams over their season means, not across games.**
+- **The denial signal is computed across teams over their season means, not across games.**
   Per-game standardization measures game-to-game noise, nobody clears it, and almost no
-  credit is paid.
+  credit is paid. (The band itself is a percentile of the season figures — `denial_from_ypa`.
+  An earlier iteration z-scored them; §12 replaces the input to that band entirely.)
 - **Participation is rank within the secondary, not share of its tackles.** Share re-imports
   the suppression: the avoided corner tackles less, so he would be credited less. On a share
   rule a covered corner scored 0.68 of a full-timer. `tests/test_coverage_credit.py` locks
@@ -646,3 +647,186 @@ listed here rather than applied as a per-player adjustment.
 
 `player_seasons.year` is still exported to the frontend by script 12, so a player card can
 read "Junior" for a fourth-year senior. Only script 15 derives it today.
+
+---
+
+## 12. Two silent input bugs, and a full recompute (2026-08-12)
+
+§10 recalibrated the ratings. This section is what the recalibration turned up on the way:
+two defects in the *inputs*, both invisible from the outside, and the full 2008–2026 recompute
+that shipped them.
+
+### 12a. A soft schedule read as good coverage
+
+The coverage credit in §10 is scaled by how few passing yards a defense allowed. Raw
+yards-per-attempt allowed cannot distinguish a defense that shut down good passing offenses
+from one that never faced any — and college schedules are wildly unequal, so this is not a
+small correction.
+
+Denial is now measured **against the offense actually faced**. Each game is compared to what
+that offense does in its *other* games, and the shortfalls are attempt-weighted across the
+season (`shortfall_vs_expectation` in script 06). Attempt-weighted because a 50-attempt
+afternoon of coverage should outweigh one garbage-time series, which is the kind of thing that
+is obvious until it is not: a game-weighted version lets a 10-attempt outlier swing a season.
+
+Only the *comparison* is per game. The credit itself remains a season figure, for the same
+reason it always was — one game's passing line is mostly noise, a season of them is the
+defense. The output still feeds the same percentile band in `denial_from_ypa`, so nothing
+downstream needed rescaling.
+
+| Within-position Spearman vs EA | Before | After |
+|---|---|---|
+| 2025 | 0.6507 | **0.6588** |
+| 2024 | 0.5357 | **0.5421** |
+| 2023 | 0.2756 | **0.2818** |
+
+Small, in the same direction in every season tested, and the placebo holds: crediting the same
+magnitudes to shuffled teams scores *below* crediting nobody.
+
+**`ARCHETYPE_SCALE` was re-measured, as the rule requires**, since this changes a coverage
+input. The three axes remain comparable — 2025 p90s of 9.9 (ball hawk) / 8.4 (coverage) / 10.0
+(run support), 2024 of 11.1 / 10.5 / 9.9, against a target of 10. Nothing like the 7.1 that
+made coverage unwinnable in the prototype. No constants changed.
+
+### 12b. Players the ratings had been dropping entirely
+
+Rating inner-joined on the API's `season_aggregate` stats row. Two populations therefore had
+no rating at all:
+
+- **No aggregate was ever written.** ~350–465 player-seasons a year, most already carrying a
+  complete EDGE score computed from their game rows.
+- **An aggregate exists but records no production.** The harvest writes one whenever usage
+  *or* PPA *or* a box score came back, so a row can hold nothing but a snap share. Read as
+  present, those players count as zero production — which also corrupts their whole position
+  room's shares and vacancy, the inputs the opportunity model runs on. 176 offensive skill
+  players in 2025 alone.
+
+Jayden Virgin-Morgan played four seasons at Boise State with 12–14 game rows each and was
+rated in none of them.
+
+`utils/stat_agg.py` now owns one rule for all three consumers — script 07 (rating), script 12
+(export) and script 15 (projection features). `has_box_score()` decides whether a payload
+records production; `aggregate_game_stats()` rebuilds one from game rows. Summing is only
+correct for counts: `LONG` is a maximum, rates are recomputed from totals rather than averaged
+over per-game averages, and the game shape's paired strings have to be split first. That last
+one was live in script 15 — it read `passingATT` off game rows that store `passingC/ATT` as
+`"25/38"`, so every rebuilt quarterback had zero attempts, which is the denominator of both
+touches and efficiency.
+
+Rebuilt payloads are marked `rebuilt_from_games` and carry **no usage or PPA**, because game
+rows never had them. That matters for what comes next: the players just recovered are exactly
+the ones the usage signal cannot reach.
+
+**Recovery is a 2016-and-later phenomenon.** Before 2016 the season aggregate is a superset of
+the players with game rows, so there is nothing to recover; recompute changed those seasons by
+zero rows. From 2016 the API returns roughly twice as many players, and the gap opens.
+
+The stats index built 111,597 player-season payloads, **6,711 of them rebuilt from game rows**.
+Not every rebuilt payload becomes a rating — the player still has to be on a roster for that
+position and season — and the ones that did are:
+
+| Season | Rated before | Rated after | Recovered |
+|---|---:|---:|---:|
+| 2008–2015 | — | — | **0** |
+| 2016 | 7,269 | 7,360 | +91 |
+| 2017 | 7,483 | 7,609 | +126 |
+| 2018 | 7,888 | 8,080 | +192 |
+| 2019 | 7,872 | 8,148 | +276 |
+| 2020 | 6,935 | 7,232 | +297 |
+| 2021 | 7,892 | 8,307 | +415 |
+| 2022 | 7,868 | 8,238 | +370 |
+| 2023 | 7,926 | 8,369 | +443 |
+| 2024 | 8,068 | 8,514 | +446 |
+| 2025 | 8,329 | 8,662 | +333 |
+| **Total** | | | **+2,989** |
+
+Counts are taken from the previous **export** rather than from `ratings.json`, because 2025 had
+already been recomputed with the fix in place during development — comparing the stored ratings
+would have reported that season as +0 and undercounted the total by 333.
+
+**The trend is the tell.** Recovery grows steadily from 2016 to 2024 rather than sitting flat,
+which is what you would expect if the API's game-level coverage has been improving faster than
+its season-aggregate coverage. It also means the bug was quietly getting worse every year.
+
+### 12c. The recompute, and what the distribution gate actually says
+
+Every season 2008–2026 was recomputed: EDGE (06) → ratings (07) → team ratings (10) →
+export (12) → research (13, 14) → projections (15, 16).
+
+Script 07's own distribution check prints per-position mean/p50/p90/p99 and warns outside
+absolute bounds. **Those bounds describe the modern game, and the classic era fails them by
+construction** — 2008–2015 warn on CB, DL, EDGE, LB, S, K, P and OL every run, before and
+after this change, because pre-2016 defensive box scores have no hurries or pass breakups and
+the CLASSIC system rates those positions from interceptions and recruiting. The check is
+deliberately non-blocking (`validation is informational`) for exactly this reason.
+
+**K and P now warn in every season too, and that one is the gate's fault.** v4.2 deliberately
+pulled specialists down — EA rates 5 kickers at 85+ and exactly 1 punter, against our 17 and
+38 — but the bounds still ask for `mean 55–70` and the shipped distribution means ~50. Those
+bounds are the ones a punter outranking his own team's receivers satisfied without complaint,
+so they encode the wrong expectation and should be re-derived from the intended design. Left
+alone here on purpose: changing a gate in the same commit that ships the output it judges is
+how goalposts move. It is logged in `ROADMAP.md` as its own change.
+
+So "zero warnings" is the wrong gate. The right ones are: the modern seasons stay inside the
+bounds, and a before/after comparison against the previous export shows the change did what it
+claimed and nothing else. The previous export is committed in the app repo, which makes that
+comparison exact rather than remembered.
+
+**Against the previous export, the recovery adds players without moving the distribution.**
+Comparing each season's committed export to the new one (2024: 8,068 → 8,514 rated players):
+
+| | 2018 | 2021 | 2024 |
+|---|---|---|---|
+| Rated players | 7,888 → 8,080 | 7,892 → 8,307 | 8,068 → 8,514 |
+| With a stat line | 100% → 100% | 100% → 100% | 100% → 100% |
+| Largest position-mean shift | 0.2 | 0.3 | 0.4 |
+
+Two things worth separating there. **The 2,656 recovered players are distributed like the
+players already present** — no position mean moves by more than 0.4, so this is not a cohort of
+scrubs dragging the floor down, and it is not a cohort of missed stars lifting the top. And
+**every rated player still ships with the evidence for his rating**: 100% stat-line coverage
+before and after is the check that script 12's half of the fix landed. Had only script 07 been
+fixed, that column would read 100% → 95%.
+
+The one place the distribution *does* move is the secondary, which is where the opponent-adjusted
+denial was supposed to move it: in 2024, defensive backs at 85+ go 52 → 64, safeties 31 → 35,
+corners at 90+ 3 → 5. Same direction in 2018 (DB 47 → 59).
+
+**The v4.2 calibration reproduces.** 2025, all 8,662 rated player-seasons, against the same EA
+reference §10 was tuned toward (`scripts/validate_ratings.py --season 2025`):
+
+| Position | EA 85+ / 90+ | Before v4.2 | After the recompute |
+|---|---|---|---|
+| QB | 27 / 9 | 38 / 5 | 39 / 5 |
+| RB | 70 / 15 | 24 / 7 | 24 / 7 |
+| WR | 83 / 15 | 45 / 9 | **80 / 12** |
+| TE | 17 / 3 | 17 / 4 | 17 / 4 — untouched, still right |
+| EDGE | 32 / 12 | 18 / 7, max **99** | **26 / 9**, max 96.0 |
+| DL | 33 / 7 | 45 / 14 | **28 / 4** |
+| LB | 45 / 10 | 54 / 16 | **45 / 9** |
+| CB+S+DB | 113 / 24 | 53 / 15 | **104 / 21** |
+| K | 5 / 0 | 17 / 7 | **4 / 0** |
+| P | 1 / 0 | 38 / 9 | **2 / 0** |
+
+Two things this table says that are worth saying out loud:
+
+- **RB is still wrong and was not fixed.** EA has 70 running backs at 85+; we have 24, exactly
+  as before. §10 diagnosed it as "ceiling flat, else fine" and raised the ceiling, which moved
+  the top without moving the middle. QB runs the other way, 39 against EA's 27. Both are
+  open.
+- **OL saturates visibly**: p90, p99 and max are all 80.0. The top tenth of linemen share one
+  number, which is the composite hitting its ceiling, and is the same fact §4c describes from
+  a different angle. Its within-position agreement with EA is **−0.27** — still negative,
+  still the strongest evidence that the OL rating is not measuring what its label claims.
+
+Within-position Spearman against EA over 4,990 matched players: QB 0.755, S 0.722, WR 0.739,
+RB 0.737, TE 0.652, LB 0.638, DB 0.590, EDGE 0.570, K 0.575, CB 0.565, P 0.561, DL 0.477,
+**OL −0.274**.
+
+### Still open after this pass
+
+Everything in §6 that was open remains open, and `ROADMAP.md` now sequences it. The nearest
+item is the one this section keeps running into from both directions: **usage**. It is the
+missing opportunity signal for defense, it is what separates *improved* from *played more*,
+it is already harvested — and it is absent for every player these two fixes recovered.

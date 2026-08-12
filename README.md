@@ -46,6 +46,10 @@ cfb-analytics-pipeline/
 
 **NaN never reaches disk.** `write_computed()` and `write_json()` both scrub NaN, which is invalid JSON and breaks the browser's `fetch().json()`. Note that `DataFrame.where(..., other=None)` does *not* do this on float columns — use the helpers.
 
+**A season aggregate that is missing, or holds nothing but usage, is rebuilt from game rows.** `utils/stat_agg.py` owns the rule: `has_box_score()` decides whether a payload actually records production, `aggregate_game_stats()` sums the player's game rows into the season shape. Summing is only correct for counts — `LONG` is a maximum, rates are recomputed from totals rather than averaged, and the game shape's paired strings (`passingC/ATT` = `"25/38"`, `kickingFG` = `"2/3"`) have to be split before any of it works. Scripts 07, 12 and 15 all go through it; rebuilt payloads are marked `rebuilt_from_games` and carry no usage or PPA, because game rows never had them.
+
+**Raw tables are read once per process.** `read_raw()` does not cache. Script 07's loader used to call it per position per season, re-parsing 255 MB of stats 228 times on a `--all-seasons` run; it now caches the tables and builds its stats index once. Any new per-position or per-season loader must do the same.
+
 ---
 
 ## Setup
@@ -124,7 +128,21 @@ Scripts are numbered by their dependency chain. Run them in this order for a com
 ```
 
 Scripts 13–15 write straight into the frontend's `data/` directory; 12 writes
-the core player/team/roster files. Run 12 before 13–15 on a full refresh.
+the core player/team/roster files. Run 12 before 13–15 on a full refresh, and
+run it once more at the end — 15, 16 and the projected team ratings all land
+after the first export.
+
+**Not part of the chain:** `scripts/validate_ratings.py` writes nothing. It prints
+the per-position distribution (n, mean, p50/p90/p99, how many clear 85 and 90) and
+within-position Spearman against EA CFB 27 over matched players. Run it after any
+change to 06 or 07 and read the table before shipping — distribution shape is a
+hard gate on this project, and EA is a reference for "too generous / too stingy /
+is the ceiling right", never a target.
+
+```bash
+python scripts/validate_ratings.py --season 2025
+python scripts/validate_ratings.py --season 2026 --engine projected
+```
 
 ### Bringing an unplayed season online
 

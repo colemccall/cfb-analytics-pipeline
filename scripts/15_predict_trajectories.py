@@ -62,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.store import read_raw, read_ratings
 from utils.json_utils import write_json
+from utils.stat_agg import aggregate_game_stats
 
 MODEL_PATH = Path(__file__).parent.parent / "data" / "models" / "engine_d.json"
 _APP_DATA = Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"
@@ -513,13 +514,20 @@ def build_opportunity(C: pd.DataFrame, stats_df: pd.DataFrame,
     if not games.empty:
         need = zero | (set(games["player_season_id"]) - have)
         g = games[games["player_season_id"].isin(need)][["player_season_id", "data"]]
-        summed = {}
+        rows_by_ps: dict = {}
         for r in g.itertuples(index=False):
             d = _parse(r.data)
             if d is None: continue
-            acc = summed.setdefault(r.player_season_id, {k: 0.0 for k, _ in FIELDS})
-            for k, src in FIELDS:
-                acc[k] += float(d.get(src) or 0)
+            rows_by_ps.setdefault(r.player_season_id, []).append(d)
+        # Summed through the shared helper, not field by field: a game row stores
+        # attempts as the pair "25/38" under passingC/ATT, so reading passingATT
+        # straight off it returns nothing and every rebuilt quarterback showed
+        # zero attempts — which is the denominator of touches and efficiency.
+        summed = {}
+        for ps, rows in rows_by_ps.items():
+            total = aggregate_game_stats(rows)
+            if not total: continue
+            summed[ps] = {k: float(total.get(src) or 0) for k, src in FIELDS}
         if summed:
             G = pd.DataFrame([{"ps_id": k, **v} for k, v in summed.items()])
             S = pd.concat([S[~S["ps_id"].isin(G["ps_id"])], G], ignore_index=True)
