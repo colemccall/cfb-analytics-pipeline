@@ -9,6 +9,13 @@ scratch, and so that "we thought about that" is checkable rather than remembered
 Read `RATING_AND_PROJECTION_MODEL.md` first if you have not. It is the honest account of
 what the ratings are and where they break; this file is what we intend to do about it.
 
+**Updated 2026-08-12 after a systematic API survey.** Three items below that were recorded as
+blocked are not: `/coaches` covers 2010–2024 with full tenure (the coaching event study is
+unblocked), `/draft/picks` joins to our players at 94.5% (survivorship and external validation
+are unblocked), and `/stats/season/advanced` carries `lineYards` / `stuffRate` / `powerSuccess`
+back to 2010 (a real line-unit rating is possible). See `API_INVENTORY.md`, which is generated,
+and `ALTERNATIVES.md`, which turns each into an option with a test attached.
+
 ---
 
 ## The one rule that orders everything below
