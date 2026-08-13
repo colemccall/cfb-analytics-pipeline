@@ -41,6 +41,28 @@ def clean_nan(o):
     return o
 
 
+def flatten_keys(obj, prefix: str = "", sep: str = "_") -> dict:
+    """Flatten a nested dict into one level: {"offense": {"ppa": 1}} -> {"offense_ppa": 1}.
+
+    The advanced-stats endpoints return three levels of nesting
+    (`offense.rushingPlays.successRate`), which is unusable as a DataFrame column
+    and awkward to read from. Lists are left whole — a list of heterogeneous
+    objects has no sensible flat form, and every list we harvest (betting lines
+    per provider, a coach's seasons) is a real one-to-many that wants its own
+    table or its own row.
+    """
+    out: dict = {}
+    if not isinstance(obj, dict):
+        return out
+    for k, v in obj.items():
+        key = f"{prefix}{sep}{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(flatten_keys(v, key, sep))
+        else:
+            out[key] = v
+    return out
+
+
 def write_json(path: Path, data, *, silent: bool = False) -> None:
     """Write data to path as compact JSON, replacing NaN with null.
 

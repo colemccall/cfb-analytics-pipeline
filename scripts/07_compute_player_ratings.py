@@ -93,6 +93,32 @@ def classify_playtime_tier(pg: str, stats: dict, games_played: int = 1) -> str:
 # based on recruiting stars when a player has NO usable stats.
 STARS_OVR_DELTA = {5: -3, 4: -8, 3: -15, 2: -22, 1: -28, 0: -33}
 
+# ---------------------------------------------------------------------------
+# Positions we decline to rate at the player level
+#
+# The offensive line has no individual measurement anywhere in the API — no
+# pancakes, no sacks allowed per player, no pressures allowed, verified by a full
+# key scan (docs/API_INVENTORY.md). The formula that used to produce an OL number
+# read two team keys that were absent from the payload it read them from, so what
+# actually shipped was recruiting rank in costume: r = 0.877 with the recruiting
+# composite, agreement with EA CFB 27 of **−0.274**, and 20% of rated linemen
+# landing on exactly 80.0.
+#
+# Withdrawing it is not the same as having nothing. utils/line_unit.py rates the
+# LINE, from five standard metrics that do exist, and script 10 uses that in place
+# of the average of five recruiting ranks. What is refused here is specifically
+# the claim to know which lineman was good.
+#
+# Rows are still emitted, carrying overall_rating=None and a reason, so a lineman
+# has a page, a team has a roster, and the site can say why the number is absent
+# instead of rendering a silent gap.
+NOT_RATED_POSITIONS: dict[str, str] = {
+    "OL": ("No individual offensive-line production exists in any available source — "
+           "no pancakes, no sacks allowed, no pressures allowed. The rating that used "
+           "to appear here was recruiting rank plus a constant, and it disagreed with "
+           "external scouting. See the line rating on the team page instead."),
+}
+
 # Positions that can have EDGE scores (computed in script 08).
 # Offensive: QB, RB, WR, TE (play-level EPA)
 # Defensive: EDGE, DL, LB, CB, S (per-game stat composite × opponent SP+)
@@ -300,6 +326,44 @@ def _composite_to_100(score) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Small-sample rate shrinkage
+#
+# Every defensive "rate" feature divides an event count by tackles, and a rate
+# over one tackle is not a rate. `instinct_score = (INT + PBU) / max(TOT, 1)`
+# handed a player with one tackle and one pass breakup a perfect 1.0 — better
+# than any full-season corner in the archive can post — and 30% of rated
+# defenders have five or fewer tackles, so this was not an edge case.
+#
+# The fix is the standard one: mix in a prior worth RATIO_PRIOR_N tackles at the
+# position's pooled rate. A player with 60 tackles is barely moved; a player with
+# two is pulled most of the way back to typical, which is the correct statement
+# about what two tackles tell us. It is the same shrinkage the research findings
+# now apply to team leaderboards (utils/shrinkage.py), for the same reason.
+#
+# Rates are the pooled 2016-2026 totals for each position — sum of events over
+# sum of tackles, not the mean of per-player ratios, which would itself be
+# dominated by the tiny samples this exists to fix.
+RATIO_PRIOR_N = 12.0
+
+RATIO_PRIOR_RATE: dict[tuple[str, str], float] = {
+    ("EDGE", "disruption_rate"): 0.288,
+    ("DL",   "disruption_rate"): 0.228,
+    ("LB",   "instinct_score"):  0.122,
+    ("CB",   "instinct_score"):  0.175,
+    ("S",    "instinct_score"):  0.098,
+    ("DB",   "instinct_score"):  0.135,
+}
+
+
+def shrunk_rate(events: float, tackles: float, pg: str, key: str) -> float:
+    """Empirical-Bayes rate: (events + n·prior) / (tackles + n). Pure; testable."""
+    prior = RATIO_PRIOR_RATE.get((pg, key))
+    if prior is None:
+        return events / max(tackles, 1.0)
+    return (events + RATIO_PRIOR_N * prior) / (max(tackles, 0.0) + RATIO_PRIOR_N)
+
+
+# ---------------------------------------------------------------------------
 # Supplementary stat features (secondary role for EDGE positions)
 # ---------------------------------------------------------------------------
 
@@ -356,7 +420,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
         hur   = _stat_float(stats, "defensiveQB HUR")
         return {
             "pass_rush_score":  sacks * 5.0 + hur * 1.5 + tfl * 2.0,   # sacks + pressure dominant for EDGE
-            "disruption_rate":  (sacks + tfl) / tot,                     # impact per play
+            "disruption_rate":  shrunk_rate(sacks + tfl, tot, pg, "disruption_rate"),
             "run_stop_score":   tfl * 2.5 + (tot - sacks) * 0.3,        # run stuffs (secondary for EDGE)
             "volume_score":     tot,
         }
@@ -369,7 +433,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
         return {
             "pass_rush_score":  sacks * 5.0 + hur * 1.5 + tfl * 1.0,   # sacks + pressure
             "run_stop_score":   tfl * 2.5 + (tot - sacks) * 0.4,        # run stuffs + tackle presence
-            "disruption_rate":  (sacks + tfl) / tot,                     # impact per play
+            "disruption_rate":  shrunk_rate(sacks + tfl, tot, pg, "disruption_rate"),
             "volume_score":     tot,
         }
 
@@ -383,7 +447,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "tackling_score":   tot * 0.5 + tfl * 2.0,                  # pursuit + run stop
             "pass_rush_score":  sacks * 4.0 + tfl * 1.0,                # blitz / pressure
             "coverage_score":   ints * 3.0 + pbu * 1.5,                 # zone/man skills
-            "instinct_score":   (ints + pbu + tfl) / tot,               # playmaking rate
+            "instinct_score":   shrunk_rate(ints + pbu + tfl, tot, pg, "instinct_score"),
             "volume_score":     tot,
         }
 
@@ -397,7 +461,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "coverage_score":   ints * 4.0 + pbu * 2.0,                 # CB: ball skills dominant
             "tackling_score":   tot * 0.3 + tfl * 1.0,                  # run support (secondary)
             "pass_rush_score":  sacks * 3.0 + tfl * 1.0,                # blitz value
-            "instinct_score":   (ints + pbu) / tot,                     # focus on coverage instinct
+            "instinct_score":   shrunk_rate(ints + pbu, tot, pg, "instinct_score"),
             "volume_score":     tot,
         }
 
@@ -411,7 +475,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "coverage_score":   ints * 3.5 + pbu * 1.5,                 # S: coverage (less dominant than CB)
             "tackling_score":   tot * 0.6 + tfl * 2.0,                  # S: tackle more than CB
             "pass_rush_score":  sacks * 3.0 + tfl * 1.5,                # box blitz value
-            "instinct_score":   (ints + pbu + tfl * 0.5) / tot,         # playmaking (coverage + disruption)
+            "instinct_score":   shrunk_rate(ints + pbu + tfl * 0.5, tot, pg, "instinct_score"),
             "volume_score":     tot,
         }
 
@@ -427,7 +491,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "coverage_score":   ints * 3.0 + pbu * 1.5,
             "tackling_score":   tot * 0.5 + tfl * 2.0,
             "pass_rush_score":  sacks * 4.0 + tfl * 1.5,
-            "instinct_score":   (ints + pbu + tfl * 0.5) / tot,
+            "instinct_score":   shrunk_rate(ints + pbu + tfl * 0.5, tot, pg, "instinct_score"),
             "volume_score":     tot,
         }
 
@@ -998,10 +1062,24 @@ FEATURE_BOUNDS: dict[str, tuple[float, float]] = {
     # Defensive stat composites
     "pass_rush_score":  (0.0,  55.0),
     "run_stop_score":   (0.0,  50.0),
-    "disruption_rate":  (0.0,  0.6),
+    # Re-derived in v4.3 after shrunk_rate(); the old bounds were calibrated on
+    # unshrunk ratios and had stopped discriminating. Measured over all rated
+    # defenders 2008-2026, before/after:
+    #
+    #   CB instinct   p90 2.000 -> 0.315   p99 5.000 -> 0.546   max 11.0 -> 1.01
+    #   S  instinct   p90 1.000 -> 0.220   p99 4.000 -> 0.398
+    #   LB instinct   p90 1.000 -> 0.192   p99 2.000 -> 0.343
+    #   EDGE disrupt  p90 0.500 -> 0.402   p99 1.000 -> 0.569
+    #   DL   disrupt  p90 0.444 -> 0.330   p99 1.000 -> 0.491
+    #
+    # Against a ceiling of 0.3, a p90 of 2.0 means nine corners in ten normalized
+    # to exactly 1.0 — 5,848 player-seasons posted a ratio of 1.0 or better, so
+    # the feature was a constant for most of the pool rather than a measurement.
+    # Ceilings are now ~p99 of the shrunk distribution and floors ~p10.
+    "disruption_rate":  (0.10, 0.55),
     "tackling_score":   (0.0,  60.0),
     "coverage_score":   (0.0,  15.0),
-    "instinct_score":   (0.0,  0.3),
+    "instinct_score":   (0.04, 0.45),
     # Universal
     "recruit_composite":(40.0, 100.0),
     "volume_score":     (0.0,  46.0),
@@ -1394,6 +1472,39 @@ def compute_breakout(df: pd.DataFrame, ratings: np.ndarray) -> np.ndarray:
 # Per-position entry point
 # ---------------------------------------------------------------------------
 
+def withhold_position(season: int, pg: str) -> list[dict]:
+    """Emit rows for a position we decline to rate, carrying the reason.
+
+    A withheld rating and a missing row are different things and must look
+    different downstream. A missing row makes a lineman vanish from his own
+    roster; a withheld one keeps him there and says why the number is absent.
+    """
+    reason = NOT_RATED_POSITIONS[pg]
+    ps = _raw("player_seasons")
+    if ps.empty:
+        print("no player_seasons")
+        return []
+    sub = ps[(ps["season"] == season) & (ps["position_group"] == pg)]
+    rows = [{
+        "player_season_id":     int(r["id"]),
+        "season":               int(season),
+        "overall_rating":       None,
+        "position_rating":      None,
+        "rating_status":        "not_rated",
+        "not_rated_reason":     reason,
+        "trajectory_score":     0.0,
+        "trajectory":           0.0,
+        "breakout_probability": 0.0,
+        "shap_values":          "{}",
+        "model_version":        MODEL_VERSION,
+        "engine":               "edge",
+        "_tier":                "bench",
+        "_pg":                  pg,
+    } for _, r in sub.iterrows()]
+    print(f"{len(rows)} players, rating withheld (no individual data exists)")
+    return rows
+
+
 def rate_position(season: int, pg: str) -> list[dict]:
     """Rate all players at a position for a given season.
 
@@ -1402,6 +1513,9 @@ def rate_position(season: int, pg: str) -> list[dict]:
     A player rated 85 in 2021 is genuinely comparable to an 85 in 2025.
     """
     print(f"  {pg}...", end=" ", flush=True)
+
+    if pg in NOT_RATED_POSITIONS:
+        return withhold_position(season, pg)
 
     # Load ALL seasons together so percentile ranks are cross-season stable
     all_df = _load_seasons(ALL_SEASONS, pg)
@@ -1604,13 +1718,30 @@ def validate_distribution(rows: list[dict]) -> bool:
         # Offensive positions can reach 90+ (elite rushers/passers have extreme stat outliers).
         # Defensive positions cap naturally lower due to counting-stat compression.
         if pg in ("K", "P"):
-            mean_ok = (55 <= mean <= 70)
-            p90_ok  = (65 <= p90 <= 79)
-            p99_ok  = (70 <= p99 <= 79)
+            # Re-derived in v4.3 from the design these ratings were rebuilt to,
+            # rather than from the pre-v4.2 distribution they replaced.
+            #
+            # The old bounds (mean 55–70, p90 65–79, p99 70–79) were inherited
+            # from a distribution with 38 punters at 85+ against EA's one. v4.2
+            # deliberately pulled specialists down, and the bounds were left
+            # behind — so the gate warned on every single run, which is the same
+            # as not having a gate. The stated intent is that a specialist's band
+            # is narrower than a skill player's and the ceiling is ~88–90.
+            #
+            # Deliberately NOT changed in the commit that shipped the ratings they
+            # judge; that is how goalposts move. This is that separate change.
+            # The old failure still fails: 24% of punters at 85+ puts p90 near 88,
+            # well outside the ceiling below.
+            mean_ok = (46 <= mean <= 64)
+            p90_ok  = (70 <= p90 <= 82)
+            p99_ok  = (78 <= p99 <= 90)
         elif pg == "OL":
-            mean_ok = (55 <= mean <= 75)
-            p90_ok  = (78 <= p90 <= 95)
-            p99_ok  = (88 <= p99 <= 99)
+            # OL carries no earned rating at all from v4.3 (NOT_RATED_POSITIONS).
+            # Reaching here means something started rating linemen again.
+            print("    WARNING: OL has rated rows — the player rating is withdrawn, "
+                  "see utils/line_unit.py")
+            valid = False
+            continue
         elif pg in ("QB", "RB"):
             mean_ok = (60 <= mean <= 72)
             p90_ok  = (78 <= p90 <= 92)

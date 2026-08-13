@@ -347,6 +347,11 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
             "logo_url":         row.get("logo_url"),
             "overall_rating":   _f(row.get("overall_rating")),
             "position_rating":  _f(row.get("position_rating")),
+            # A withheld rating is not a missing one. OL carries rating_status
+            # "not_rated" with the reason attached, so the UI renders a stated
+            # refusal instead of a blank that reads as a bug.
+            "rating_status":    row.get("rating_status"),
+            "not_rated_reason": row.get("not_rated_reason"),
             "trajectory":       _f(row.get("trajectory_score")),
             "breakout_prob":    _f(row.get("breakout_probability")),
             "shap":             _parse_shap(row.get("shap_values")),
@@ -467,8 +472,12 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             "logo_url":         r.get("logo_url"),
             "sub_ratings":      sub,
         }
-        # Hoist split keys for frontend
-        for k in ("pass_off", "run_off", "pass_def", "run_def", "special_teams"):
+        # Hoist split keys for frontend. line_unit is here rather than only
+        # inside sub_ratings because the team page reads it directly — it is the
+        # replacement for the withdrawn per-lineman rating and needs to be as
+        # easy to reach as any other split.
+        for k in ("pass_off", "run_off", "pass_def", "run_def", "special_teams",
+                  "line_unit", "line_unit_inputs"):
             row[k] = sub.get(k)
         row["sp_plus"]       = sub.get("sp_offense_scaled") or sub.get("sp_overall_scaled")
         row["recruit_score"] = sub.get("recruiting_scaled")
@@ -789,6 +798,8 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
             "weight_lbs":       _i(row.get("weight_lbs")),
             "hometown_state":   row.get("hometown_state"),
             "overall_rating":   _f(row.get("overall_rating")),
+            "rating_status":    row.get("rating_status"),
+            "not_rated_reason": row.get("not_rated_reason"),
             "trajectory":       _f(row.get("trajectory_score")),
             "breakout_prob":    _f(row.get("breakout_probability")),
             "shap":             _parse_shap(row.get("shap_values")),

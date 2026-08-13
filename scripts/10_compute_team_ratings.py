@@ -44,6 +44,7 @@ load_dotenv()
 
 from utils.store import read_raw, read_computed, write_computed
 from utils.api_client import load_api_key, fetch_sp_ratings_breakdown, fetch_team_stats
+from utils.line_unit import line_unit_rating
 
 MODEL_VERSION = "v2.0-team"
 
@@ -298,11 +299,89 @@ def sp_season_means(sp_map: dict) -> tuple:
 # Position-weighted roster quality
 # ---------------------------------------------------------------------------
 
-def avg_top(ratings: list, n: int) -> float:
-    """Average top-N ratings from list; return 50.0 if empty."""
+def avg_top(ratings: list, n: int) -> float | None:
+    """Average of the top N ratings, or None when there are none.
+
+    This used to return a hard-coded 50.0, which was a trap rather than a
+    default: a position with nobody rated became an average position, and OL is
+    40% of run offence. With the OL player rating withdrawn in v4.3 that would
+    have made 40% of every team's run offence an identical constant. None forces
+    the caller to renormalise, which is what the headline blend already does when
+    a whole signal is missing.
+    """
     if not ratings:
-        return 50.0
+        return None
     return float(np.mean(sorted(ratings, reverse=True)[:n]))
+
+
+def blend(parts: list) -> float | None:
+    """Weighted mean over the [(value, weight)] pairs that have a value.
+
+    Renormalises across what is present. None when nothing is.
+    """
+    present = [(v, w) for v, w in parts if v is not None]
+    if not present:
+        return None
+    return sum(v * w for v, w in present) / sum(w for _, w in present)
+
+
+def build_line_unit_ratings(season: int, stat_table: dict, teams: list) -> dict:
+    """{team_id: (rating, contributions)} — the offensive line, rated as a unit.
+
+    This is what replaces the withdrawn per-lineman number. Four run-blocking
+    metrics come from /stats/season/advanced (harvested by script 09, confirmed
+    back to 2008); sack rate allowed comes from /stats/season, where
+    `sacksOpponent` is sacks taken BY this team's offence.
+
+    Empty when script 09 has not been run, in which case the OL term simply drops
+    out of the roster splits and the remaining weights renormalise — a smaller
+    claim, not a wrong one.
+    """
+    adv = read_raw("team_advanced_season")
+    if adv.empty or "season" not in adv.columns:
+        return {}
+    sub = adv[adv["season"] == season]
+    if sub.empty:
+        return {}
+
+    keys = list(stat_table.keys())
+    out: dict = {}
+    school_by_id = {tid: school for tid, school, _ in teams}
+
+    for _, r in sub.iterrows():
+        tid = r.get("team_id")
+        if tid is None or pd.isna(tid):
+            continue
+        tid = int(tid)
+
+        sack_rate = None
+        school = school_by_id.get(tid)
+        if school:
+            s = stat_table.get(school.lower()) or stat_table.get(_fuzzy_match(school.lower(), keys) or "")
+            if s:
+                sacks_allowed = s.get("sacksOpponent")
+                att = s.get("passAttempts")
+                # Dropbacks, not attempts: a sack is a pass play that ended in a
+                # sack, so it belongs in its own denominator or the rate is
+                # understated for exactly the lines that allow the most.
+                if sacks_allowed is not None and att:
+                    denom = float(att) + float(sacks_allowed)
+                    if denom > 0:
+                        sack_rate = float(sacks_allowed) / denom
+
+        # Season is passed, not defaulted: the line metrics have two definitional
+        # step changes (2014, 2021) and pooled bounds made the rating drift 25
+        # points across the archive. See LINE_UNIT_BOUNDS_BY_ERA.
+        rating, parts = line_unit_rating({
+            "line_yards":         r.get("off_line_yards"),
+            "stuff_rate":         r.get("off_stuff_rate"),
+            "power_success":      r.get("off_power_success"),
+            "second_level_yards": r.get("off_second_level_yards"),
+            "sack_rate_allowed":  sack_rate,
+        }, season=season)
+        if rating is not None:
+            out[tid] = (rating, parts)
+    return out
 
 
 def load_starter_ratings_by_position(season: int, engine: str = "edge") -> dict:
@@ -333,8 +412,18 @@ def load_starter_ratings_by_position(season: int, engine: str = "edge") -> dict:
     return result
 
 
-def compute_roster_splits(by_pos: dict) -> dict:
-    """Compute pass_off, run_off, pass_def, run_def, special_teams from position ratings."""
+def compute_roster_splits(by_pos: dict, line_rating: float | None = None) -> dict:
+    """pass_off, run_off, pass_def, run_def, special_teams from position ratings.
+
+    The OL term is the LINE-UNIT rating (utils/line_unit.py), not the average of
+    five linemen's overalls — those no longer exist, and when they did they were
+    the average of five recruiting ranks. When no line rating is available the
+    term drops out and the remaining weights renormalise; the same rule now
+    applies to every position, so a team with no rated kicker no longer gets a
+    silent 50.
+
+    Returns None for a split with no inputs at all. Callers must handle it.
+    """
     def g(pos):
         return by_pos.get(pos, [])
 
@@ -342,31 +431,21 @@ def compute_roster_splits(by_pos: dict) -> dict:
     db_all = g("DB") + g("CB") + g("S")
     dl_all = g("DL") + g("EDGE")
 
-    pass_off = (avg_top(g("QB"),   2) * W_QB
-              + avg_top(g("WR") + g("TE"), 5) * W_WR_TE
-              + avg_top(g("OL"),   5) * W_OL)
-
-    run_off  = (avg_top(g("RB"),   3) * W_RB
-              + avg_top(g("OL"),   5) * W_OL_RUN
-              + avg_top(g("QB"),   2) * W_QB_RUN
-              + avg_top(g("WR") + g("TE"), 5) * W_WR_TE_RUN)
-
-    pass_def = (avg_top(db_all,    5) * W_DB
-              + avg_top(g("LB"),   4) * W_LB_PDEF
-              + avg_top(dl_all,    4) * W_DL_PDEF)
-
-    run_def  = (avg_top(dl_all,    4) * W_DL
-              + avg_top(g("LB"),   4) * W_LB_RDEF
-              + avg_top(db_all,    5) * W_DB_RDEF)
-
-    special  = avg_top(g("K") + g("P"), 2)
+    qb    = avg_top(g("QB"), 2)
+    wrte  = avg_top(g("WR") + g("TE"), 5)
+    rb    = avg_top(g("RB"), 3)
+    lb    = avg_top(g("LB"), 4)
+    dbs   = avg_top(db_all, 5)
+    dls   = avg_top(dl_all, 4)
 
     return {
-        "pass_off": pass_off,
-        "run_off":  run_off,
-        "pass_def": pass_def,
-        "run_def":  run_def,
-        "special":  special,
+        "pass_off": blend([(qb, W_QB), (wrte, W_WR_TE), (line_rating, W_OL)]),
+        "run_off":  blend([(rb, W_RB), (line_rating, W_OL_RUN),
+                           (qb, W_QB_RUN), (wrte, W_WR_TE_RUN)]),
+        "pass_def": blend([(dbs, W_DB), (lb, W_LB_PDEF), (dls, W_DL_PDEF)]),
+        "run_def":  blend([(dls, W_DL), (lb, W_LB_RDEF), (dbs, W_DB_RDEF)]),
+        "special":  avg_top(g("K") + g("P"), 2),
+        "line_unit": line_rating,
     }
 
 
@@ -621,6 +700,7 @@ def compute_team_splits(
     team_stats: dict | None,
     sp_means: tuple,
     recruiting_scaledcaled: float | None,
+    line_rating: float | None = None,
 ) -> dict | None:
     """SP+-anchored overall/offense/defense (0-99), blended with roster talent.
 
@@ -640,10 +720,14 @@ def compute_team_splits(
     # equally important, which a football team is not; the position-weighted
     # composite knows a quarterback outweighs a fourth safety. Blending both
     # keeps a star-driven roster and a uniformly solid one distinguishable.
-    ros = compute_roster_splits(roster_by_pos)
-    weighted = (ros["pass_off"] * W_PASS_OFF + ros["run_off"] * W_RUN_OFF
-                + ros["pass_def"] * W_PASS_DEF + ros["run_def"] * W_RUN_DEF
-                + ros["special"] * W_SPEC)
+    ros = compute_roster_splits(roster_by_pos, line_rating)
+    # Every split can now be None — a position group with nobody rated no longer
+    # contributes a fabricated 50 — so the rollup renormalises the same way.
+    weighted = blend([(ros["pass_off"], W_PASS_OFF), (ros["run_off"], W_RUN_OFF),
+                      (ros["pass_def"], W_PASS_DEF), (ros["run_def"], W_RUN_DEF),
+                      (ros["special"],  W_SPEC)])
+    if weighted is None:
+        mean_top22 = None
 
     if mean_top22 is not None:
         roster_ovr = (roster_to_ovr(mean_top22) * W_ROSTER_TOP22
@@ -677,11 +761,16 @@ def compute_team_splits(
         return None
 
     # --- Detail splits: position-weighted roster quality (drives the bars) ---
-    # Blend roster splits toward the SP+ offense/defense headline so bars track OVR.
-    pass_off = ros["pass_off"] * 0.6 + off  * 0.4
-    run_off  = ros["run_off"]  * 0.6 + off  * 0.4
-    pass_def = ros["pass_def"] * 0.6 + def_rating * 0.4
-    run_def  = ros["run_def"]  * 0.6 + def_rating * 0.4
+    # Blend roster splits toward the SP+ offense/defense headline so bars track
+    # OVR. A split with no roster behind it falls back to the headline rather
+    # than to a constant, because the headline is a real reading of this team.
+    def _bar(split, anchor):
+        return anchor if split is None else split * 0.6 + anchor * 0.4
+
+    pass_off = _bar(ros["pass_off"], off)
+    run_off  = _bar(ros["run_off"],  off)
+    pass_def = _bar(ros["pass_def"], def_rating)
+    run_def  = _bar(ros["run_def"],  def_rating)
     special  = ros["special"]
 
     def r2(v): return round(float(v), 2)
@@ -691,7 +780,8 @@ def compute_team_splits(
         "run_off":        r2(_clip(run_off)),
         "pass_def":       r2(_clip(pass_def)),
         "run_def":        r2(_clip(run_def)),
-        "special_teams":  r2(_clip(special)),
+        "special_teams":  r2(_clip(special)) if special is not None else None,
+        "line_unit":      r2(_clip(line_rating)) if line_rating is not None else None,
         "overall_rating": r2(_clip(overall)),
         "offense_rating": r2(_clip(off)),
         "defense_rating": r2(_clip(def_rating)),
@@ -738,6 +828,16 @@ def run_season(season: int, api_key: str) -> None:
     print("Storing display team stats...")
     store_team_season_stats(season, api_key, teams)
 
+    print("Rating offensive lines as units...")
+    line_map = build_line_unit_ratings(season, build_team_stat_table(season, api_key), teams)
+    if line_map:
+        vals = sorted((v[0] for v in line_map.values()), reverse=True)
+        print(f"  {len(line_map)} lines rated  (top {vals[0]:.1f}, median "
+              f"{vals[len(vals)//2]:.1f}, bottom {vals[-1]:.1f})")
+    else:
+        print("  none — run scripts/09_harvest_supplemental.py "
+              "--dataset team_advanced_season; the OL term will renormalise out")
+
     print(f"Loading recruiting ({season - RECRUITING_WINDOW + 1}–{season})...")
     recruiting_map = load_recruiting_scores(season)
     print(f"  {len(recruiting_map)} teams have recruiting data")
@@ -757,7 +857,10 @@ def run_season(season: int, api_key: str) -> None:
         tstats  = tss_map.get(team_id)
         recruiting_scaled   = recruiting_map.get(team_id)
 
-        splits = compute_team_splits(team_id, sp, by_pos, tstats, sp_means, recruiting_scaled)
+        line_rating, line_parts = line_map.get(team_id, (None, {}))
+
+        splits = compute_team_splits(team_id, sp, by_pos, tstats, sp_means,
+                                     recruiting_scaled, line_rating)
         if splits is None:
             skipped.append(school)
             continue
@@ -768,6 +871,11 @@ def run_season(season: int, api_key: str) -> None:
             "pass_def":           splits["pass_def"],
             "run_def":            splits["run_def"],
             "special_teams":      splits["special_teams"],
+            # The offensive line, rated as a unit. It replaces the per-lineman
+            # number entirely — see utils/line_unit.py — and it ships with its
+            # inputs so a team page can show what the rating is made of.
+            "line_unit":          splits["line_unit"],
+            "line_unit_inputs":   line_parts or None,
             "composite":          splits["composite"],
             "sp_offense_scaled":  round(sp_scaled(sp["offense"] if sp else None, sp_means[1]), 2),
             "sp_defense_scaled":  round(sp_scaled(sp["defense"] if sp else None, sp_means[2]), 2),
@@ -886,6 +994,12 @@ def run_projected_season(season: int) -> None:
             "pass_def":          splits["pass_def"],
             "run_def":           splits["run_def"],
             "special_teams":     splits["special_teams"],
+            # No line rating for an unplayed season — the line metrics are
+            # measurements of games that have not happened. The OL term
+            # renormalises out rather than being projected, which matches the
+            # decision not to project individual linemen either.
+            "line_unit":         None,
+            "line_unit_inputs":  None,
             "composite":         splits["composite"],
             "sp_offense_scaled": None,
             "sp_defense_scaled": None,

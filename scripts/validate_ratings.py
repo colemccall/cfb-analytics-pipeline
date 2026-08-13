@@ -91,6 +91,15 @@ def ea_agreement(df: pd.DataFrame, ea: pd.DataFrame) -> pd.DataFrame:
         g = m[m["position_group"] == pg]
         if len(g) < 10:
             continue
+        # A position we decline to rate has nothing to correlate. Printing NaN
+        # reads as a broken computation; "withheld" reads as the decision it is.
+        # OL is the case: its old rating scored -0.2742 here, which is what
+        # withdrawing it was for.
+        if g["overall_rating"].notna().sum() < 10:
+            out.append({"pos": pg, "matched": len(g), "spearman": "withheld",
+                        "ours 85+": "—", "EA 85+": int((g["ovr"] >= 85).sum()),
+                        "ours 90+": "—", "EA 90+": int((g["ovr"] >= 90).sum())})
+            continue
         out.append({
             "pos":       pg,
             "matched":   len(g),

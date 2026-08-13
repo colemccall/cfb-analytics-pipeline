@@ -31,11 +31,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.store import read_raw, read_computed
 from utils.json_utils import write_json
+from utils.coaching import coach_tenures, head_coach_by_team_season
+from utils.shrinkage import population_stats, shrink_mean
 
 OUTPUT_PATH = (
     Path(__file__).parent.parent.parent
     / "cfb-analytics-app" / "data" / "team_performance.json"
 )
+
+COACHING_PATH = (
+    Path(__file__).parent.parent.parent
+    / "cfb-analytics-app" / "data" / "coaching_impact.json"
+)
+
+# A stint needs this many seasons on each side of a change before the before/after
+# comparison says anything. Two is the minimum that is not a single season, and a
+# single season of SP+ residual is mostly noise (SD 9.82).
+MIN_STINT_SEASONS = 2
 
 # Power 4 + legacy Pac-12 treated as P5 for the covariate
 P5_CONFERENCES = {"SEC", "Big Ten", "Big 12", "ACC", "Pac-12"}
@@ -217,10 +229,148 @@ def main() -> None:
     else:
         print(f"  WARNING: only {len(valid)} rows with talent data — skipping regression")
 
+    # -------------------------------------------------------------------------
+    # Shrinkage — the residual leaderboard is 2,310 noisy numbers ranked
+    # -------------------------------------------------------------------------
+    resids = [r["performance_residual"] for r in records
+              if r["performance_residual"] is not None]
+    if resids:
+        mu, sd = population_stats(resids)
+        print(f"  Residual distribution: mean {mu:.2f}, SD {sd:.2f} over {len(resids)} team-seasons")
+        # One team-season is one observation, so n=1 and the shrunk value is the
+        # honest one: a single season tells you much less than the raw number
+        # implies. Teams with several seasons get an aggregate below.
+        for r in records:
+            if r["performance_residual"] is None:
+                continue
+            sm = shrink_mean(r["performance_residual"], 1, mu, sd, sd)
+            r["residual_shrunk"] = sm["value"]
+            r["residual_low"]    = sm["low"]
+            r["residual_high"]   = sm["high"]
+
     records.sort(key=lambda r: (-(r["season"] or 0), -(r["performance_residual"] or 0)))
 
     write_json(OUTPUT_PATH, records)
     print(f"Done. {len(records)} team-seasons written to team_performance.json")
+
+    write_json(COACHING_PATH, coaching_event_study(records))
+
+
+def coaching_event_study(records: list[dict]) -> list[dict]:
+    """Does the performance residual move when the head coach does?
+
+    This is the test the team-performance finding has needed since it shipped.
+    The residual persists year over year (r = 0.607 at t+1, 0.280 at t+3), which
+    the page presented as evidence of coaching. It is not: scheme, development
+    pipelines, portal usage and systematic error in the talent proxy are all
+    persistent by team too. Persistence says the residual is real. It says nothing
+    about what causes it.
+
+    A coaching change is the closest thing to a natural experiment available. If
+    the residual steps at the change and the step travels with the coach to his
+    next job, coaching is doing work. If it does not move, the residual is a
+    property of the program.
+
+    What this can support: a distribution of before/after steps across many
+    changes, and a per-coach record. What it cannot: causation for any single
+    hire. Programs fire coaches after bad seasons, so the "before" is selected
+    for being low and mean reversion alone predicts an improvement — which is why
+    the summary reports the *median* step and the share of changes that improved,
+    rather than presenting a positive mean as proof that firing coaches works.
+    """
+    print("\nCoaching event study...")
+    hc = head_coach_by_team_season()
+    if not hc:
+        print("  No coaches table — run scripts/09_harvest_supplemental.py "
+              "--dataset coaches. Skipping.")
+        return []
+
+    resid = {(r["team_id"], r["season"]): r["performance_residual"]
+             for r in records if r["performance_residual"] is not None}
+
+    stints = [s for s in coach_tenures(hc) if s["seasons"] >= MIN_STINT_SEASONS]
+    by_team: dict = defaultdict(list)
+    for s in stints:
+        by_team[s["team_id"]].append(s)
+    for v in by_team.values():
+        v.sort(key=lambda s: s["first_season"])
+
+    def stint_mean(s: dict):
+        vals = [resid[(s["team_id"], y)] for y in
+                range(s["first_season"], s["last_season"] + 1)
+                if (s["team_id"], y) in resid]
+        return (float(np.mean(vals)), len(vals)) if vals else (None, 0)
+
+    events: list[dict] = []
+    for tid, seq in by_team.items():
+        for prev, cur in zip(seq, seq[1:]):
+            # Consecutive stints only. A gap means seasons we have no coach for,
+            # and attributing the step across it would be inventing the transition.
+            if cur["first_season"] != prev["last_season"] + 1:
+                continue
+            before, n_before = stint_mean(prev)
+            after, n_after = stint_mean(cur)
+            if before is None or after is None:
+                continue
+            if n_before < MIN_STINT_SEASONS or n_after < MIN_STINT_SEASONS:
+                continue
+            events.append({
+                "team_id":        tid,
+                "school":         next((r["school"] for r in records if r["team_id"] == tid), ""),
+                "change_season":  cur["first_season"],
+                "outgoing":       prev["coach_name"],
+                "incoming":       cur["coach_name"],
+                "residual_before": round(before, 2),
+                "residual_after":  round(after, 2),
+                "step":            round(after - before, 2),
+                "seasons_before":  n_before,
+                "seasons_after":   n_after,
+            })
+
+    if not events:
+        print("  No coaching changes with enough seasons on both sides.")
+        return []
+
+    steps = np.array([e["step"] for e in events], dtype=float)
+    print(f"  {len(events)} coaching changes with >= {MIN_STINT_SEASONS} rated seasons each side")
+    print(f"    mean step   {steps.mean():+.2f} SP+ points")
+    print(f"    median step {np.median(steps):+.2f}")
+    print(f"    improved    {100*float((steps > 0).mean()):.1f}% of changes")
+    print(f"    step SD     {steps.std(ddof=1):.2f}  (residual SD is 9.82 — "
+          f"a step smaller than that is not a coaching effect)")
+
+    # Does a coach carry his residual between jobs? This is the harder and more
+    # interesting question, and the one persistence cannot answer at all.
+    by_coach: dict = defaultdict(list)
+    for s in stints:
+        m, n = stint_mean(s)
+        if m is not None and n >= MIN_STINT_SEASONS:
+            by_coach[s["coach"]].append({"team_id": s["team_id"], "mean": m, "n": n,
+                                         "first_season": s["first_season"],
+                                         "coach_name": s["coach_name"]})
+    movers = {c: v for c, v in by_coach.items() if len(v) >= 2}
+    carry = None
+    if len(movers) >= 10:
+        first = [sorted(v, key=lambda x: x["first_season"])[0]["mean"] for v in movers.values()]
+        later = [sorted(v, key=lambda x: x["first_season"])[1]["mean"] for v in movers.values()]
+        carry = float(np.corrcoef(first, later)[0, 1])
+        print(f"  {len(movers)} coaches with two rated stints: correlation between "
+              f"their first job's residual and their second = {carry:+.3f}")
+        print("    This is the number that separates 'good coach' from 'good program'.")
+
+    events.sort(key=lambda e: -abs(e["step"]))
+    return [{
+        "_summary": True,
+        "n_events": len(events),
+        "mean_step": round(float(steps.mean()), 2),
+        "median_step": round(float(np.median(steps)), 2),
+        "pct_improved": round(100 * float((steps > 0).mean()), 1),
+        "step_sd": round(float(steps.std(ddof=1)), 2),
+        "residual_sd": 9.82,
+        "n_coaches_with_two_stints": len(movers),
+        "coach_carryover_r": round(carry, 3) if carry is not None else None,
+        "min_stint_seasons": MIN_STINT_SEASONS,
+    }] + events
 
 
 if __name__ == "__main__":

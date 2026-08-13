@@ -1,4 +1,4 @@
-"""EDGE — Efficiency-Driven Grade per Event (v4.1).
+"""EDGE — Efficiency-Driven Grade per Event (v4.3).
 
 Formula (all positions):
     edge_score = sum_over_games(stat_composite_i × opp_mult_i) / sqrt(games_played)
@@ -12,6 +12,21 @@ Defensive (EDGE/DL/LB/CB/S):
     Pre-2016: only INTs available — sacks/hurries/TFLs/PBUs are absent from the
     CFB Data API for those seasons. Defensive EDGE scores pre-2016 will be sparse.
     opp_mult scales by the opponent's *offensive* SP+ rating for that game.
+
+v4.3 makes four changes to the defensive side, all aimed at the same complaint:
+the rating was mostly tackle volume, and tackle volume is mostly opportunity.
+
+    solo/assist split   a made play counts more than proximity to one (2013+)
+    fumble recoveries   a takeaway the composite simply did not count
+    opportunity index   counting stats scaled by defensive plays FACED (2008+)
+    havoc share         computed and published, but NOT scored — it failed its
+                        own ablation. See the note on HAVOC_CREDIT.
+
+The last two need data/raw/team_advanced_season.json — run
+`python scripts/09_harvest_supplemental.py --dataset team_advanced_season` first.
+Without it both degrade to 1.0 and the rating is exactly what it was before,
+which is the right failure mode but is silently a different model, so the run
+prints which of them are active.
 
 All data is read from data/raw/*.json and written to data/raw/player_edge.json.
 
@@ -36,7 +51,7 @@ load_dotenv()
 from utils.store import read_raw, RAW_DIR
 from utils.api_client import load_api_key, fetch_sp_ratings_all, fetch_sp_ratings_breakdown, fetch_game_team_stats
 
-MODEL_VERSION = "v4.1-local"
+MODEL_VERSION = "v4.3-local"
 
 OFF_EDGE_POSITIONS = {"QB", "RB", "WR", "TE"}
 DEF_EDGE_POSITIONS = {"EDGE", "DL", "LB", "CB", "S", "DB"}
@@ -62,13 +77,77 @@ OFFENSE_PRIMARY_STATS = {
 }
 
 DEF_STAT_WEIGHTS = {
-    "EDGE": {"sacks": 7.0, "hur": 2.5, "tfl": 4.0, "tot": 0.3, "ints": 4.0,  "pbu": 1.5},
-    "DL":   {"sacks": 6.0, "hur": 2.0, "tfl": 4.0, "tot": 0.4, "ints": 3.0,  "pbu": 0.5},
-    "LB":   {"sacks": 5.5, "hur": 1.5, "tfl": 4.0, "tot": 0.6, "ints": 7.0,  "pbu": 2.0},
-    "CB":   {"sacks": 2.5, "hur": 1.0, "tfl": 2.0, "tot": 0.3, "ints": 12.0, "pbu": 2.0},
-    "S":    {"sacks": 3.0, "hur": 1.5, "tfl": 3.0, "tot": 0.4, "ints": 10.0, "pbu": 2.0},
-    "DB":   {"sacks": 2.5, "hur": 1.0, "tfl": 2.0, "tot": 0.3, "ints": 11.0, "pbu": 2.0},
+    "EDGE": {"sacks": 7.0, "hur": 2.5, "tfl": 4.0, "tot": 0.3, "ints": 4.0,  "pbu": 1.5, "fum_rec": 4.0},
+    "DL":   {"sacks": 6.0, "hur": 2.0, "tfl": 4.0, "tot": 0.4, "ints": 3.0,  "pbu": 0.5, "fum_rec": 4.0},
+    "LB":   {"sacks": 5.5, "hur": 1.5, "tfl": 4.0, "tot": 0.6, "ints": 7.0,  "pbu": 2.0, "fum_rec": 4.5},
+    "CB":   {"sacks": 2.5, "hur": 1.0, "tfl": 2.0, "tot": 0.3, "ints": 12.0, "pbu": 2.0, "fum_rec": 5.0},
+    "S":    {"sacks": 3.0, "hur": 1.5, "tfl": 3.0, "tot": 0.4, "ints": 10.0, "pbu": 2.0, "fum_rec": 5.0},
+    "DB":   {"sacks": 2.5, "hur": 1.0, "tfl": 2.0, "tot": 0.3, "ints": 11.0, "pbu": 2.0, "fum_rec": 5.0},
 }
+
+# ---------------------------------------------------------------------------
+# Solo vs assisted tackles
+#
+# A tackle is the biggest term in every defensive composite and the weakest
+# signal in it — volume is snaps x how often the opponent runs at you x how long
+# your defence is on the field. Splitting it is the cheapest way to make it mean
+# more: a solo stop is a play the defender made, an assist is a play he was near.
+#
+# Calibrated to be near-neutral in aggregate rather than to inflate defence as a
+# whole. Solo tackles are 56.4% of all recorded tackles 2013-2026, so
+# 0.564 x 1.25 + 0.436 x 0.65 = 0.988 — the average defender's tackle credit is
+# essentially unchanged and only the mix moves.
+SOLO_MULT = 1.25
+ASSIST_MULT = 0.65
+
+# defensiveSOLO does not exist before 2013 — zero rows carry it — so the split
+# cannot be applied to the classic era and must degrade to plain totals rather
+# than reading every tackle as an assist. Within 2013+ the field IS per-player
+# real: 8,359 of 8,590 games have some players with solos and some without, and
+# the SOLO=0 rows average 1.65 tackles against 3.88 for the rest. So a zero there
+# means "all assisted", not "not recorded", and only the whole-season absence
+# needs a fallback.
+def _tackle_split(stats: dict) -> tuple[float, float]:
+    """(solo, assisted) for one game row. Assisted is total minus solo."""
+    tot = float(_coerce_int(stats.get("defensiveTOT")))
+    solo = float(_coerce_int(stats.get("defensiveSOLO")))
+    solo = min(solo, tot)
+    return solo, max(tot - solo, 0.0)
+
+
+def season_records_solo(rows: pd.DataFrame) -> bool:
+    """Did this season's data record solo tackles at all?
+
+    Asked of the data rather than hardcoded to a year, so a season where the API
+    stops publishing the field degrades to the old behaviour instead of silently
+    reclassifying every tackle in it as an assist.
+    """
+    if rows.empty or "data" not in rows.columns:
+        return False
+    for d in rows["data"]:
+        if isinstance(d, dict) and _coerce_int(d.get("defensiveSOLO")) > 0:
+            return True
+    return False
+
+
+def _tackle_credit(stats: dict, w_tot: float, solo_known: bool) -> float:
+    """Tackle contribution to a composite, split when the split is knowable."""
+    if not solo_known:
+        return _coerce_int(stats.get("defensiveTOT")) * w_tot
+    solo, assist = _tackle_split(stats)
+    return (solo * SOLO_MULT + assist * ASSIST_MULT) * w_tot
+
+
+# A defender's fumble recovery is a takeaway and belongs in the composite.
+#
+# `fumblesFUM` is NOT the forced fumble it looks like: on a defensive row it is a
+# fumble the player COMMITTED. Only 974 defensive game rows carry one, 84% of
+# them in a game where the player also had a return, an interception or a
+# recovery — that is, the ball was in his hands — and 455 of the 974 also carry
+# `fumblesLOST`. Crediting it would pay a corner for coughing up an interception
+# return. Forced fumbles are simply not published per player anywhere in the API.
+def _fumble_recoveries(stats: dict) -> float:
+    return float(_coerce_int(stats.get("fumblesREC")))
 
 # ---------------------------------------------------------------------------
 # Stat coercion
@@ -392,6 +471,203 @@ def denial_from_ypa(ypa: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Opportunity — how many defensive plays did this player's unit actually face?
+#
+# The complaint that motivates the whole defensive rework is that a tackle count
+# is mostly opportunity. A defence that gets off the field denies its own players
+# the statistic we reward them for, and the fix is a denominator.
+#
+# /stats/season/advanced carries `defense.plays` back to 2010, so this is the one
+# denominator available for nearly the whole archive. Per game, not per season:
+# a 2020 team that played eight games faced fewer plays for reasons that have
+# nothing to do with getting off the field.
+#
+# It is deliberately a gentle, clipped correction rather than a straight rate.
+# Dividing outright would make snaps-faced the dominant term in the rating, and
+# plays faced is not purely a defensive virtue — a fast-tempo offence puts its own
+# defence back on the field. The clip keeps the adjustment to the range where the
+# signal is real and stops a 12-play outlier season from rewriting a career.
+OPPORTUNITY_CLIP = (0.85, 1.20)
+OPPORTUNITY_MIN_PLAYS = 300     # below this the season is too partial to normalise
+
+
+def build_opportunity_index(season: int) -> dict:
+    """{team_db_id: 0.85..1.20} — how many plays this defence faced vs the median.
+
+    Above 1.0 means the unit faced FEWER plays than typical, so each of its
+    counting stats represents more per opportunity and is scaled up. Empty when
+    the advanced-stats table has not been harvested, in which case every caller
+    falls back to 1.0 and the rating is exactly what it was before.
+    """
+    adv = read_raw("team_advanced_season")
+    if adv.empty or "season" not in adv.columns:
+        return {}
+    sub = adv[adv["season"] == season]
+    if sub.empty or "def_plays" not in sub.columns:
+        return {}
+
+    games = _team_games_played(season)
+    per_game: dict[int, float] = {}
+    for _, r in sub.iterrows():
+        tid, plays = r.get("team_id"), r.get("def_plays")
+        if tid is None or pd.isna(tid) or plays is None or pd.isna(plays):
+            continue
+        if float(plays) < OPPORTUNITY_MIN_PLAYS:
+            continue
+        g = games.get(int(tid), 0)
+        if g < MIN_GAMES:
+            continue
+        per_game[int(tid)] = float(plays) / g
+
+    if len(per_game) < 20:
+        return {}
+    med = float(np.median(list(per_game.values())))
+    lo, hi = OPPORTUNITY_CLIP
+    return {t: float(np.clip(med / v, lo, hi)) for t, v in per_game.items() if v > 0}
+
+
+def _team_games_played(season: int) -> dict:
+    """{team_db_id: games} for a season, from our own games table."""
+    games_df = read_raw("games")
+    if games_df.empty:
+        return {}
+    g = games_df[games_df["season"] == season]
+    counts: dict[int, int] = {}
+    for col in ("home_team_id", "away_team_id"):
+        if col not in g.columns:
+            continue
+        for tid in g[col].dropna():
+            try:
+                counts[int(tid)] = counts.get(int(tid), 0) + 1
+            except (TypeError, ValueError):
+                continue
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Havoc share — how much of your unit's disruption was you?
+#
+# The opportunity index above answers "how many chances did the unit get". This
+# answers the complementary question, and it is the one a scout actually asks: of
+# everything disruptive this defence did, what fraction was this player? A
+# tackle-for-loss on a defence that recorded eighty of them is a different claim
+# from the same tackle-for-loss on a defence that recorded twenty.
+#
+# Havoc is a published, standard definition — tackles for loss, passes defensed,
+# forced fumbles — and /stats/season/advanced splits it front-seven vs DB, which
+# maps onto our position groups almost exactly. So the denominator is the team's
+# own havoc, measured the same way, rather than something we invent.
+#
+# MEASURED AND PUBLISHED, BUT NOT SCORED. It failed its own test.
+#
+# The idea is sound and the number is worth showing — "this player accounted for
+# 18% of his unit's disruption" is a real fact about him. But as a rating input it
+# does not survive the ablation that every new signal on this project has to pass:
+#
+#   within-position Spearman vs EA CFB 27, 2025, mean over the six defensive
+#   position groups, against a baseline with neither team-context signal:
+#
+#     opportunity index            +0.0085
+#     opportunity index, SHUFFLED  -0.0025   <- placebo scores below doing nothing
+#     havoc share                  +0.0011
+#     havoc share, FLAT denominator +0.0019  <- the denominator is worth nothing
+#
+# The last line is the verdict. Replacing each unit's own havoc with one shared
+# constant scores slightly BETTER than using the real denominator, which means the
+# credit was never measuring share of a unit — it was re-weighting tackles for
+# loss, passes defensed and fumble recoveries, all of which the composite already
+# counts. Paying for them again is double-counting with extra steps.
+#
+# Contrast the opportunity index directly above it, which passes the same test the
+# coverage credit passed in v4.2: real signal helps, shuffled signal actively
+# hurts. That is what a genuine measurement looks like here.
+#
+# So havoc_share is computed, stored on player_edge and exported for display, and
+# HAVOC_CREDIT is zero. Restoring it is a one-line change if a better denominator
+# is found — per-snap havoc, say, once snap data is wired in.
+HAVOC_POSITIONS = {"EDGE", "DL", "LB"}
+
+HAVOC_CREDIT: dict[str, float] = {}
+
+# A dominant front-seven player accounts for roughly this share of his unit's
+# havoc events over a season. Fixed, like every other anchor here: recomputing it
+# per season would make the best player on a weak front seven look elite.
+HAVOC_REFERENCE_SHARE = 0.22
+
+
+def build_team_havoc(season: int) -> dict:
+    """{team_db_id: (front_seven_events, db_events)} for a season.
+
+    The endpoint publishes havoc as a RATE, so the event count is rate x plays.
+    Returning events rather than rates matters: a share needs a common
+    denominator, and two defences with the same havoc rate over different play
+    counts did not do the same amount.
+    """
+    adv = read_raw("team_advanced_season")
+    if adv.empty or "season" not in adv.columns:
+        return {}
+    sub = adv[adv["season"] == season]
+    if sub.empty:
+        return {}
+    out: dict[int, tuple[float, float]] = {}
+    for _, r in sub.iterrows():
+        tid, plays = r.get("team_id"), r.get("def_plays")
+        if tid is None or pd.isna(tid) or plays is None or pd.isna(plays):
+            continue
+        f7 = r.get("def_havoc_front_seven")
+        db = r.get("def_havoc_db")
+        if f7 is None or pd.isna(f7):
+            continue
+        out[int(tid)] = (float(f7) * float(plays),
+                         float(db) * float(plays) if db is not None and not pd.isna(db) else 0.0)
+    return out
+
+
+def _player_havoc_events(stats: dict) -> float:
+    """Havoc events by one player in one game, on the published definition.
+
+    Tackles for loss (sacks are a subset of TFL and are not added again), passes
+    defensed, and fumble recoveries standing in for the forced fumbles the API
+    does not attribute.
+    """
+    return float(_coerce_int(stats.get("defensiveTFL"))
+                 + (_coerce_int(stats.get("defensivePD")) or _coerce_int(stats.get("defensivePBU")))
+                 + _coerce_int(stats.get("fumblesREC")))
+
+
+def build_havoc_share(rows: pd.DataFrame, team_havoc: dict) -> dict:
+    """{(team_id, player_id): 0..1} — share of the unit's havoc, normalised.
+
+    1.0 means the player accounted for HAVOC_REFERENCE_SHARE or more of his
+    unit's season havoc. Front seven and secondary are measured against their own
+    unit's events, so a corner is not compared to a defensive end.
+    """
+    if rows.empty or not team_havoc:
+        return {}
+
+    per: dict[tuple, float] = {}
+    for pid, tid, pg, data in zip(rows["player_id"], rows["player_team_id"],
+                                  rows["position_group"], rows["data"]):
+        if tid is None or pd.isna(tid) or not isinstance(data, dict):
+            continue
+        ev = _player_havoc_events(data)
+        if ev <= 0:
+            continue
+        per[(int(tid), int(pid), pg)] = per.get((int(tid), int(pid), pg), 0.0) + ev
+
+    out: dict[tuple, float] = {}
+    for (tid, pid, pg), ev in per.items():
+        unit = team_havoc.get(tid)
+        if not unit:
+            continue
+        denom = unit[0] if pg in HAVOC_POSITIONS else unit[1]
+        if denom <= 0:
+            continue
+        out[(tid, pid)] = float(np.clip(ev / denom / HAVOC_REFERENCE_SHARE, 0.0, 1.0))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Defensive-back archetypes
 #
 # "Defensive back" is three jobs wearing one label, and a single composite makes
@@ -410,7 +686,10 @@ def denial_from_ypa(ypa: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 ARCHETYPE_WEIGHTS = {
-    "ball_hawk":   {"ints": 12.0, "pbu": 3.5, "def_td": 8.0},
+    # A fumble recovery is a takeaway, which is what ball hawk measures. It was
+    # missing, so a corner who stripped and recovered scored the same as one who
+    # watched the ball roll out of bounds.
+    "ball_hawk":   {"ints": 12.0, "pbu": 3.5, "def_td": 8.0, "fum_rec": 6.0},
     "run_support": {"tot": 0.6, "tfl": 4.0, "sacks": 6.0, "hur": 1.5},
     # coverage has no box-score inputs at all; it is playing time x denial
 }
@@ -425,7 +704,16 @@ ARCHETYPE_WEIGHTS = {
 # out at 7.1 on a 0-10 axis while run support reached 20 — coverage could not win
 # a comparison it was supposed to be able to win, and 25 defensive backs out of
 # 2,026 typed as coverage players.
-ARCHETYPE_SCALE = {"ball_hawk": 12.9, "coverage": 8.5, "run_support": 14.8}
+#
+# Re-measured for v4.3 (2026-08-12) after fumble recoveries entered ball hawk and
+# the solo/assist split and opportunity index entered run support. Raw p90s over
+# 2,026 rated defensive backs in 2025: ball hawk 13.4 (was 12.9), coverage 7.1,
+# run support 14.8 (unmoved — the tackle changes were calibrated to be neutral in
+# aggregate and measurably were). Coverage sits below the other two by
+# construction, because a defensive back on a porous pass defence earns no credit
+# at all and the zeros drag its p90 down; that was accepted at v4.2 and is
+# unchanged here.
+ARCHETYPE_SCALE = {"ball_hawk": 13.4, "coverage": 8.5, "run_support": 14.8}
 
 # How much each job counts toward the overall, by position. A corner is paid to
 # cover and take the ball away; a safety is the last line and plays the run.
@@ -443,7 +731,7 @@ SECONDARY_ARCHETYPE_WEIGHTS = {
 }
 
 
-def _archetype_raws(pg: str, stats: dict, credit: float) -> dict:
+def _archetype_raws(pg: str, stats: dict, credit: float, solo_known: bool = False) -> dict:
     """Per-game archetype contributions for one defensive back."""
     ints   = _coerce_int(stats.get("interceptionsINT")) or _coerce_int(stats.get("defensiveINT"))
     pbu    = _coerce_int(stats.get("defensivePD")) or _coerce_int(stats.get("defensivePBU"))
@@ -451,8 +739,11 @@ def _archetype_raws(pg: str, stats: dict, credit: float) -> dict:
     b = ARCHETYPE_WEIGHTS["ball_hawk"]
     r = ARCHETYPE_WEIGHTS["run_support"]
     return {
-        "ball_hawk":   ints * b["ints"] + pbu * b["pbu"] + def_td * b["def_td"],
-        "run_support": (_coerce_int(stats.get("defensiveTOT")) * r["tot"]
+        "ball_hawk":   (ints * b["ints"] + pbu * b["pbu"] + def_td * b["def_td"]
+                        + _fumble_recoveries(stats) * b["fum_rec"]),
+        # Run support is the only archetype where tackles are production, so it is
+        # the only one the solo/assist split touches.
+        "run_support": (_tackle_credit(stats, r["tot"], solo_known)
                         + _coerce_int(stats.get("defensiveTFL")) * r["tfl"]
                         + _coerce_int(stats.get("defensiveSACKS")) * r["sacks"]
                         + _coerce_int(stats.get("defensiveQB HUR")) * r["hur"]),
@@ -691,7 +982,7 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
 # Defensive EDGE
 # ---------------------------------------------------------------------------
 
-def _def_stat_composite(pg: str, stats: dict) -> tuple[float, float]:
+def _def_stat_composite(pg: str, stats: dict, solo_known: bool = False) -> tuple[float, float]:
     weights = DEF_STAT_WEIGHTS.get(pg)
     if not weights:
         return 0.0, 0.0
@@ -701,9 +992,12 @@ def _def_stat_composite(pg: str, stats: dict) -> tuple[float, float]:
     hur   = _coerce_int(stats.get("defensiveQB HUR")) or _coerce_int(stats.get("defensiveQBH"))
     pbu   = _coerce_int(stats.get("defensivePD")) or _coerce_int(stats.get("defensivePBU"))
     ints  = _coerce_int(stats.get("interceptionsINT")) or _coerce_int(stats.get("defensiveINT"))
-    score = (tot * weights["tot"] + sacks * weights["sacks"] + tfl * weights["tfl"] +
-             hur * weights["hur"] + pbu * weights["pbu"] + ints * weights["ints"])
-    vol = tot + sacks + tfl + hur + pbu + ints
+    frec  = _fumble_recoveries(stats)
+    score = (_tackle_credit(stats, weights["tot"], solo_known)
+             + sacks * weights["sacks"] + tfl * weights["tfl"]
+             + hur * weights["hur"] + pbu * weights["pbu"] + ints * weights["ints"]
+             + frec * weights["fum_rec"])
+    vol = tot + sacks + tfl + hur + pbu + ints + frec
     return score, float(vol)
 
 
@@ -716,6 +1010,12 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
     ctx_means = _compute_season_defensive_means(ctx_map) if ctx_map else {}
     pass_denial   = build_team_pass_denial(season)
     participation = build_coverage_participation(rows)
+    solo_known    = season_records_solo(rows)
+    opportunity   = build_opportunity_index(season)
+    havoc_share   = build_havoc_share(rows, build_team_havoc(season))
+    print(f"    solo split: {'on' if solo_known else 'off (field absent this season)'}"
+          f" | opportunity index: {len(opportunity)} teams"
+          f" | havoc share: {len(havoc_share)} players")
     records = []
 
     for _, r in rows.iterrows():
@@ -725,7 +1025,7 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
         opp_team = r["away_team_id"] if my_team == r["home_team_id"] else r["home_team_id"]
         stats   = r["data"] if isinstance(r["data"], dict) else {}
 
-        raw, vol = _def_stat_composite(pg, stats)
+        raw, vol = _def_stat_composite(pg, stats, solo_known)
 
         # Coverage denial — see COVERAGE_CREDIT. Additive, so it survives the
         # stat suppression that is the whole reason it exists.
@@ -739,16 +1039,37 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
         # position is actually paid to do. Scaling per game is equivalent to
         # scaling the aggregate — the whole chain is linear — so the archetypes
         # a card displays and the number beside them cannot drift apart.
+        # Opportunity: counting stats accrued against fewer plays represent more
+        # per snap. It scales the BOX-SCORE composite only. The coverage credit is
+        # already a denial measure and the havoc bonus is already a share, so
+        # normalising either by plays faced would divide by opportunity twice.
+        opp_index = 1.0
+        if my_team is not None and not pd.isna(my_team):
+            opp_index = opportunity.get(int(my_team), 1.0)
+
         arch = None
         if pg in COVERAGE_POSITIONS:
-            arch = _archetype_raws(pg, stats, credit)
+            arch = _archetype_raws(pg, stats, credit, solo_known)
+            for k in ("ball_hawk", "run_support"):
+                arch[k] *= opp_index
             w = SECONDARY_ARCHETYPE_WEIGHTS[pg]
             raw = sum(w[k] * (arch[k] / ARCHETYPE_SCALE[k] * 10.0) for k in w)
+        else:
+            raw *= opp_index
+
+        # Havoc share — measured and carried for display, worth 0 in the score.
+        # HAVOC_CREDIT is empty; see the note on it for the ablation that emptied
+        # it. The multiplication is left in place so restoring the credit is a
+        # one-line change rather than a re-derivation.
+        hshare = 0.0
+        if my_team is not None and not pd.isna(my_team):
+            hshare = havoc_share.get((int(my_team), int(r["player_id"])), 0.0)
+        havoc_bonus = HAVOC_CREDIT.get(pg, 0.0) * hshare if pg in HAVOC_POSITIONS else 0.0
 
         # A game where nothing was thrown at him is not an absent game. Keep it
         # when coverage credit is owed — dropping it shrinks the sqrt(games)
         # denominator and quietly rewards the suppression instead.
-        if raw <= 0 and credit <= 0:
+        if raw <= 0 and credit <= 0 and havoc_bonus <= 0:
             continue
 
         try:
@@ -767,13 +1088,14 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
 
         # For the secondary the credit is already inside `raw` as the coverage
         # archetype; adding it again would pay for it twice.
-        score = raw if arch is not None else raw + credit
+        score = raw + havoc_bonus if arch is not None else raw + credit + havoc_bonus
         rec = {
             "player_id":      int(r["player_id"]),
             "position_group": pg,
             "adj_score":      score * opp_mult * ctx_mult,
             "opp_mult":       opp_mult,
             "raw_vol":        vol,
+            "havoc_share":    hshare,
             # What the coverage archetype contributes, in the same units as the
             # score, so coverage_share below stays meaningful.
             "cov_credit":     (SECONDARY_ARCHETYPE_WEIGHTS[pg]["coverage"]
@@ -805,6 +1127,9 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
             "stats_measured":  grp["raw_vol"].sum(),
             "opponent_avg_sp": (avg_mult - 1.0) * 60.0,
             "coverage_share":  (credited / total) if total > 0 else 0.0,
+            # Constant across a player's games by construction, so max is just a
+            # cheap way to read it back out of the group.
+            "havoc_share":     float(grp["havoc_share"].max()) if "havoc_share" in grp else 0.0,
             "position_group":  grp["position_group"].iloc[0],
         }
         # Archetypes on a shared 0-10 axis, aggregated the same way the rating is
@@ -847,6 +1172,7 @@ def save_edge(agg: pd.DataFrame, season: int) -> None:
             "games_played":     int(r["games_played"]) if pd.notna(r.get("games_played")) else 0,
             "opponent_avg_sp":  float(r["opponent_avg_sp"]) if pd.notna(r.get("opponent_avg_sp")) else None,
             "coverage_share":   float(r["coverage_share"]) if pd.notna(r.get("coverage_share")) else 0.0,
+            "havoc_share":      float(r["havoc_share"]) if pd.notna(r.get("havoc_share")) else 0.0,
             "model_version":    MODEL_VERSION,
         }
         # Archetype sub-scores, and which job this player actually does. Only

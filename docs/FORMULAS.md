@@ -1,13 +1,25 @@
 # Every rating formula, as it is actually computed
 
-*Written 2026-08-12. Descriptive, not aspirational — where the code does something other than
-what it appears to, this records what it does.*
+*Rating version **v4.3**, 2026-08-12.*
 
-Companion documents: `ALTERNATIVES.md` (what we could do instead),
-`HOW_PROJECTIONS_WORK.md` (the projection engine in plain language),
-`RESEARCH_METHODS.md` (the research findings), `API_INVENTORY.md` (what data exists at all).
+"As actually computed", not as intended — the distinction earns its place here. The offensive
+line rating in the previous version of this document was described correctly and computed
+correctly from inputs that did not exist, and nothing in the code, the tests or the site said
+so for a year.
 
----
+What changed in v4.3, in one place:
+
+| | change |
+|---|---|
+| **OL** | player rating **withdrawn**; a line-**unit** rating replaces it (§2) |
+| **Defence** | solo/assist split, fumble recoveries, an opportunity denominator, small-sample shrinkage (§3) |
+| **Defence** | havoc share built, measured, and **not scored** — it failed its own ablation (§3) |
+| **Secondary** | `ARCHETYPE_SCALE` re-measured: ball hawk 12.9 -> 13.4 |
+| **K/P** | distribution gate re-derived; it had been warning on every run since v4.2 (§5) |
+| **Team** | `avg_top()` returns `None` instead of a fabricated 50, and renormalises (§6) |
+
+Companion documents: `ALTERNATIVES.md` (what we could compute instead, with the test that would
+settle each), `HOW_PROJECTIONS_WORK.md`, `RESEARCH_METHODS.md`, `API_INVENTORY.md` (generated).
 
 ## 0. The shape shared by every position
 
@@ -77,92 +89,206 @@ corner accumulates ~20 — which is why boards show percentile-within-position, 
 
 ---
 
-## 2. Offensive line — read this one carefully
+## 2. Offensive line — the player rating is withdrawn
 
-### What the code says
+**Status: no lineman carries an earned rating from v4.3.** What follows is first the record of
+why, because the failure is instructive, and then what replaced it.
+
+### The rating that was removed
 
 ```text
-composite_OL = 0.30·N(team_rush_ypa)
-             + 0.25·N(team_sack_rate_inv)
-             + 0.30·N(recruit_composite)
-             + 0.10·N(experience)
-             + 0.05·N(award_tier)
-
-N(x) = clip((x − lo) / (hi − lo), 0, 1)
-   team_rush_ypa      (3.0, 6.0)      team_sack_rate_inv (0.5, 0.98)
-   experience         (1.0, 5.0)      award_tier         (0.0, 3.0)
-
-OVR = interp(composite, [(0,30) (0.25,45) (0.325,55) (0.40,65)
-                         (0.50,72) (0.625,80) (0.65,88)])
+composite_OL = 0.30·N(team_rush_ypa)  + 0.25·N(team_sack_rate_inv)
+             + 0.30·N(recruit_composite) + 0.10·N(experience) + 0.05·N(award_tier)
 ```
 
-### What the code does
-
-`team_rush_ypa` and `team_sack_rate` are read with `_stat_float(stats, ...)` from the player's
+`team_rush_ypa` and `team_sack_rate` were read with `_stat_float(stats, ...)` from the player's
 own `season_aggregate` payload. **Those keys are never written there.** Verified: 0 of 280 OL
-payloads in 2025 contain `team_rush_ypa`.
+payloads in 2025 contain `team_rush_ypa`. So:
 
-So `_stat_float` returns `0.0` for both, and:
+- `N(team_rush_ypa)` = `clip((0 − 3)/3)` = **0** — contributed nothing, ever.
+- `team_sack_rate_inv` = `1.0 − min(0.0, 1.0)` = `1.0`, so `N(1.0)` = **1.0** — a flat **0.25 for
+  every lineman in the country**.
 
-- `N(team_rush_ypa)` = `clip((0 − 3)/3)` = **0** — contributes nothing, ever.
-- `team_sack_rate_inv` = `1.0 − min(0.0, 1.0)` = `1.0`, so `N(1.0)` = `clip((1 − 0.5)/0.48)`
-  = **1.0** — contributes a flat **0.25 to every lineman in the country**.
+The live formula was therefore
+`0.25 + 0.30·N(recruiting) + 0.10·N(experience) + 0.05·N(award_tier)`, and:
 
-**The live formula is:**
+- Recruiting was **67% of the only signal that varied** — OL correlated r = **0.877** with the
+  recruiting composite where every other position is under 9%.
+- Maximum attainable composite was `0.65`, which the anchor table mapped to exactly **88**. The
+  documented "88 cap" was not policy. It was arithmetic.
+- **59 of 293** rated linemen in 2025 (20%) landed on exactly **80.0**.
+- Within-position agreement with EA CFB 27 was **−0.274**. Negative.
+- `experience` was 22% of the live signal and came from `player_seasons.year`, which is **not a
+  class year** — constant across a career for 84% of players with three or more seasons. A
+  lineman's experience term did not increase as he aged.
+- Only ~9% of rostered linemen were rated at all (280 of 2,952), because a lineman receives a
+  stats payload only if he happens to record a defensive stat. The rated ones were close to a
+  random sample, not the best ones.
+
+**There is no per-lineman blocking data in the API** — no pancakes, no sacks allowed, no
+pressures allowed. Verified by a full key scan; see `API_INVENTORY.md`.
+
+### What ships instead: the line as a unit
+
+`utils/line_unit.py`, computed in script 10, attached to the team-season.
 
 ```text
-composite_OL = 0.25 + 0.30·N(recruiting) + 0.10·N(experience) + 0.05·N(award_tier)
+composite = 0.30·N(line_yards)              + 0.25·N(sack_rate_allowed, inverted)
+          + 0.20·N(stuff_rate,   inverted)  + 0.15·N(power_success)
+          + 0.10·N(second_level_yards)
+
+rating    = interp(composite, [(0,30) (0.15,42) (0.30,52) (0.45,62)
+                               (0.55,70) (0.70,80) (0.85,89) (1.00,95)])
 ```
 
-Consequences, all measured:
+Sources: the four run metrics from `/stats/season/advanced` (2008–2025, all 2,295 FBS
+team-seasons); sack rate from `/stats/season` `sacksOpponent / (passAttempts + sacksOpponent)`,
+which is dropbacks rather than attempts — a sack is a pass play that ended in a sack, and putting
+it only in the numerator understates the rate for exactly the lines that allow the most.
 
-- Recruiting is **67% of the only signal that varies**, which is why OL correlates r = 0.877
-  with recruiting composite where every other position is under 9%.
-- Maximum attainable composite is `0.25 + 0.30 + 0.10 + 0.05` = **0.65**, which the anchor table
-  maps to exactly **88**. The documented "88 cap" is not a policy — it is arithmetic.
-- **59 of 293** rated linemen in 2025 (20%) land on exactly **80.0**, the value at composite
-  0.625, reached by any 4th-year lineman whose recruiting normalises to the top of its range.
-- Within-position agreement with EA CFB 27 is **−0.274**. Negative.
+**Missing inputs renormalise the remaining weights. They never contribute a zero.** That is the
+specific failure that killed the old rating, and `tests/test_line_unit.py` asserts it.
 
-### How class age contributes
+**Bounds are per era**, and that is a fix rather than a flourish:
 
-Through `experience`, at weight **0.10** — 22% of the live signal. `experience` is
-`player_seasons.year` normalised on `(1, 5)`. That field is documented elsewhere in this repo
-as **not a class year**: constant across a career for 84% of players with three or more
-seasons, and an outright calendar year for 114,612 of 269,552 rows. **A lineman's experience
-term does not increase as he ages.** It is a fixed per-player constant.
+| bucket | seasons | why |
+|---|---|---|
+| classic | 2008–2013 | |
+| transition | 2014–2020 | `power_success` steps 0.664 → 0.717 and `second_level_yards` 1.038 → 1.112 at 2014 |
+| modern | 2021–  | `line_yards` steps 2.885 → 3.095 and `stuff_rate` 0.199 → 0.165 at 2021 |
 
-### Coverage
+Pooled bounds produced a median line rating of 52 in 2008 rising to 77 in 2023. A 7% jump in
+line yards and a 17% drop in stuff rate between two consecutive seasons is the provider changing
+a definition, not 130 teams simultaneously learning to block. Within an era the bounds are still
+fixed absolute constants, so the `AUDIT_FINDINGS.md` §9 guarantee holds. After bucketing, season
+medians run 61–73 with no trend.
 
-Only ~9% of rostered linemen are rated at all (280 of 2,952 in 2025), because a lineman only
-receives a stats payload if he happens to record a defensive stat — a tackle after an
-interception, say. The rated linemen are close to a random sample, not the best ones.
+Note these era breaks are **not** script 07's `ERA_ANCHORS` (2013, 2018). Different phenomena:
+those track when defensive stats became available, these track a change in how the
+advanced-stats endpoint computes line play.
 
-**There is no per-lineman blocking data in the API.** See `API_INVENTORY.md`. The disposition
-of this rating is in `ALTERNATIVES.md` §A.
+### What it is validated against
+
+The only external check possible: `scripts/validate_vs_draft.py`.
+
+- Spearman(line rating, linemen drafted off that season) = **+0.179**
+- Mean line rating by picks: **65.2** with none, **70.8** with one, **77.1** with two
+
+Weak, and real, and pointing the right way — against a withdrawn rating that scored −0.274.
+
+### Consequences elsewhere
+
+- `avg_top()` in script 10 returned a hard-coded **50.0** for a position with nobody rated. OL is
+  40% of run offence, so withdrawing the ratings without changing this would have made 40% of
+  every team's run offence a constant. It now returns `None` and the weights renormalise —
+  universally, so a team with no rated kicker no longer gets a fabricated 50 either.
+- Script 07 emits OL rows with `overall_rating = None`, `rating_status = "not_rated"` and a
+  reason. A missing row would make a lineman vanish from his own roster; a withheld one keeps him
+  there and says why.
+- Script 15 never trained on or predicted OL, and still does not.
+- An unplayed season gets **no** line rating. These are measurements of games that have not
+  happened.
 
 ---
 
 ## 3. Defense: EDGE, DL, LB, CB, S, DB
 
-### The six inputs
+### The inputs
 
-Everything is built from `defensiveTOT`, `defensiveSACKS`, `defensiveTFL`, `defensiveQB HUR`,
-`defensivePD`, `interceptionsINT`. Three more sit in the payload **unused**:
-`defensiveSOLO` (all 402,156 rows), `fumblesFUM` and `fumblesREC` (42,328 rows).
+`defensiveTOT`, `defensiveSOLO`, `defensiveSACKS`, `defensiveTFL`, `defensiveQB HUR`,
+`defensivePD`, `interceptionsINT`, `fumblesREC`. Plus two team-level signals from
+`/stats/season/advanced`: defensive plays faced, and unit havoc.
+
+`defensiveSOLO` and `fumblesREC` were unused until v4.3. One key remains deliberately unused:
+**`fumblesFUM` is not a forced fumble.** On a defensive row it is a fumble the player COMMITTED
+— 974 rows carry one, 84% of them in a game where he also had a return, an interception or a
+recovery, and 455 also carry `fumblesLOST`. Crediting it would pay a corner for coughing up an
+interception return. Forced fumbles are not published per player anywhere in the API.
+
+### The tackle credit (v4.3)
+
+```text
+2013+   :  SOLO x 1.25 + (TOT - SOLO) x 0.65   x position_weight
+pre-2013:  TOT                                 x position_weight
+```
+
+A solo tackle is a play the defender made; an assist is a play he was near. Calibrated to be
+aggregate-neutral — solo tackles are 56.4% of all recorded tackles, so
+`0.564 x 1.25 + 0.436 x 0.65 = 0.988` and the average defender's credit does not move, only the
+mix. `defensiveSOLO` does not exist before 2013 (zero rows), so the split degrades to plain
+totals there; the code asks the data rather than hardcoding a year, so a season that stops
+publishing the field cannot silently be read as all-assists.
+
+Within 2013+ a zero **is** meaningful: 8,359 of 8,590 games have some players with solos and
+some without, and the SOLO=0 rows average 1.65 tackles against 3.88 for the rest.
+
+### The opportunity index (v4.3)
+
+```text
+index = clip(median_defensive_plays_per_game / this_defence_plays_per_game, 0.85, 1.20)
+composite x index
+```
+
+The direct answer to "a tackle count is mostly opportunity". Above 1.0 means the unit faced
+fewer plays than typical, so each counting stat represents more per snap. Deliberately gentle
+and clipped: dividing outright would make snaps-faced the dominant term, and plays faced is not
+purely a defensive virtue — a fast-tempo offence puts its own defence back on the field. Source
+is `/stats/season/advanced` `defense.plays`, confirmed 2008+.
+
+It earns its place on the placebo test: **+0.0085** mean within-position Spearman against EA
+across the six defensive groups, while the same values **shuffled across teams score -0.0025**,
+below doing nothing at all.
+
+### Havoc share — computed, published, and NOT scored
+
+`HAVOC_CREDIT = {}`. The player's havoc events (TFL + PBU + fumble recoveries; sacks are a
+subset of TFL and are not added twice) over his unit's season havoc, from
+`defense.havoc.frontSeven` / `.db`.
+
+It failed its own ablation. Replacing every unit's havoc with **one shared constant** scored
++0.0019 against the real denominator's +0.0011 — a denominator that performs worse than a
+constant is not a denominator. The credit was re-weighting tackles for loss and passes defensed,
+which the composite already counts. The share is stored on `player_edge` and exported for
+display, because "this player accounted for 18% of his unit's disruption" is a real fact about
+him; it is simply not part of his number.
 
 ### Front seven
 
 ```text
 EDGE  pass_rush  = sacks×5.0 + hurries×1.5 + TFL×2.0
-      disruption = (sacks + TFL) / max(TOT, 1)
+      disruption = shrunk_rate(sacks + TFL, TOT, prior 0.288)
       run_stop   = TFL×2.5 + (TOT − sacks)×0.3
 DL    pass_rush  = sacks×5.0 + hurries×1.5 + TFL×1.0
       run_stop   = TFL×2.5 + (TOT − sacks)×0.4
+      disruption = shrunk_rate(sacks + TFL, TOT, prior 0.228)
 LB    tackling   = TOT×0.5 + TFL×2.0
       coverage   = INT×3.0 + PBU×1.5
-      instinct   = (INT + PBU + TFL) / max(TOT, 1)
+      instinct   = shrunk_rate(INT + PBU + TFL, TOT, prior 0.122)
+
+shrunk_rate(events, tackles, prior) = (events + 12 × prior) / (tackles + 12)
 ```
+
+### Small-sample shrinkage (v4.3)
+
+Every defensive "rate" divides an event count by tackles, and a rate over one tackle is not a
+rate. `instinct = (INT + PBU) / max(TOT, 1)` gave a player with one tackle and one breakup a
+perfect **1.0**, and 30% of rated defenders have five or fewer tackles — so this was not an edge
+case. **5,848 player-seasons posted a ratio of 1.0 or better against a normalisation ceiling of
+0.3**, meaning nine corners in ten clipped to maximum and the feature was a constant rather than
+a measurement.
+
+Mixing in a prior worth 12 tackles at the position's pooled rate fixes it. Before to after:
+
+| feature | p90 | p99 | max |
+|---|---|---|---|
+| CB instinct | 2.000 -> 0.315 | 5.000 -> 0.546 | 11.0 -> 1.01 |
+| S instinct | 1.000 -> 0.220 | 4.000 -> 0.398 | |
+| LB instinct | 1.000 -> 0.192 | 2.000 -> 0.343 | |
+| EDGE disruption | 0.500 -> 0.402 | 1.000 -> 0.569 | |
+| DL disruption | 0.444 -> 0.330 | 1.000 -> 0.491 | |
+
+`FEATURE_BOUNDS` were re-derived to match: `disruption_rate` (0.10, 0.55),
+`instinct_score` (0.04, 0.45). Leaving the old ones would have kept the feature saturated.
 
 Blend: EDGE `0.50 edge + 0.25 pass_rush + 0.12 disruption + 0.08 run_stop + 0.05 recruiting`;
 DL `0.40 / 0.25 / 0.10 / 0.18 / 0.07`; LB `0.40 edge + 0.25 tackling + 0.15 coverage +
@@ -174,12 +300,12 @@ Since v4.2 a defensive back's score is not a stat composite but three sub-scores
 axis, weighted by position:
 
 ```text
-ball_hawk   = INT×12.0 + PBU×3.5 + defTD×8.0
-run_support = TOT×0.6 + TFL×4.0 + sacks×6.0 + hurries×1.5
+ball_hawk   = INT×12.0 + PBU×3.5 + defTD×8.0 + fumble_recoveries×6.0
+run_support = tackle_credit(0.6) + TFL×4.0 + sacks×6.0 + hurries×1.5
 coverage    = playing-time share × team pass-denial credit    (no box-score input at all)
 
 scaled_k = clip(Σ(per-game k) / √games / ARCHETYPE_SCALE[k] × 10, 0, 20)
-ARCHETYPE_SCALE = {ball_hawk: 12.9, coverage: 8.5, run_support: 14.8}
+ARCHETYPE_SCALE = {ball_hawk: 13.4, coverage: 8.5, run_support: 14.8}
 
 score = Σ weight[pos][k] × scaled_k
         CB 0.40 coverage / 0.40 ball_hawk / 0.20 run_support
@@ -188,7 +314,13 @@ score = Σ weight[pos][k] × scaled_k
 
 `ARCHETYPE_SCALE` values are each archetype's 90th percentile, frozen like the anchors. They
 **must be re-measured whenever an input changes** — stale constants once left coverage topping
-out at 7.1 while run support reached 20. Last checked after v4.2: p90s of 9.9 / 8.4 / 10.0.
+out at 7.1 while run support reached 20.
+
+Re-measured for v4.3 after fumble recoveries entered ball hawk and the tackle changes entered
+run support, over 2,026 rated defensive backs in 2025: **ball hawk 12.9 -> 13.4**, coverage 8.5
+unchanged, **run support 14.8 unchanged** — which is independent confirmation that the tackle
+changes really were aggregate-neutral. Coverage sits below the other two by construction: a
+defensive back on a porous pass defence earns no credit at all and the zeros drag its p90 down.
 
 ### Coverage denial (CB/S/DB only)
 
@@ -207,11 +339,29 @@ coverage. Credit only, never penalty.
 
 ### What the defensive rating therefore measures
 
-Tackles correlate **0.70–0.82** with the final OVR at every position, and at safety they are
-the strongest single input. A tackle count is mostly snaps played × how often the opponent runs
-at you × how long your defence is on the field — so a defence that gets off the field denies
-its own players the statistic we reward them for. This is the central known weakness; options
-are in `ALTERNATIVES.md` §B.
+Tackles correlated **0.70–0.82** with the final OVR at every position before v4.3, and at safety
+they were the strongest single input. A tackle count is mostly snaps played × how often the
+opponent runs at you × how long your defence is on the field — so a defence that gets off the
+field denies its own players the statistic we reward them for.
+
+v4.3 attacks that from three directions (the solo split, the opportunity index, shrinkage). The
+effect on within-position agreement with EA CFB 27 in 2025:
+
+| position | v4.2 | v4.3 |
+|---|---|---|
+| EDGE | 0.5699 | **0.5822** |
+| DL | 0.4766 | **0.4849** |
+| LB | 0.6380 | **0.6400** |
+| CB | 0.5654 | **0.5711** |
+| S | 0.7219 | 0.7202 |
+| DB | 0.5901 | **0.6132** |
+
+Real, small, and in the same direction at five of six positions. It does not make the central
+weakness go away: a tackle is still mostly opportunity, and the things that would settle it —
+missed tackles, per-play tackle attribution, coverage snaps, targets allowed — do not exist in
+any source. Independent confirmation of the remaining gap: our defensive ratings order NFL draft
+picks at Spearman 0.13–0.25, against 0.42–0.49 for offence. Options are in `ALTERNATIVES.md`
+§B; per-snap rates are the next phase.
 
 ### Era
 
@@ -234,14 +384,36 @@ recruiting only). Thresholds are per position, e.g. LB starter ≥ 20 tackles, C
 ```text
 K   0.50 fg_pct + 0.25 fg_long + 0.15 xp_pct + 0.10 volume
 P   0.55 avg_yards + 0.30 inside_20_pct + 0.15 volume
-→ COMPOSITE_OVR_ANCHORS, ceiling 90
+both -> COMPOSITE_OVR_ANCHORS, ceiling 90
 ```
 
-v4.2 pulled specialists down deliberately: EA rates 5 kickers at 85+ and exactly 1 punter,
-against our pre-v4.2 17 and 38. The tell was a punter outranking the receivers on his own team
-page. **Note:** script 07's distribution validator still expects K/P `mean 55–70` and the
-shipped distribution means ~50, so specialists warn on every run — the bounds are stale, not
-the ratings. Logged in `ROADMAP.md`.
+Specialists occupy a narrow band by design: their impact range is genuinely smaller than a skill
+player's, and the tell that the old calibration was wrong was a punter outranking the receivers
+on his own team page. v4.2 pulled them down — 17 kickers and 38 punters at 85+ became 4 and 2,
+against EA CFB 27's 5 and 1.
+
+### The gate, re-derived in v4.3
+
+The distribution gate for K and P was inherited from the distribution it was supposed to judge:
+mean 55-70, p90 65-79, p99 70-79. After v4.2 deliberately lowered specialists, the gate warned
+on **every single run**, which is the same as not having a gate.
+
+It was deliberately not fixed in the same change that shipped the ratings it judges — that is
+how goalposts move. v4.3 is that separate change:
+
+| | old | new | 2025 K | 2025 P |
+|---|---|---|---|---|
+| mean | 55-70 | **46-64** | 51.1 | 59.5 |
+| p90 | 65-79 | **70-82** | 74.6 | 78.3 |
+| p99 | 70-79 | **78-90** | 85.2 | 85.3 |
+
+Derived from the stated design — a specialist's band is narrower than a skill player's and the
+ceiling is ~88-90 — rather than from the shipped output. The old failure still fails: 24% of
+punters at 85+ puts p90 near 88, outside the new ceiling of 82.
+
+**Known limitation:** field goal percentage is heavily confounded by attempt distance and by
+which kicks a coach chooses to attempt, and we have neither. A kicker on a bad team attempts
+longer field goals and rates worse for it.
 
 ---
 
@@ -249,17 +421,31 @@ the ratings. Logged in `ROADMAP.md`.
 
 ```text
 team_rating = 0.50 SP+ + 0.30 our player ratings + 0.20 team stats
-              (renormalised when a signal is absent — which is how 2026 works
-               with neither SP+ nor stats)
+              (renormalised across whichever signals exist)
 
-pass_off = 0.45 avg_top(QB,2) + 0.35 avg_top(WR+TE,5) + 0.20 avg_top(OL,5)
-run_off  = 0.40 avg_top(RB,3) + 0.40 avg_top(OL,5) + 0.10 avg_top(QB,2)
-                                                    + 0.10 avg_top(WR+TE,5)
+pass_off = 0.45 avg_top(QB,2) + 0.35 avg_top(WR+TE,5) + 0.20 line_unit
+run_off  = 0.40 avg_top(RB,3) + 0.40 line_unit + 0.10 QB + 0.10 WR/TE
+pass_def = 0.45 avg_top(DB,5) + 0.30 avg_top(LB,4) + 0.25 avg_top(DL+EDGE,4)
+run_def  = 0.40 avg_top(DL+EDGE,4) + 0.35 avg_top(LB,4) + 0.25 avg_top(DB,5)
+special  = avg_top(K+P, 2)
 ```
 
-**`avg_top()` returns a hard-coded 50.0 when a position has no rated players.** That matters
-for any change that removes a position group: OL is 40% of run offence, so withdrawing OL
-ratings without renormalising would make 40% of every team's run offence an identical constant.
+### The trap that v4.3 removed
+
+`avg_top()` returned a hard-coded **50.0** for a position with nobody rated. That is not a
+default, it is a trap: an empty position silently became an average one. With the OL player
+rating withdrawn it would have made 40% of every team's run offence an identical constant — the
+rating would have stopped varying with the thing it claimed to measure, and nothing would have
+errored.
+
+`avg_top()` now returns `None` and `blend()` renormalises across whatever is present. The rule is
+universal rather than an OL special case: a team with no rated kicker no longer gets a fabricated
+50 for special teams either. It is the same rule the headline blend already applied when a whole
+signal was missing, finally applied one level down.
+
+The OL term is **not** simply deleted. It is the line-unit rating from §2, which is a more
+honest input than the average of five recruiting ranks ever was. An unplayed season has no line
+rating, so for 2026 the term renormalises out.
 
 ---
 

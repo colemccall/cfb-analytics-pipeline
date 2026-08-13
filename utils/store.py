@@ -72,6 +72,33 @@ def read_ratings(engine: str = "edge") -> pd.DataFrame:
     return df[df["engine"] == engine].copy()
 
 
+def write_raw(table: str, rows: list[dict], *, season_key: str | None = None,
+              seasons: list[int] | None = None) -> int:
+    """Write data/raw/{table}.json from a list of dicts, scrubbing NaN.
+
+    When `season_key` and `seasons` are given the write is a per-season REPLACE:
+    rows for those seasons are swapped out and every other season on disk is kept.
+    That is the same rule script 06 uses for player_edge, and it is what makes a
+    single-season re-harvest safe.
+
+    Never append blindly. `player_seasons` was appended to for two years and
+    accumulated 7,206 (player, season) pairs sitting on two teams at once,
+    because a pure append cannot express "the API corrected this".
+    """
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    path = RAW_DIR / f"{table}.json"
+
+    if season_key and seasons:
+        kept = [r for r in _load_json(path) if r.get(season_key) not in set(seasons)]
+        rows = kept + list(rows)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(clean_nan(rows), f, separators=(",", ":"), cls=_Encoder, allow_nan=False)
+    size_kb = path.stat().st_size / 1024
+    print(f"  Wrote data/raw/{table}.json ({len(rows)} rows, {size_kb:.1f} KB)")
+    return len(rows)
+
+
 def write_computed(table: str, df: pd.DataFrame) -> None:
     """Write DataFrame → data/computed/{table}.json.
 

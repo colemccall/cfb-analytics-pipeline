@@ -61,6 +61,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.store import read_raw, read_ratings
+from utils.draft import apply_departure_rate, departure_rates, drafted_by_player
 from utils.json_utils import write_json
 from utils.stat_agg import aggregate_game_stats
 
@@ -162,6 +163,11 @@ FEATURE_COLS = [
     "pct_sd", "pct_accel", "n_seasons", "games_last", "games_mean",
     "opp_sp_last", "opp_sp_trend", "class_year", "stars", "composite_score",
     "cohort_delta", "cohort_next", "pos_enc",
+    # How many players at this exact stage leave for the NFL instead of coming
+    # back. The cohort curves are built only from players who returned, so this
+    # is the model's only way to see how selected that surviving sample is —
+    # §4d survivorship, previously disclosed and now measured (utils/draft.py).
+    "cohort_departure_rate",
     # Availability, and the same career shape measured over healthy seasons
     # only. Both readings are supplied rather than the healthy one replacing
     # the raw one: the gap between them is itself the signal that a season was
@@ -200,6 +206,7 @@ DRIVER_LABELS = {
     "composite_score": "recruiting grade",
     "cohort_delta":    "typical development at this stage",
     "cohort_next":     "cohort baseline",
+    "cohort_departure_rate": "how often players at this stage leave for the NFL",
     "pos_enc":         "position",
     "last_interrupted":  "last season cut short",
     "n_interrupted":     "seasons lost to injury",
@@ -903,6 +910,32 @@ def main() -> None:
         "coarse": [{"position_group": k[0], "class_year": k[1],
                     "delta": round(v[0], 3), "n": v[1]} for k, v in lookup["coarse"].items()],
     })
+
+    # How selected is the population that came back?
+    #
+    # Every cohort delta above is an average over players who had a next season,
+    # which means players who did not leave for the NFL. That is survivorship, it
+    # bites hardest at the top of the distribution where the leavers are, and it
+    # has been a disclosed limitation with no measurement behind it. /draft/picks
+    # supplies the measurement. Feeding the rate as a feature lets the model
+    # learn how much to discount a cohort curve built from the players who stayed.
+    print("Measuring NFL departure by cohort...")
+    drafted = drafted_by_player()
+    # Season window only — NOT train_mask. train_mask requires a next season, and
+    # a player who left for the NFL has none, so using it here measures departure
+    # among the players who did not depart and returns a flat zero.
+    dep_lookup, dep_global = departure_rates(
+        C, drafted, _between(C["season"], TRAIN_SEASONS))
+    C["cohort_departure_rate"] = apply_departure_rate(C, dep_lookup, dep_global)
+    if drafted:
+        top = C[C["pct_bucket"] >= 9]["cohort_departure_rate"].mean()
+        bot = C[C["pct_bucket"] <= 5]["cohort_departure_rate"].mean()
+        print(f"  {len(drafted)} drafted players matched; departure rate "
+              f"{dep_global*100:.1f}% overall, {top*100:.1f}% in the top production "
+              f"decile against {bot*100:.1f}% in the bottom half")
+    else:
+        print("  no draft data on file — run scripts/09_harvest_supplemental.py "
+              "--dataset draft_picks. Feature falls back to a constant 0.")
 
     C["pos_enc"] = C["position_group"].astype("category").cat.codes.astype(float)
 

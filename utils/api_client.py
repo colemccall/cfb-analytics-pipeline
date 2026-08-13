@@ -287,6 +287,163 @@ def fetch_sp_ratings_all(api_key: str, year: int) -> dict:
     return result
 
 
+# ── SUPPLEMENTAL ENDPOINTS ──────────────────────────────────────────────────
+#
+# Everything below was surveyed by scripts/explore_api.py and recorded in
+# docs/API_INVENTORY.md before being wired up here. The survey found 74 endpoints
+# answering and 13 in use; these close most of that gap. Each one notes the
+# season where its history actually begins, because "the endpoint exists" and
+# "the endpoint has 2009 data" are different claims and we have been burned by
+# conflating them twice (usage starts 2013, hurries start 2015).
+#
+# All of them are season-sliced and go through the same cache as everything else,
+# so a re-harvest costs zero requests.
+
+
+def fetch_coaches(api_key: str, year: int) -> list:
+    """Coaches with full tenure: per-season W/L, SRS, and SP+ overall/off/def.
+
+    Confirmed 2010–2024 (123 rows in 2010, 152 in 2024), schools matching ours at
+    100%. This is what unblocks the coaching-change event study — the local
+    coaching table was 22 hand-seeded rows.
+    """
+    return _get_list(api_key, "/coaches", {"year": year})
+
+
+def fetch_draft_picks(api_key: str, year: int) -> list:
+    """NFL draft picks with `collegeAthleteId`, round, overall, and preDraftGrade.
+
+    Confirmed 2010–2024 at ~255/yr, joining to our player ids at 94.5%. The only
+    independent, historical, backtestable check on our ratings that exists.
+    """
+    return _get_list(api_key, "/draft/picks", {"year": year})
+
+
+def fetch_advanced_season_stats(api_key: str, year: int) -> list:
+    """Season advanced team stats — offense AND defense.
+
+    Carries the line metrics (`lineYards`, `stuffRate`, `powerSuccess`,
+    `secondLevelYards`, `openFieldYards`), `havoc.frontSeven` / `havoc.db`,
+    success rate, explosiveness, PPA, and standard/passing-down splits.
+    Confirmed back to 2010 (120 teams). Source for the OL line-unit rating and
+    for the defensive opportunity denominator.
+    """
+    return _get_list(api_key, "/stats/season/advanced", {"year": year})
+
+
+def fetch_advanced_game_stats(api_key: str, year: int) -> list:
+    """The same advanced splits, per game. Confirmed 2010+."""
+    return _get_list(api_key, "/stats/game/advanced", {"year": year})
+
+
+def fetch_game_havoc(api_key: str, year: int) -> list:
+    """Per-game havoc rates, offense and defense, split front-seven vs DB.
+
+    Thin before 2016 (2 rows in 2010) — the season endpoint is the reliable one
+    for the whole archive.
+    """
+    return _get_list(api_key, "/stats/game/havoc", {"year": year})
+
+
+def fetch_returning_production(api_key: str, year: int) -> list:
+    """Returning PPA and usage share per team-season. Confirmed 2016+, zero in 2010."""
+    return _get_list(api_key, "/player/returning", {"year": year})
+
+
+def fetch_ratings_core(api_key: str, year: int) -> list:
+    """Model-versioned team ratings with offense/defense splits. 2016+."""
+    return _get_list(api_key, "/ratings/core", {"year": year})
+
+
+def fetch_ratings_elo(api_key: str, year: int) -> list:
+    """Elo team ratings. Confirmed 2010+."""
+    return _get_list(api_key, "/ratings/elo", {"year": year})
+
+
+def fetch_ratings_fpi(api_key: str, year: int) -> list:
+    """ESPN FPI with resume ranks and efficiency splits. Confirmed 2010+."""
+    return _get_list(api_key, "/ratings/fpi", {"year": year})
+
+
+def fetch_ratings_srs(api_key: str, year: int) -> list:
+    """Expanded SRS — includes non-FBS, so it is filtered on classification."""
+    return _get_list(api_key, "/ratings/srs/expanded", {"year": year})
+
+
+def fetch_lines(api_key: str, year: int) -> list:
+    """Betting lines with final scores — the market baseline any predictive model must beat."""
+    return _get_list(api_key, "/lines", {"year": year})
+
+
+def fetch_pregame_wp(api_key: str, year: int) -> list:
+    """Pregame win probability and spread per game. 2016+."""
+    return _get_list(api_key, "/metrics/wp/pregame", {"year": year})
+
+
+def fetch_cfp_participants(api_key: str, year: int) -> list:
+    """Playoff field with seed, committee rank, bid type and outcome.
+
+    Structured ground truth for a playoff backtest. Twelve-team era only —
+    earlier years return nothing rather than the four-team field.
+    """
+    return _get_list(api_key, "/playoffs/cfp/participants", {"year": year})
+
+
+def fetch_player_success_rates(api_key: str, year: int) -> list:
+    """Per-player play counts and success rates. OFFENCE ONLY. 2016+.
+
+    The play counts are the honest denominator for RB/WR/QB rate stats. There is
+    no defensive equivalent — see the verified-absent list in API_INVENTORY.md.
+    """
+    return _get_list(api_key, "/stats/player/success", {"year": year})
+
+
+def fetch_player_wepa(api_key: str, year: int, kind: str) -> list:
+    """Opponent-adjusted EPA per player. kind ∈ {passing, rushing, kicking}.
+
+    Sparse by design (≈2 qualifying rushers per team), and offence only, so this
+    is a benchmark to check our ordering against — never a rating input.
+    """
+    return _get_list(api_key, f"/wepa/players/{kind}", {"year": year})
+
+
+def fetch_game_weather(api_key: str, year: int) -> list:
+    """Per-game weather, including a dome/indoors flag."""
+    return _get_list(api_key, "/games/weather", {"year": year})
+
+
+def fetch_venues(api_key: str) -> list:
+    """Every venue: capacity, dome, elevation, lat/long. Season-agnostic."""
+    return _get_list(api_key, "/venues", None)
+
+
+def fetch_team_records(api_key: str, year: int) -> list:
+    """Team records split home/away/neutral/conference/postseason."""
+    return _get_list(api_key, "/records", {"year": year})
+
+
+def fetch_team_ats(api_key: str, year: int) -> list:
+    """Against-the-spread records and average cover margin."""
+    return _get_list(api_key, "/teams/ats", {"year": year})
+
+
+def fetch_play_stats(api_key: str, year: int, team: str | None = None,
+                     week: int | None = None) -> list:
+    """Per-play, per-athlete stat events with full situational context.
+
+    **Capped at 2,000 records per response**, which a bare year request hits
+    immediately — so this must be sliced. Pass `team` (≈2,450 calls for the full
+    archive) or `week`. A caller that ignores the cap gets a silently truncated
+    season, which is worse than getting nothing.
+    """
+    params: dict = {"year": year}
+    if team:
+        params["team"] = team
+    if week:
+        params["week"] = week
+    return _get_list(api_key, "/plays/stats", params)
+
+
 def fetch_sp_ratings_breakdown(api_key: str, year: int) -> dict:
     """Return {team_lower: {overall, offense, defense}} SP+ ratings for a year.
 

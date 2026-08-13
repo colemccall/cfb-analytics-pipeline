@@ -18,6 +18,35 @@ and `ALTERNATIVES.md`, which turns each into an option with a test attached.
 
 ---
 
+## Shipped since this was written: rating v4.3 (2026-08-12)
+
+Everything the API survey unblocked has now been built, and the two "blocked" items above are
+closed. What landed:
+
+- **17 supplemental datasets harvested** (`scripts/09_harvest_supplemental.py`) — 210,287 rows
+  across coaches, draft picks, advanced season and game stats, havoc, returning production,
+  betting lines, pregame win probability, CFP participants, per-player play counts, opponent-
+  adjusted EPA, talent, records, ATS, weather and venues. Held whether or not anything consumes
+  them yet, so the next question does not start with a week of "can we even get that".
+- **The OL player rating is withdrawn** and replaced by a line-unit rating validated against
+  draft outcomes (+0.179, against the withdrawn rating's -0.274 vs EA).
+- **Defence**: solo/assist split, fumble recoveries, an opportunity denominator that passes its
+  placebo test, and small-sample shrinkage. Five of six positions improved against EA.
+- **Havoc share was built and rejected on its own evidence.** Published, scored at zero.
+- **The coaching event study exists.** Coach carry-over r = +0.343 across 101 coaches.
+- **Recruiting ROI is residualized** — its correlation with class recruiting strength falls from
+  +0.254 to -0.028, so it finally measures development rather than restating the star ratings.
+- **Every ranked finding carries shrinkage and an interval** (`utils/shrinkage.py`).
+- **NFL departure is measured**: 22.1% of top-decile players leave against 0.7% in the bottom
+  half. §4d survivorship is no longer a disclosure without a number.
+- **Draft validation** is the first backtestable external check these ratings have ever had.
+
+What did NOT change, and is still the headline: **usage, then the defensive rating.** The v4.3
+defensive work is a floor, not a fix. The clearest evidence is external — our defensive ratings
+order NFL draft picks at Spearman 0.13-0.25 against 0.42-0.49 for offence.
+
+---
+
 ## The one rule that orders everything below
 
 **A model that cannot show its backtest does not ship.**
@@ -89,11 +118,11 @@ of a defensive rating that has not been fixed.
 
 ### 3. Then, in the model doc's order
 
-- **EA blocking grades as the OL input** (§6 Option 1). OL is the only position with no
-  individual measurement anywhere — the current number is 77% recruiting, capped at 88
-  because the composite saturates. Defensible without a backtest, because the claim is not
-  "EA predicts better" but "we have nothing individual at all". Ship it labelled, keep the
-  old value beside it for a season, compare when 2026 is played.
+- **EA blocking grades as the OL input** (§6 Option 1). Partly overtaken: the OL player rating
+  is now withdrawn entirely and the line is rated as a unit, so there is no "old value" to sit
+  beside. EA's OL overall still ships as a labelled cross-check column for 2026. Whether to
+  build an EA-derived per-player blocking number for 2026 alone remains open, and remains
+  un-backtestable by construction.
 - **A talent prior for the production-blind majority** (Option 2). Two thirds of a roster
   has no production to measure; for them a scouting opinion beats a stale recruiting grade.
   Run it as an experiment under `projection_source`, never as the default, and let 2026 be
@@ -101,9 +130,11 @@ of a defensive rating that has not been fixed.
 - **Production and Talent as two published numbers** (Option 3). The category error at the
   root: a backup would read `Production 41 · Talent 78` instead of a misleading single 54.
   Only worth the UI cost if 1 and 2 show the two signals really are distinct.
-- **Top-end survivorship** (Option 5). Cohort curves condition on "stayed in college", so
-  the players who leave for the NFL are missing from exactly the top of the distribution.
-  Needs draft/departure data we do not have.
+- ~~**Top-end survivorship** (Option 5)~~ — **done in v4.3.** `/draft/picks` supplied the
+  departure data. Measured: 22.1% of top-production-decile players leave against 0.7% in the
+  bottom half. Fed to the model as `cohort_departure_rate`. It does not improve MAE (8.19 ->
+  8.22 offence) and was shipped anyway, because a disclosed limitation with a number beside it
+  is a different thing from one without.
 
 ---
 
@@ -155,7 +186,8 @@ changes too thin to use (22 seed rows), preseason projections inherently noisy.
   ratings for 2008–2015 are recruiting-caliber estimates rather than production ratings,
   and classic-era thresholds sit at 75% of modern to compensate. A Sports Reference scraper
   would fix it.
-- **Draft and departure data.** Needed for survivorship (above).
+- ~~**Draft and departure data**~~ — harvested. 4,858 picks 2008-2026, 83.7% joining to our
+  players.
 - **Headshots.**
 
 ---
@@ -176,6 +208,11 @@ Small, real, and each one has bitten at least once.
   change, with the reasoning written down.
 - **`research_cache` is empty**, so `data/research/index.json` exports `[]` and the site's
   Published Findings section shows its empty state permanently.
+- **`team_advanced_games.json` is 107 MB.** Harvested for completeness and currently unread; the
+  season-level file is what the ratings use. Slim it or drop it if it never finds a consumer.
+- **Coordinator changes are gone.** `/coaches` is head coaches only, and the retired seed CSV had
+  OC/DC rows. Script 10's coaching-change flag is now HC-only, which is a narrower signal than
+  before even though it covers 2,584 coach-seasons instead of 20.
 - **`player_seasons.year` is not a class year** and never was — it is constant across a
   career for 84% of players with three or more seasons, and holds an outright calendar year
   for 114,612 of 269,552 rows. Script 15 derives a real one; script 12 still exports the raw
@@ -192,3 +229,6 @@ Small, real, and each one has bitten at least once.
 - Script 07 re-read all of `data/raw` — 255 MB of stats alone — once per position per
   season, which is 228 full parses on a `--all-seasons` run. Tables are now read once per
   process and the stats index built once.
+- Script 07's K/P distribution bounds were stale and warned on every run. Re-derived in v4.3 as
+  its own change, separately from the ratings they judge.
+- `player_seasons.year` is still not a class year and script 12 still exports the raw value.
