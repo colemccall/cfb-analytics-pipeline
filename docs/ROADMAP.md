@@ -47,6 +47,31 @@ order NFL draft picks at Spearman 0.13-0.25 against 0.42-0.49 for offence.
 
 ---
 
+## Superseded 2026-08-13 — read this before the sections below
+
+The order that follows was written before anyone had measured **how much of a rating is
+signal**. That measurement now exists (`scripts/validate_reliability.py`), and it moves three
+things:
+
+| what this file says | what was measured |
+|---|---|
+| Usage is the headline, and "matters most for defense" | `snap_pct` reaches **15 rated defenders out of 43,008 since 2016**. It is offence-only. Coverage among *rated* offensive skill players is 88–99%, not the 29.8% recorded below — that figure counts every stat row, most belonging to players nobody rates. |
+| Fix the defensive rating next | DB/CB already extract **83–88%** of the year-over-year signal their measurement allows; QB extracts **63%**. Defence is close to its ceiling and offence has the headroom. |
+| Defensive ratings order draft picks at 0.13–0.25 | True for rank agreement *among drafted players*. On separating drafted from undrafted the same ratings score **AUC 0.83**, and a fitted model on the same inputs scores 0.785. The weights are not the problem; the inputs are. |
+
+Three candidate builds were measured and rejected in the same pass — a per-game defensive
+denominator (0.5417 against the shipped season index's 0.5448), fitting the defensive weights
+to the draft (AUC 0.785 against 0.829), and snap share as a projection feature (0.002 MAE).
+
+**The revised order is in `ARCHITECTURE_REVIEW_2026-08.md` §6.** In short: publish reliability
+and per-position confidence first; then per-snap efficiency as a *sub-rating* for offence and
+the Production/Talent split for the two thirds of every roster whose number is a recruiting
+grade; then the projection, aimed at QB and WR rather than defence; then the playoff model,
+which is unblocked and whose benchmarks are on disk. The sections below are kept because the
+data facts in them are still correct — only the priority is wrong.
+
+---
+
 ## The one rule that orders everything below
 
 **A model that cannot show its backtest does not ship.**
@@ -56,6 +81,9 @@ season of EA Sports CFB 27 data, so every EA-based idea is unvalidated *by const
 until CFB 28 exists (~mid-2027) and gives us one year-over-year pair. Usage data is
 historical, so it can be tested properly today. Usage therefore goes first, even though
 the EA ideas are more interesting.
+
+*(That last sentence is the part 2026-08-13 overturned: usage is testable, was tested, and is
+worth 0.002 MAE. The rule stands; the conclusion drawn from it did not survive the test.)*
 
 ---
 

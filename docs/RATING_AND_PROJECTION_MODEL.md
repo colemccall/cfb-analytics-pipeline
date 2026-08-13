@@ -40,9 +40,11 @@ rating:     EDGE → OVR through fixed position anchors
 
 - **`stat_composite`** — a position-specific weighted sum of that game's box score. QB =
   `passYds×1.0 + passTD×25 + rushYds×0.7 + rushTD×20 − INT×20`, and so on per position.
-- **`opponent_multiplier`** — the opponent's SP+ on the relevant side of the ball,
-  normalised to `[0.55, 1.45]` per game. Production against a top-10 defence counts up to
-  1.45×; the same line against a weak one counts 0.55×.
+- **`opponent_multiplier`** — the opponent's SP+ on the relevant side of the ball, as a
+  z-score clipped to ±2 and applied **asymmetrically**: `1 + z×0.35` for a hard opponent, up
+  to **1.70**, and `1 + z×0.12` for a weak one, down to **0.76**. A hard opponent is rewarded
+  about three times as hard as a weak one is punished. *(Corrected 2026-08-13 — this document
+  said a symmetric `[0.55, 1.45]` for a year. The code never did; see `FORMULAS.md` §0.)*
 - **`√(games_played)`** — rewards sustained production without destroying players who
   missed time.
 - **Anchors** — fixed piecewise-linear maps from EDGE to OVR, per position, per era bucket

@@ -32,9 +32,19 @@ stage 1 (script 06)   per game:  stat_composite × opponent_multiplier
 stage 2 (script 07)   rating:    edge_score → OVR through fixed position anchors
 ```
 
-- **`opponent_multiplier`** — the opponent's SP+ on the relevant side of the ball, normalised
-  to `[0.55, 1.45]` per game. Production against a top-10 defence counts up to 1.45×; the same
-  line against a weak one as little as 0.55×.
+- **`opponent_multiplier`** — the opponent's SP+ on the relevant side of the ball, as a z-score
+  clipped to ±2, applied **asymmetrically**:
+
+  ```text
+  z ≥ 0 (hard opponent):  1 + z × 0.35     up to 1.70
+  z < 0 (weak opponent):  1 + z × 0.12     down to 0.76
+  ```
+
+  Beating a top defence is rewarded roughly three times as hard as beating a weak one is
+  punished. **Corrected 2026-08-13:** this document, `RATING_AND_PROJECTION_MODEL.md` and the
+  site's methods page all described a symmetric `[0.55, 1.45]`. The code
+  (`06_compute_edge_scores.py:228-256`) has always done the above; only the description was
+  wrong, and it was wrong in the document whose stated premise is "as actually computed".
 - **`√(games_played)`** — rewards sustained production without destroying a player who missed
   time. Not a mean (which would flatter a one-game wonder) and not a sum (which would make
   availability the whole rating).
