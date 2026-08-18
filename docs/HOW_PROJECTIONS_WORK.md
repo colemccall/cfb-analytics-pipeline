@@ -140,7 +140,22 @@ honesty and worsen MAE.
 ## Stage 5 — the range
 
 The 80% range is not calculated from theory. We take the model's errors on a held-out set of
-players, bucket them by predicted rating, and read off the 10th and 90th percentiles.
+players, bucket them by **position and** predicted rating, and read off the 10th and 90th
+percentiles. Below 60 rows in a cell the position's own band is noise and the family's is used
+instead.
+
+**Per position since v4.5.** One band for all of defence gave a corner and a linebacker the
+same interval, and coverage ran from 72.8% (CB) to 84.6% (DL) against an 80% target that only
+held in aggregate — two errors in opposite directions, cancelling. Measured per position,
+defence's mean distance from the target falls from 4.2 to 2.3 points and CB lands at 80.4%.
+Offence was already calibrated and did not move (1.7 points either way).
+
+The obvious way to do this was to scale each position's width by its measured reliability —
+a corner's rating disagrees with itself more, so his interval should be wider. It was built
+first and **rejected on its own gate**: it fixed CB and DB and broke S, LB, TE and QB, taking
+the mean distance from target from 3.2 to 5.9 points. Reliability bounds what a rating can
+*know*; it does not describe how a projection of it *errs*, and those are different quantities
+however closely related they sound. See `ALTERNATIVES.md` §D8.
 
 For Mickey: prediction 73.7, range **[57.6, 83.6]**.
 

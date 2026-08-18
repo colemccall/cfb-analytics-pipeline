@@ -3,6 +3,15 @@
 *2026-08-13. Review and planning. Everything below was measured against the data on disk
 during this review; the scripts that produced each number are named beside it.*
 
+> **Corrected the same week, by v4.5.** Two figures in §1 were computed on the production
+> composite and then used to draw conclusions about the *published* rating, which is a
+> different quantity — the tiers and the recruiting blend shrink it, most at the positions
+> the conclusions were about. Both tables below are kept as published and the corrected
+> numbers sit beside them. The direction survived; the size of the gap did not.
+>
+> §6's Phase 0 is now shipped, and §4's defect list is four items shorter. Status is marked
+> inline.
+
 The brief was: the foundation is not solid enough to build playoff prediction and roster
 analysis on top of, so fix the rating and therefore the projection, and start using the
 seventeen supplemental datasets that have been harvested and left unread.
@@ -43,6 +52,29 @@ A corner's first half-season and his second half-season agree at 0.42. Not with 
 with the draft — **with himself**. Whatever we compute from that, the ceiling on its
 agreement with the truth is 0.77.
 
+**Corrected in v4.5.** That table is the reliability of the production *composite*. Carried
+through script 07's full mapping — anchors, games confidence, the playing-time tier and the
+recruiting blend — the *published* rating is steadier, and steadier by most exactly where
+production is least measurable:
+
+| position | composite | published OVR | gap |
+|---|---:|---:|---:|
+| S | 0.684 | **0.810** | +0.126 |
+| DB | 0.609 | **0.723** | +0.115 |
+| CB | 0.591 | **0.700** | +0.108 |
+| TE | 0.750 | 0.827 | +0.077 |
+| DL | 0.627 | 0.700 | +0.073 |
+| WR | 0.840 | 0.908 | +0.068 |
+| LB | 0.786 | 0.853 | +0.067 |
+| EDGE | 0.648 | 0.709 | +0.061 |
+| RB | 0.883 | 0.931 | +0.048 |
+| QB | 0.876 | 0.919 | +0.044 |
+
+The gap is the shrinkage, and it is worth stating plainly what it is and is not:
+**repeatability, not truth.** Blending a production number toward a recruiting grade that does
+not vary between halves makes it repeat better without making it more right. A rating that is
+100% recruiting has reliability 1.0 and says nothing about the season it describes.
+
 Now put the shipped rating's year-over-year persistence beside that ceiling:
 
 | position | pairs | persistence | ceiling | share of ceiling reached |
@@ -58,21 +90,53 @@ Now put the shipped rating's year-over-year persistence beside that ceiling:
 | WR | 10,814 | 0.551 | 0.840 | 0.66 |
 | QB | 3,519 | 0.555 | 0.876 | **0.63** |
 
-Read the last column as *how much of the achievable year-over-year signal we already
-extract.* It inverts the roadmap:
+**That table divides by the wrong ceiling, and v4.5 re-ran it.** Persistence is measured on
+the published OVR, so the bound on it is the published OVR's reliability, not the composite's.
+Against the right ceiling:
 
-- **Defensive backs are at 83–88% of their ceiling.** Their projections are not bad because
-  the model is weak. They are bad because a corner's season is barely measurable, and the
-  things that would measure it — targets allowed, coverage snaps, missed tackles — do not
-  exist in any source (`API_INVENTORY.md`, verified by key scan). **No feature will fix
-  this. Only a new measurement would, and there is not one to buy.**
-- **Quarterbacks are at 63%.** QB production is measured cleanly (0.876) and predicted
-  poorly (0.555). That gap is real change the model is not capturing — and it is the
-  largest modelling headroom in the system.
+| position | persistence | OVR ceiling | share reached | as published above |
+|---|---:|---:|---:|---:|
+| EDGE | 0.516 | 0.709 | **73%** | 80% |
+| DB | 0.515 | 0.723 | **71%** | 88% |
+| CB | 0.491 | 0.700 | **70%** | 83% |
+| DL | 0.473 | 0.700 | 68% | 75% |
+| TE | 0.548 | 0.827 | 66% | 73% |
+| LB | 0.550 | 0.853 | 64% | 70% |
+| RB | 0.587 | 0.931 | 63% | 66% |
+| WR | 0.551 | 0.908 | 61% | 66% |
+| QB | 0.555 | 0.919 | **60%** | 63% |
+| S | 0.473 | 0.810 | **58%** | 69% |
+
+The conclusion holds in direction and weakens in size: the spread is 58–73%, not 58–88%, and
+safety joins the offensive positions at the bottom rather than sitting mid-table. "Defence is
+somewhat nearer its ceiling" is supportable; "defence is nearly done" is not.
+
+Read the last column as *how much of the achievable year-over-year signal we already
+extract.* It inverts the roadmap — by less than first published, and still decisively:
+
+- **Corners, edge rushers and the generic DB group are at 70–73% of their ceiling.** Their
+  projections are not bad because the model is weak. They are bad because a corner's season
+  is barely measurable, and the things that would measure it — targets allowed, coverage
+  snaps, missed tackles — do not exist in any source (`API_INVENTORY.md`, verified by key
+  scan). **No feature will fix this. Only a new measurement would, and there is not one to
+  buy.**
+- **Quarterbacks, receivers and safeties are at 58–61%.** QB production is measured cleanly
+  (0.919 on the published number) and predicted poorly (0.555). That gap is real change the
+  model is not capturing — and it is the largest modelling headroom in the system.
 
 So the queue is upside down. The defensive rating, which the roadmap makes the headline,
-is close to done in the only sense available to it. Offensive projection, which the
-roadmap treats as solved, is where the remaining accuracy lives.
+is nearer done than the positions the roadmap treats as solved — and offensive projection is
+where the remaining accuracy lives.
+
+**One hypothesis for the spread, tested and rejected** (v4.5). A corner records 3.6 countable
+events a game against a running back's 8.4, so some of this could be observation count rather
+than a property of the position. Pooling every position and bucketing by events per game, the
+curve is **U-shaped**: the least-observed decile (1.4 events) is the *most* repeatable at
+0.878, because a player with almost no events reliably produces almost nothing. Across
+positions the correlation between reliability and event count is only **+0.44**, and tight
+end has the fewest events of any position (2.0/game) with the fourth-highest reliability.
+Observation count does not explain the spread. It is a property of what each position's
+statistics actually measure, which is the harder and more useful answer.
 
 ---
 
@@ -211,13 +275,15 @@ Ordered by how much they can mislead a reader or cost a run.
 | # | Where | What | Severity |
 |---|---|---|---|
 | 1 | `06_compute_edge_scores.py:228-256` vs `FORMULAS.md` §0, `RATING_AND_PROJECTION_MODEL.md`, `js/methods.js:72` | The opponent multiplier is documented as symmetric `[0.55, 1.45]`. The code is **asymmetric: `1 + z·0.35` up to 1.70, `1 + z·0.12` down to 0.76**. Three documents and the public methods page state a formula the code does not implement — on the page whose premise is "as the code actually computes it". **Fixed in this pass.** | high (credibility) |
-| 2 | `07_compute_player_ratings.py:1192` | `STAT_FALLBACK_TARGETS` maps the no-EDGE pool through `np.percentile(...)` — pool-relative scaling, the exact mechanism `AUDIT_FINDINGS.md` §9 forbids. Bounded (caps at 78) and cross-season pooled, so the damage is small, but the guarantee as written is not true of every path. | medium |
-| 3 | `07_compute_player_ratings.py:1521` + `main()` | `rate_position()` loads and re-rates **every season** of a position to return one season, and `main()` loops seasons on the outside. A `--all-seasons` run therefore rebuilds the full cross-season frame 19×12 times and rewrites the 112 MB `ratings.json` 19 times. The v4.3 fix cached the *raw tables*; the quadratic work is the per-row feature loop above them, which is still there. | medium (run time) |
-| 4 | `07_compute_player_ratings.py:78` | `classify_playtime_tier` falls back to `volume_score` when the position's canonical stat key is missing. `volume_score` is a different quantity on a different scale, so the tier thresholds (`QB starter ≥ 100 passingATT`) are being applied to a number that does not mean attempts. | medium |
+| 2 ✅ **fixed v4.5** | `07_compute_player_ratings.py` | `STAT_FALLBACK_TARGETS` maps the no-EDGE pool through `np.percentile(...)` — pool-relative scaling, the exact mechanism `AUDIT_FINDINGS.md` §9 forbids. Bounded (caps at 78) and cross-season pooled, so the damage is small, but the guarantee as written is not true of every path. | medium |
+| 3 ✅ **fixed v4.5** | `07_compute_player_ratings.py` | `rate_position()` loads and re-rates **every season** of a position to return one season, and `main()` loops seasons on the outside. A `--all-seasons` run therefore rebuilds the full cross-season frame 19×12 times and rewrites the 112 MB `ratings.json` 19 times. The v4.3 fix cached the *raw tables*; the quadratic work is the per-row feature loop above them, which is still there. | medium (run time) |
+| 4 ✅ **fixed v4.5** | `07_compute_player_ratings.py` | `classify_playtime_tier` falls back to `volume_score` when the position's canonical stat key is missing. `volume_score` is a different quantity on a different scale, so the tier thresholds (`QB starter ≥ 100 passingATT`) are being applied to a number that does not mean attempts. | medium |
 | 5 | `data/computed/ratings.json` | 112 MB holding every engine in one file, rewritten whole on every season of every run. Should be split per engine (and probably per season) — `read_ratings()` already exists as the only correct way to read it, which is a workaround for the shape rather than a fix. | medium |
 | 6 | `player_wepa.json` | 1,734 rows with `wepa_kind = "kicking"` and **`wepa` null in every one**. The harvest wrote the envelope of an empty response. | low |
 | 7 | `venues.json` | 844 rows with `season = 0` and `team_id = null` — as harvested it cannot join to anything. | low |
 | 8 | `cfp_participants.json` | 24 rows, 2024–2025 only. This is the playoff model's *ground truth* and it is two seasons deep. Any backtest claim must be framed around that, not around bracket accuracy. | low, but plan-shaping |
+| 10 | `PLAYTIME_TIERS` | **DB had no entry**, so every one of 23,353 DB player-seasons classified as a starter and was rated on the full formula with no recruiting anchor. Found in v4.5 while checking defect 4; fixing it moved 7,138 ratings and raised agreement with EA from 0.6132 to 0.6497. ✅ **fixed v4.5** | was high |
+| 11 | script 07 | `EDGE_OVR_ANCHORS` has **no era buckets**, though `FORMULAS.md` describes three, and `get_rating_era()` is dead code with no call sites. Untouched — changing anchors moves every rating at once. | medium |
 | 9 | frontend `data/` | `players_2025.json` is 13.7 MB and the grid needs a dozen fields; `trajectory_detail.json` 5.5 MB. Already in the roadmap's debt list; still true. | low |
 
 ---
@@ -263,18 +329,21 @@ numbers". It is now cheap: every row already knows its tier.
 Ordered so that each phase's gate is a measurement, and so that nothing downstream is built
 on a number that has not passed one.
 
-### Phase 0 — make the foundation legible (days, no accuracy claims)
+### Phase 0 — make the foundation legible (days, no accuracy claims) — ✅ **shipped v4.5**
 
-1. **Ship reliability.** `scripts/validate_reliability.py` exists and exports
-   `data/reliability.json`. Add it to the pre-ship checklist beside `validate_ratings.py`
-   and `validate_vs_draft.py`. *Gate: none — it is a measurement.*
-2. **Publish `rating_basis` on every rating row** — `production` / `blended` / `recruiting`
-   / `withheld` — derived from the tier that already exists. The UI shows it as a chip.
-   *Gate: `tests/test_export_contract.py` asserts every rated row carries one.*
-3. **Per-position confidence from reliability.** A CB's interval must be wider than a QB's
-   because his measurement is worse, not because his model residuals happened to be. Feed
-   `noise_ceiling` into the published interval width.
-4. **Fix the defects in §4**, items 1–4 first. Item 1 is done.
+1. ~~**Ship reliability.**~~ Done, and extended: it now measures the composite *and* the
+   published OVR, and is on the pre-ship checklist in `CLAUDE.md` §4.
+2. ~~**Publish `rating_basis` on every rating row.**~~ Done — `production` 70,718 rows,
+   `blended` 4,456, `recruiting` 29,427, `withheld` 47,958, chipped in the UI, four tests in
+   the contract suite. No OVR moved for it.
+3. **Per-position confidence** — done, but **not the way this said**. Feeding the noise
+   ceiling into interval width failed its own gate: mean |coverage − 80| across positions went
+   3.2 → 5.9 points. Residual quantiles measured per position ship instead, and take defence
+   from 4.2 → 2.3 points off target with CB at 80.4%. Reliability bounds what a rating can
+   *know*; it does not describe how a projection of it *errs*.
+4. ~~**Fix the defects in §4**, items 1–4.~~ Done, plus two found while doing it: DB had no
+   tier entry at all (defect 10 — 7,138 ratings moved, EA agreement 0.6132 → 0.6497), and
+   `EDGE_OVR_ANCHORS` has no era buckets despite three being documented (defect 11, untouched).
 
 ### Phase 1 — the rating, where reliability says there is room
 

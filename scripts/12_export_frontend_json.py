@@ -351,6 +351,12 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
             # "not_rated" with the reason attached, so the UI renders a stated
             # refusal instead of a blank that reads as a bug.
             "rating_status":    row.get("rating_status"),
+            # What the number is BUILT from, derived from the playing-time tier
+            # (v4.5). production / blended / recruiting / withheld. A backup's 54
+            # and a starter's 54 are different claims — the backup's IS
+            # `pos_avg + stars_delta`, a six-valued step function — and until this
+            # shipped nothing on the page distinguished them.
+            "rating_basis":     row.get("rating_basis"),
             "not_rated_reason": row.get("not_rated_reason"),
             "trajectory":       _f(row.get("trajectory_score")),
             "breakout_prob":    _f(row.get("breakout_probability")),
@@ -799,6 +805,12 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
             "hometown_state":   row.get("hometown_state"),
             "overall_rating":   _f(row.get("overall_rating")),
             "rating_status":    row.get("rating_status"),
+            # What the number is BUILT from, derived from the playing-time tier
+            # (v4.5). production / blended / recruiting / withheld. A backup's 54
+            # and a starter's 54 are different claims — the backup's IS
+            # `pos_avg + stars_delta`, a six-valued step function — and until this
+            # shipped nothing on the page distinguished them.
+            "rating_basis":     row.get("rating_basis"),
             "not_rated_reason": row.get("not_rated_reason"),
             "trajectory":       _f(row.get("trajectory_score")),
             "breakout_prob":    _f(row.get("breakout_probability")),

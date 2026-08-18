@@ -1,6 +1,18 @@
 # Every rating formula, as it is actually computed
 
-*Rating version **v4.3**, 2026-08-12.*
+*Rating version **v4.5**, 2026-08-13.*
+
+What changed in v4.5:
+
+| | change |
+|---|---|
+| **Tiers** | **DB was missing from `PLAYTIME_TIERS` entirely**, so all 23,353 DB player-seasons classified as starters and were rated on the full formula with no recruiting anchor. Fixed; 7,138 DB ratings moved and agreement with EA rose 0.6132 → **0.6497** (§4) |
+| **Tiers** | a defender's zero tackles read as one, because the tier lookup used the floored `volume_score`. The bench tier was unreachable at CB, DL and EDGE (§4) |
+| **Every row** | carries `rating_basis` — `production` / `blended` / `recruiting` / `withheld` (§4) |
+| **No-EDGE fallback** | percentile-of-the-pool scaling replaced by fixed `STAT_FALLBACK_ANCHORS` (§1) |
+| **Opponent multiplier** | documented asymmetrically, as the code has always computed it (§0) |
+
+*Rating version v4.3, 2026-08-12.*
 
 "As actually computed", not as intended — the distinction earns its place here. The offensive
 line rating in the previous version of this document was described correctly and computed
@@ -55,6 +67,20 @@ stage 2 (script 07)   rating:    edge_score → OVR through fixed position ancho
 **Three positions never reach stage 1 at all** — OL, K and P have no `edge_score` rows,
 because there is no per-play production to build one from. They go through a separate
 composite → `COMPOSITE_OVR_ANCHORS` path described in §2 and §5.
+
+**A player at an EDGE position with no EDGE score** — injured, pre-2016, or below the
+`stats_measured` threshold — falls back to a stat-only composite mapped through
+`STAT_FALLBACK_ANCHORS`, capped at 78 because elite production cannot be confirmed without
+the opponent adjustment.
+
+Those anchors are **fixed constants as of v4.5**. Until then the fallback mapped through
+`np.percentile(pool, [0, 10, 50, 75, 90, 99, 100])` — pool-relative scaling, the exact
+mechanism `AUDIT_FINDINGS.md` §9 forbids, surviving on one path after being removed from
+every other. The bottom of the no-EDGE pool became 30 and the top 78 in every season
+regardless of how good either actually was. The x-coordinates are now that same pooled
+2008–2026 distribution frozen at those seven percentiles, so today's output is unchanged to
+within interpolation error (3,468 rows moved by ≤0.02 OVR, none by more) and a future crop
+that is genuinely worse maps lower instead of being re-stretched to fill the band.
 
 ---
 
@@ -381,11 +407,63 @@ thresholds are 75% of modern, compensating for hurries and pass breakups not exi
 
 ---
 
-## 4. Playing-time tiers
+## 4. Playing-time tiers, and what a rating is built from
 
-Before any of the above, a player is bucketed by stat volume — starter (full formula), role
-player (capped 78), reserve (capped 68, blended with recruiting), bench (capped 60,
-recruiting only). Thresholds are per position, e.g. LB starter ≥ 20 tackles, CB ≥ 10.
+Before any of the above, a player is bucketed by stat volume, and the tier decides how much
+of the formula survives:
+
+```text
+starter   100% formula
+role      75% formula + 25% recruiting anchor
+reserve   40% formula + 60% recruiting anchor
+bench     recruiting anchor only  =  position_avg + STARS_OVR_DELTA[stars]
+```
+
+Thresholds are per position — LB starter ≥ 20 tackles, CB ≥ 10, DB ≥ 15.
+
+### `rating_basis` — the tier, published (v4.5)
+
+Every rating row now carries what its number is **built from**, derived from the tier rather
+than newly computed:
+
+| basis | meaning | rows |
+|---|---|---:|
+| `production` | the formula ran on real production | 70,718 |
+| `blended` | formula and recruiting mixed | 4,456 |
+| `recruiting` | the number **is** `position_avg + stars_delta`, a six-valued step function | 29,427 |
+| `withheld` | OL — `rating_status: "not_rated"` | 47,958 |
+
+§7 has always said two thirds of a roster has no production to measure. Nothing on the site
+said which two thirds, so a backup's 54 and a starter's 54 were published as the same kind of
+object. This is the same category error as the withdrawn OL rating, differing only in degree,
+and the fix is the same shape: the number stays, its nature stops being hidden.
+
+### Two defects fixed in v4.5
+
+**DB was not in `PLAYTIME_TIERS` at all.** The lookup returned `None`, which the code read as
+"no thresholds, treat as starter" — so every one of **23,353 DB player-seasons** was rated on
+the full production formula with no recruiting anchor, however little he played. In 2025 the
+tier split was 919 starters and nothing else, against CB's 245 / 70 / 123. DB thresholds now
+sit between CB's and S's, because DB is the API's own generic label for both and its tackle
+distribution sits between them (2025 p50 14 against CB 13 and S 14).
+
+Measured consequence: **7,138 DB ratings moved, mean −5.19**, and within-position agreement
+with EA CFB 27 rose from **0.6132 to 0.6497** — the largest single-position gain in any recent
+pass, from a missing table entry rather than from tuning. `test_every_rated_position_has_tiers`
+is what stops the next position group inheriting it.
+
+**A zero tackle read as one.** Defensive features divide by tackles, so `volume_score` is
+`max(TOT, 1)`; the tier lookup read that floored value and the reserve threshold at CB, DL and
+EDGE is exactly 1. The bench tier was therefore unreachable at those positions — 0 bench rows
+at all three in 2025. Tiers now read an unfloored `tier_volume`.
+
+**Held constant on purpose:** pre-2016 defenders keep the floored behaviour. Tackles are not
+published before 2016, so their zero is unknown rather than real, and un-flooring it would
+move them from `reserve` to `bench` — which discards the CLASSIC interceptions-and-recruiting
+rating entirely. That interaction is a real defect (the tier blend already discards or dilutes
+CLASSIC for every pre-2016 defender, worth a mean +9.0 to +16.5 across 3,900 ratings if
+fixed), and it is a rating change with no external check available for that era. It belongs to
+its own pass, not to a labelling one.
 
 ---
 

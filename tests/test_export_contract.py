@@ -339,6 +339,62 @@ class TestOffensiveLineIsWithheld:
         assert all(p.get("rating_status") == "not_rated" for p in ol)
 
 
+class TestRatingBasis:
+    """Every rated row says what its number is built from (v4.5).
+
+    Two thirds of any roster has no production to measure, and for those players
+    the rating IS `position average + STARS_OVR_DELTA[stars]` — a six-valued step
+    function. It was published as the same kind of object as a starter's
+    production rating, which is the same category error as the withdrawn OL
+    rating differing only in degree.
+
+    The tier that decides this already existed; these tests pin that it is now
+    visible, and that it is derived rather than invented — a row labelled
+    `production` must not be a recruiting grade in disguise.
+    """
+
+    VALID = {"production", "blended", "recruiting", "withheld"}
+
+    @pytest.fixture(scope="class")
+    def players(self, manifest):
+        season = manifest["last_played_season"]
+        path = APP_DATA / f"players_{season}.json"
+        if not path.exists():
+            pytest.skip(f"players_{season}.json not exported yet")
+        return _load(f"players_{season}.json")
+
+    def test_every_row_carries_a_basis(self, players):
+        missing = [p for p in players if not p.get("rating_basis")]
+        assert not missing, (
+            f"{len(missing)} of {len(players)} rows carry no rating_basis. A number "
+            "whose nature is unstated is the defect this field exists to close.")
+
+    def test_basis_values_are_from_the_contract(self, players):
+        bad = sorted({p.get("rating_basis") for p in players} - self.VALID)
+        assert not bad, f"unexpected rating_basis values: {bad}"
+
+    def test_withheld_is_exactly_the_unrated(self, players):
+        for p in players:
+            if p.get("rating_basis") == "withheld":
+                assert p.get("overall_rating") is None, (
+                    f"{p.get('name')} is labelled withheld but carries a rating")
+            if p.get("rating_status") == "not_rated":
+                assert p.get("rating_basis") == "withheld"
+
+    def test_recruiting_basis_rows_exist_and_are_not_rare(self, players):
+        """If this ever reads zero, the derivation has silently broken.
+
+        Two thirds of a roster having no production is the fact the field exists
+        to expose; a version that labels everything `production` would pass every
+        other test here and publish the original lie.
+        """
+        rated = [p for p in players if p.get("overall_rating") is not None]
+        rec = [p for p in rated if p.get("rating_basis") == "recruiting"]
+        assert len(rec) > 0.05 * len(rated), (
+            f"only {len(rec)} of {len(rated)} rated rows are recruiting-based. "
+            "Expected a substantial share — check the tier derivation.")
+
+
 class TestLineUnitRating:
     """The constructive half of the withdrawal: the line is rated as a unit."""
 

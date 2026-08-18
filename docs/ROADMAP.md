@@ -63,6 +63,14 @@ Three candidate builds were measured and rejected in the same pass — a per-gam
 denominator (0.5417 against the shipped season index's 0.5448), fitting the defensive weights
 to the draft (AUC 0.785 against 0.829), and snap share as a projection feature (0.002 MAE).
 
+**Phase 0 of that plan shipped as v4.5 on 2026-08-13**, and it corrected two of the numbers
+above: the reliability figures were computed on the production composite, and against the
+*published* rating's ceiling the spread is 58–73% rather than 63–88%. Defence is still nearer
+its limit than offence; the gap is smaller than first reported. Also fixed in that pass, and
+not on any roadmap because nobody knew it was there: **DB had no entry in `PLAYTIME_TIERS`**,
+so all 23,353 DB player-seasons were rated as starters. Correcting it moved 7,138 ratings and
+raised agreement with EA from 0.6132 to 0.6497.
+
 **The revised order is in `ARCHITECTURE_REVIEW_2026-08.md` §6.** In short: publish reliability
 and per-position confidence first; then per-snap efficiency as a *sub-rating* for offence and
 the Production/Talent split for the two thirds of every roster whose number is a recruiting

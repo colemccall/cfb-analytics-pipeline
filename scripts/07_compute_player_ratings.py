@@ -63,9 +63,49 @@ PLAYTIME_TIERS = {
     "LB":   {"stat": "defensiveTOT", "starter":  20, "role": 10,  "reserve": 2},
     "CB":   {"stat": "defensiveTOT", "starter":  10, "role":  5,  "reserve": 1},
     "S":    {"stat": "defensiveTOT", "starter":  20, "role": 10,  "reserve": 2},
+    # DB was missing from this table until v4.5, which meant cfg was None and every
+    # DB in the archive — 23,353 player-seasons — classified as "starter" and was
+    # rated on the full formula with no recruiting anchor, however little he played.
+    # 4,354 of them are rated without even an EDGE score. Thresholds sit between CB
+    # and S because DB is the API's own generic label for both and its tackle
+    # distribution sits between them (2025 p50 14 against CB 13 and S 14; p75 35
+    # against 28 and 41). Guarded by test_every_rated_position_has_tiers.
+    "DB":   {"stat": "defensiveTOT", "starter":  15, "role":  7,  "reserve": 1},
     "K":    {"stat": "kickingFGM",   "starter":   5, "role":  2,  "reserve": 1},
     "P":    {"stat": "puntingNO",    "starter":  10, "role":  5,  "reserve": 1},
 }
+
+
+def _tier_value(stats: dict, cfg: dict) -> float:
+    """The countable stat a tier is judged on, preferring the unfloored count.
+
+    Three keys can carry it and they are not equivalent:
+
+      cfg["stat"]    the canonical raw key ("defensiveTOT"). Present when a raw
+                     payload is passed, absent from a computed feature row.
+      tier_volume    the raw count, carried through compute_stat_features
+                     deliberately UNFLOORED (v4.5).
+      volume_score   the same count, but floored at 1 for the positions whose
+                     features divide by it. A defender with zero tackles reads as
+                     one, and the reserve threshold at CB/DL/EDGE is exactly 1, so
+                     the bench tier was unreachable for them: 0 bench rows at all
+                     three positions in 2025, 24 of which belong there.
+
+    Order matters, and so does not using `or` — a genuine 0 is falsy and would fall
+    through to the floored value, which is the bug this function exists to fix.
+    """
+    for key in (cfg["stat"], "tier_volume", "volume_score"):
+        if key is None:
+            continue
+        val = stats.get(key)
+        if val is None:
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
 
 def classify_playtime_tier(pg: str, stats: dict, games_played: int = 1) -> str:
     """Classify player into tier based on stat volume."""
@@ -73,13 +113,7 @@ def classify_playtime_tier(pg: str, stats: dict, games_played: int = 1) -> str:
     if not cfg or cfg["stat"] is None:
         return "starter"  # OL team proxy, always full formula
 
-    # Try the canonical PLAYTIME_TIERS stat key first, then fall back to
-    # volume_score (the alias set by extract_features for all positions).
-    val = stats.get(cfg["stat"]) or stats.get("volume_score") or 0
-    try:
-        val = float(val)
-    except (TypeError, ValueError):
-        val = 0
+    val = _tier_value(stats, cfg)
 
     if val >= cfg["starter"]:
         return "starter"
@@ -88,6 +122,19 @@ def classify_playtime_tier(pg: str, stats: dict, games_played: int = 1) -> str:
     if val >= cfg["reserve"]:
         return "reserve"
     return "bench"
+
+
+# What a rating is actually built from. Derived from the tier, which already exists —
+# this adds no computation, only a name for something the site was publishing without
+# one. A backup's 54 and a starter's 54 are different claims: the starter's is
+# measured production, the backup's IS `pos_avg + STARS_OVR_DELTA[stars]`, a
+# six-valued step function. FORMULAS.md §7 has always said so; nothing on the page did.
+TIER_RATING_BASIS = {
+    "starter": "production",   # the formula ran on real production
+    "role":    "blended",      # 75% formula + 25% recruiting anchor
+    "reserve": "blended",      # 40% formula + 60% recruiting anchor
+    "bench":   "recruiting",   # the number IS pos_avg + stars_delta
+}
 
 # Recruiting fallback: how much the overall rating shifts from position average
 # based on recruiting stars when a player has NO usable stats.
@@ -380,6 +427,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "yards_per_att": yds  / att,
             "td_int_ratio":  (td + 1) / (ints + 1),
             "volume_score":  att,
+            "tier_volume":   _stat_float(stats, "passingATT"),
         }
 
     if pg == "RB":
@@ -391,6 +439,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "yards_total":      yds,
             "rec_versatility":  rec / car,
             "volume_score":     car,
+            "tier_volume":      _stat_float(stats, "rushingCAR"),
         }
 
     if pg in ("WR", "TE"):
@@ -403,6 +452,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "td_score":        tds * 8.0 + yds * 0.01,
             "rec_volume":      rec,
             "volume_score":    rec,   # alias used by is_starter threshold check
+            "tier_volume":     _stat_float(stats, "receivingREC"),
         }
 
     if pg == "OL":
@@ -423,6 +473,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "disruption_rate":  shrunk_rate(sacks + tfl, tot, pg, "disruption_rate"),
             "run_stop_score":   tfl * 2.5 + (tot - sacks) * 0.3,        # run stuffs (secondary for EDGE)
             "volume_score":     tot,
+            "tier_volume":      _stat_float(stats, "defensiveTOT"),
         }
 
     if pg == "DL":
@@ -435,6 +486,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "run_stop_score":   tfl * 2.5 + (tot - sacks) * 0.4,        # run stuffs + tackle presence
             "disruption_rate":  shrunk_rate(sacks + tfl, tot, pg, "disruption_rate"),
             "volume_score":     tot,
+            "tier_volume":      _stat_float(stats, "defensiveTOT"),
         }
 
     if pg == "LB":
@@ -449,6 +501,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "coverage_score":   ints * 3.0 + pbu * 1.5,                 # zone/man skills
             "instinct_score":   shrunk_rate(ints + pbu + tfl, tot, pg, "instinct_score"),
             "volume_score":     tot,
+            "tier_volume":      _stat_float(stats, "defensiveTOT"),
         }
 
     if pg == "CB":
@@ -463,6 +516,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "pass_rush_score":  sacks * 3.0 + tfl * 1.0,                # blitz value
             "instinct_score":   shrunk_rate(ints + pbu, tot, pg, "instinct_score"),
             "volume_score":     tot,
+            "tier_volume":      _stat_float(stats, "defensiveTOT"),
         }
 
     if pg == "S":
@@ -477,6 +531,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "pass_rush_score":  sacks * 3.0 + tfl * 1.5,                # box blitz value
             "instinct_score":   shrunk_rate(ints + pbu + tfl * 0.5, tot, pg, "instinct_score"),
             "volume_score":     tot,
+            "tier_volume":      _stat_float(stats, "defensiveTOT"),
         }
 
     if pg == "DB":
@@ -493,6 +548,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "pass_rush_score":  sacks * 4.0 + tfl * 1.5,
             "instinct_score":   shrunk_rate(ints + pbu + tfl * 0.5, tot, pg, "instinct_score"),
             "volume_score":     tot,
+            "tier_volume":      _stat_float(stats, "defensiveTOT"),
         }
 
     if pg == "K":
@@ -507,6 +563,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "fg_long":      _stat_float(stats, "kickingLONG"),
             "xp_pct":       _stat_float(stats, "kickingXPM") / xpa,
             "volume_score": _stat_float(stats, "kickingFGM"),
+            "tier_volume":  _stat_float(stats, "kickingFGM"),
         }
 
     if pg == "P":
@@ -515,6 +572,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "avg_yards":     _stat_float(stats, "puntingYDS") / n,
             "inside_20_pct": _stat_float(stats, "puntingIn 20") / n,
             "volume_score":  _stat_float(stats, "puntingNO"),
+            "tier_volume":   _stat_float(stats, "puntingNO"),
         }
 
     return {}
@@ -697,9 +755,44 @@ STAT_ONLY_WEIGHTS = {
     },
 }
 
-# Percentile → OVR targets for the no-EDGE stat fallback in compute_edge_ratings.
+# Stat-only composite → OVR for the no-EDGE fallback in compute_edge_ratings.
 # Cap at 78: without opponent-adjusted EPA we can't confirm elite production.
+#
+# v4.5: these are FIXED ABSOLUTE ANCHORS. They replace
+#     np.percentile(pool, [0, 10, 50, 75, 90, 99, 100]) -> STAT_FALLBACK_TARGETS
+# which was pool-relative scaling — the exact mechanism AUDIT_FINDINGS.md §9 forbids,
+# surviving on one path after it had been removed from every other. The bottom of the
+# no-EDGE pool mapped to 30 and the top to 78 in every season regardless of how good
+# either actually was, so a weak crop was silently re-stretched to fill the same band.
+#
+# Calibrated exactly as COMPOSITE_OVR_ANCHORS was in v4.2: the x-coordinates are the
+# pooled 2008-2026 composite values at those same seven percentiles, frozen. Today's
+# output is therefore unchanged to within interpolation error, and a future crop that
+# is genuinely worse now maps lower instead of being re-normalised to look the same.
 STAT_FALLBACK_TARGETS = [30.0, 38.0, 55.0, 64.0, 70.0, 76.0, 78.0]
+
+STAT_FALLBACK_ANCHORS: dict[str, list[tuple[float, float]]] = {
+    "QB":   [(0.0065, 30.0), (0.0931, 38.0), (0.3278, 55.0), (0.4686, 64.0), (0.6063, 70.0), (0.7889, 76.0), (0.9770, 78.0)],
+    "RB":   [(0.0156, 30.0), (0.1340, 38.0), (0.3024, 55.0), (0.4044, 64.0), (0.4991, 70.0), (0.6233, 76.0), (0.7866, 78.0)],
+    "WR":   [(0.0027, 30.0), (0.1000, 38.0), (0.2426, 55.0), (0.3439, 64.0), (0.4338, 70.0), (0.5704, 76.0), (0.8108, 78.0)],
+    "TE":   [(0.0015, 30.0), (0.0610, 38.0), (0.1821, 55.0), (0.2655, 64.0), (0.3604, 70.0), (0.4669, 76.0), (0.5800, 78.0)],
+    "EDGE": [(0.0462, 30.0), (0.0832, 38.0), (0.1669, 55.0), (0.2216, 64.0), (0.3092, 70.0), (0.4950, 76.0), (0.7315, 78.0)],
+    "DL":   [(0.0320, 30.0), (0.0523, 38.0), (0.1503, 55.0), (0.2063, 64.0), (0.2692, 70.0), (0.3949, 76.0), (0.8312, 78.0)],
+    "LB":   [(0.0213, 30.0), (0.0570, 38.0), (0.1405, 55.0), (0.1974, 64.0), (0.2422, 70.0), (0.3356, 76.0), (0.7211, 78.0)],
+    "CB":   [(0.0291, 30.0), (0.0513, 38.0), (0.1942, 55.0), (0.2936, 64.0), (0.3683, 70.0), (0.5793, 76.0), (0.7664, 78.0)],
+    "S":    [(0.0249, 30.0), (0.0362, 38.0), (0.1287, 55.0), (0.1967, 64.0), (0.2417, 70.0), (0.3892, 76.0), (0.7619, 78.0)],
+    "DB":   [(0.0345, 30.0), (0.0402, 38.0), (0.1361, 55.0), (0.1677, 64.0), (0.2468, 70.0), (0.3792, 76.0), (0.6961, 78.0)],
+}
+
+
+def stat_fallback_to_ovr(score: float, pg: str) -> float:
+    """Map a stat-only composite to OVR through fixed anchors. Absolute, not relative."""
+    anchors = STAT_FALLBACK_ANCHORS.get(pg)
+    if not anchors:
+        return float(np.clip(30.0 + 48.0 * float(score), 30.0, 78.0))
+    xs = [a[0] for a in anchors]
+    ys = [a[1] for a in anchors]
+    return float(np.clip(np.interp(float(score), xs, ys), 30.0, 78.0))
 
 
 # ---------------------------------------------------------------------------
@@ -966,10 +1059,42 @@ def is_starter(row: pd.Series, pg: str) -> bool:
 
 
 def get_tier(row: pd.Series, pg: str) -> str:
-    """Classify player into tier: starter, role, reserve, or bench."""
+    """Classify player into tier: starter, role, reserve, or bench.
+
+    Mirrors is_starter's structure deliberately, because the tier decides how much
+    of the rating survives apply_multi_tier_treatment and the two must not disagree
+    about what a player is.
+
+    **Tackles are not published before 2016**, so a pre-2016 defender's zero is
+    unknown, not a bench player — missing means unknown, never zero. Removing the
+    max(...,1) floor in v4.5 fixed the modern era, where a zero is a real zero, and
+    would have changed the classic era, where it is not: every pre-2016 CB, DL and
+    EDGE with no recorded tackle would have moved from `reserve` to `bench`.
+
+    Those players keep the floored value, which reproduces the pre-v4.5 treatment
+    exactly. It is not defended as correct — it is held constant on purpose. The
+    measurement that forced the choice, and which belongs to its own pass:
+
+      the CLASSIC interceptions-and-recruiting rating is largely inoperative.
+      A pre-2016 defender's tier is decided by a tackle count that does not exist,
+      so LB and S (reserve threshold 2, floored value 1) land in `bench` and
+      apply_multi_tier_treatment REPLACES their classic rating with a pure
+      recruiting grade; CB, DL and EDGE (threshold 1) land in `reserve` and keep
+      40% of it. Tiering them by production instead moves 3,900 ratings by a mean
+      of +9.0 (EDGE) to +16.5 (LB).
+
+    That is the same family of defect as the withdrawn OL rating — a subsystem
+    whose output a later step discards — but fixing it is a rating change with no
+    external check available for that era, and this pass is a labelling pass.
+    Recorded in ALTERNATIVES.md rather than shipped inside it.
+    """
     if _has_valid_edge(row):
         return "starter"
-    return classify_playtime_tier(pg, row.to_dict(), games_played=row.get("games_played", 1))
+    row_season = int(row.get("_season") or 9999)
+    stats = row.to_dict()
+    if pg in DEFENSIVE_POSITIONS and row_season < 2016:
+        stats.pop("tier_volume", None)      # fall through to the floored value
+    return classify_playtime_tier(pg, stats, games_played=row.get("games_played", 1))
 
 
 def has_opp_score(row: pd.Series, pg: str = "") -> bool:
@@ -1122,13 +1247,18 @@ def normalize_feature(key: str, val: float, pg: str = "") -> float:
 # Rating computation
 # ---------------------------------------------------------------------------
 
-def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple[np.ndarray, list[dict]]:
+def compute_edge_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[dict]]:
     """Direct edge_score → OVR mapping for EDGE positions.
 
     For players with a valid edge_score: OVR = edge_to_ovr(edge_score, pg).
     For players without EDGE data (pre-2016 defense, injured, etc.): use the
-    stat-only composite (STAT_ONLY_WEIGHTS) scaled to [30–90] so historical
-    defensive players get meaningful variance instead of a flat 50.0 fallback.
+    stat-only composite (STAT_ONLY_WEIGHTS) through STAT_FALLBACK_ANCHORS, so
+    historical defensive players get meaningful variance instead of a flat 50.0.
+
+    Every era decision here reads each ROW's own season. The function took a
+    `season` argument until v4.5 and passed it to edge_to_ovr(), which has never
+    read it — that is why one season of the pool could be rated with another
+    season's parameters without anyone noticing, and why the result is cacheable.
 
     Returns:
       scores   — np.ndarray of OVR values [30–99] or 0.0 if truly no data at all
@@ -1140,7 +1270,9 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
     no_edge_features = list(no_edge_weights.keys())
     no_edge_w_arr = np.array([no_edge_weights[c] for c in no_edge_features]) if no_edge_features else np.array([])
 
-    # Gather all no-EDGE stat composites to scale relatively within the pool
+    # Stat-only composites for the players with no EDGE score. These are mapped
+    # through STAT_FALLBACK_ANCHORS — fixed constants — not through percentiles of
+    # whoever happens to be in the pool. See the note on STAT_FALLBACK_ANCHORS.
     all_stat_scores = []
     for _, row in df.iterrows():
         if not has_opp_score(row, pg) and no_edge_features:
@@ -1149,16 +1281,12 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
         else:
             all_stat_scores.append(None)
 
-    valid_stat = [s for s in all_stat_scores if s is not None]
-    if valid_stat:
-        stat_pcts = np.percentile(valid_stat, [0, 10, 50, 75, 90, 99, 100])
-
     final_scores   = []
     final_contribs = []
 
     for i, (_, row) in enumerate(df.iterrows()):
         # Per-row pre-2016 defensive check — df contains ALL seasons.
-        row_season = int(row.get("_season") or season)
+        row_season = int(row.get("_season") or 9999)
         is_pre2016_def = (pg in DEFENSIVE_POSITIONS and row_season < 2016)
 
         if is_pre2016_def:
@@ -1174,7 +1302,7 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
             }
         elif has_opp_score(row, pg):
             es  = float(row.get("edge_score") or 0)
-            ovr = edge_to_ovr(es, pg, season)
+            ovr = edge_to_ovr(es, pg, row_season)
             contrib = {
                 "edge_score":     round(es, 4),
                 "games_played":   int(row.get("games_played") or 0),
@@ -1187,9 +1315,9 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str, season: int = 2025) -> tuple
             cov = row.get("coverage_share")
             if pg in ("CB", "S", "DB") and cov is not None and float(cov or 0) > 0:
                 contrib["coverage_share"] = round(float(cov), 4)
-        elif all_stat_scores[i] is not None and valid_stat:
-            # Stat-based fallback: scale within the no-EDGE pool, cap at 78
-            ovr = float(np.clip(np.interp(all_stat_scores[i], stat_pcts, STAT_FALLBACK_TARGETS), 30.0, 78.0))
+        elif all_stat_scores[i] is not None:
+            # Stat-based fallback through FIXED anchors, cap at 78.
+            ovr = stat_fallback_to_ovr(all_stat_scores[i], pg)
             contrib = {"recruit_composite": round(float(row.get("recruit_composite") or 50.0), 2),
                        "stat_fallback": round(all_stat_scores[i], 4)}
         else:
@@ -1491,6 +1619,7 @@ def withhold_position(season: int, pg: str) -> list[dict]:
         "overall_rating":       None,
         "position_rating":      None,
         "rating_status":        "not_rated",
+        "rating_basis":         "withheld",
         "not_rated_reason":     reason,
         "trajectory_score":     0.0,
         "trajectory":           0.0,
@@ -1505,45 +1634,54 @@ def withhold_position(season: int, pg: str) -> list[dict]:
     return rows
 
 
-def rate_position(season: int, pg: str) -> list[dict]:
-    """Rate all players at a position for a given season.
+# The whole cross-season pool for one position, computed once per process.
+#
+# rate_position() rates EVERY season of a position and then returns one season of
+# it, and main() loops seasons on the outside — so a --all-seasons run did the same
+# work 19 times per position, 228 rebuilds of a frame assembled by a Python loop
+# over a quarter of a million rows. v4.3 cached the raw TABLES underneath this;
+# the quadratic part is here.
+#
+# Cacheable because nothing in it depends on the requested season: edge_to_ovr()
+# accepts a `season` argument and never reads it (EDGE_OVR_ANCHORS has no era
+# buckets, whatever FORMULAS.md says — get_rating_era() is dead code), and the
+# only genuine era branch, the pre-2016 defensive CLASSIC system, keys off each
+# ROW's own season. Output is identical, which tests/test_export_contract.py's
+# ratings-diff gate checks rather than assumes.
+_POOL: dict[str, dict] = {}
 
-    Normalization is cross-season: percentile ranks are computed against the
-    full 2021-2025 starter population, so ratings are consistent across years.
-    A player rated 85 in 2021 is genuinely comparable to an 85 in 2025.
-    """
-    print(f"  {pg}...", end=" ", flush=True)
 
-    if pg in NOT_RATED_POSITIONS:
-        return withhold_position(season, pg)
+def _position_pool(pg: str) -> dict:
+    """{all_df, starter_df, ratings_map, contrib_map, basis_map, pos_avg} for a position."""
+    if pg in _POOL:
+        return _POOL[pg]
 
-    # Load ALL seasons together so percentile ranks are cross-season stable
     all_df = _load_seasons(ALL_SEASONS, pg)
     if all_df.empty:
-        print("no data")
-        return []
+        _POOL[pg] = {"all_df": all_df}
+        return _POOL[pg]
 
     all_starter_mask = all_df.apply(lambda r: is_starter(r, pg), axis=1)
     all_starter_df   = all_df[all_starter_mask]
     all_backup_df    = all_df[~all_starter_mask]
 
-    # Cross-season ratings_map: row_key -> float
     ratings_map: dict[str, float] = {}
     contrib_map: dict[str, dict]  = {}
-
-    edge_count = all_starter_df["edge_score"].notna().sum() if "edge_score" in all_starter_df.columns else 0
+    # What produced each number, tracked as it is produced rather than inferred
+    # afterwards. See TIER_RATING_BASIS.
+    basis_map: dict[str, str] = {}
 
     if len(all_starter_df) >= 5:
         if pg in EDGE_POSITIONS:
             # --- Direct edge_score → OVR mapping (no peer ranking) ---
-            raw_scores, contribs = compute_edge_ratings(all_starter_df, pg, season)
+            raw_scores, contribs = compute_edge_ratings(all_starter_df, pg)
             # raw_scores is already [30-99] for EDGE players, 0.0 for no-data players
             scaled = apply_games_confidence(raw_scores, all_starter_df, pg=pg)
-            # Print distribution of players with valid EDGE
             edge_ovrs = scaled[scaled > 0]
             if len(edge_ovrs) >= 5:
                 p = np.percentile(edge_ovrs, [10, 25, 50, 75, 90, 99])
-                print(f"\n    [edge OVR] p10={p[0]:.1f} p25={p[1]:.1f} p50={p[2]:.1f} p75={p[3]:.1f} p90={p[4]:.1f} p99={p[5]:.1f}", end=" ")
+                print(f"\n    [{pg} pool, all seasons] p10={p[0]:.1f} p25={p[1]:.1f} "
+                      f"p50={p[2]:.1f} p75={p[3]:.1f} p90={p[4]:.1f} p99={p[5]:.1f}", end=" ")
         else:
             # --- Stat composite + fixed anchors for OL/K/P ---
             raw_scores, contribs = compute_ratings(all_starter_df, pg)
@@ -1554,10 +1692,12 @@ def rate_position(season: int, pg: str) -> list[dict]:
             if scaled[i] > 0:   # 0.0 = no EDGE data → let fallback handle it
                 ratings_map[rkey] = float(scaled[i])
                 contrib_map[rkey] = contribs[i]
+                basis_map[rkey]   = "production"
     else:
         print(f"(only {len(all_starter_df)} starters across all seasons — fallback only) ", end="")
         for rkey, row in all_df.iterrows():
             ratings_map[rkey] = fallback_rating(int(row.get("stars", 0)))
+            basis_map[rkey]   = "recruiting"
 
     # Fallback for backups / low-snap players.
     # Sub-threshold players with high efficiency get a blended rating instead
@@ -1593,9 +1733,65 @@ def rate_position(season: int, pg: str) -> list[dict]:
                     blend = round(0.70 * base + 0.30 * eff_implied, 2)
                     ratings_map[rkey] = blend
                     contrib_map[rkey] = {"recruit_composite": 0.35, eff_col: 0.15}
+                    basis_map[rkey]   = "blended"
                     continue
         ratings_map[rkey] = base
         contrib_map[rkey] = {"recruit_composite": 0.5}
+        basis_map[rkey]   = "recruiting"
+
+    _POOL[pg] = {
+        "all_df": all_df, "starter_df": all_starter_df,
+        "ratings_map": ratings_map, "contrib_map": contrib_map,
+        "basis_map": basis_map, "pos_avg": pos_avg,
+    }
+    return _POOL[pg]
+
+
+def rating_basis_for(rkey: str, tier: str, basis_map: dict) -> str:
+    """What the published number is actually built from.
+
+    The tier decides how much of the formula survives apply_multi_tier_treatment,
+    so a production-path row that is tiered below starter is genuinely a blend and
+    a bench-tiered one is genuinely just recruiting — whatever produced the value
+    that went in. `default` is the one honest answer left when a row reached
+    neither path and inherited the hard-coded 50.0 in rate_position(); it is
+    published rather than hidden because a fabricated average is exactly the trap
+    avg_top() was fixed for.
+    """
+    produced = basis_map.get(rkey)
+    if produced is None:
+        return "default"
+    if produced == "production":
+        return TIER_RATING_BASIS.get(tier, "production")
+    if tier == "bench":
+        return "recruiting"
+    return produced
+
+
+def rate_position(season: int, pg: str) -> list[dict]:
+    """Rate all players at a position for a given season.
+
+    Normalization is cross-season: the pool is every season of the position, so a
+    player rated 85 in 2021 is genuinely comparable to an 85 in 2025.
+    """
+    print(f"  {pg}...", end=" ", flush=True)
+
+    if pg in NOT_RATED_POSITIONS:
+        return withhold_position(season, pg)
+
+    pool = _position_pool(pg)
+    all_df = pool["all_df"]
+    if all_df.empty:
+        print("no data")
+        return []
+
+    all_starter_df = pool["starter_df"]
+    ratings_map    = pool["ratings_map"]
+    contrib_map    = pool["contrib_map"]
+    basis_map      = pool["basis_map"]
+    pos_avg        = pool["pos_avg"]
+
+    edge_count = all_starter_df["edge_score"].notna().sum() if "edge_score" in all_starter_df.columns else 0
 
     # --- Filter down to the requested season ---
     season_df = all_df[all_df["_season"] == season].copy()
@@ -1657,6 +1853,8 @@ def rate_position(season: int, pg: str) -> list[dict]:
             "shap_values":          json.dumps(contrib_map.get(rkey, {})),
             "model_version":        MODEL_VERSION,
             "engine":               "edge",
+            "rating_status":        "rated",
+            "rating_basis":         rating_basis_for(rkey, tier, basis_map),
             "_tier":                tier,   # stripped before upsert (not a DB column)
             "_pg":                  pg,     # stripped before upsert
         })
@@ -1791,35 +1989,44 @@ def main():
     seasons = list(range(2008, 2027)) if args.all_seasons else [args.season]
     positions = [args.position.upper()] if args.position else list(WEIGHTS.keys())
 
+    written = 0
     for season in seasons:
         print(f"\n-- Season {season} --")
         all_rows = []
         for pg in positions:
             all_rows.extend(rate_position(season, pg))
-        if all_rows:
-            print("\n  Validating distribution...")
-            validate_distribution(all_rows)
-            clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in all_rows]
+        if not all_rows:
+            continue
 
-            # Merge with any existing computed ratings (other seasons / engines)
-            existing = _computed_ratings()
-            new_df   = pd.DataFrame(clean_rows)
-            if not existing.empty:
-                # Drop rows being replaced (same player_season_id + season + engine)
-                mask = ~(
-                    existing["player_season_id"].isin(new_df["player_season_id"]) &
-                    existing["season"].isin(new_df["season"]) &
-                    existing["engine"].isin(new_df["engine"])
-                )
-                combined = pd.concat([existing[mask], new_df], ignore_index=True)
-            else:
-                combined = new_df
+        print("\n  Validating distribution...")
+        validate_distribution(all_rows)
+        clean_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in all_rows]
 
-            write_computed("ratings", combined)
-            # What was just written is what the next season must read.
-            global _RATINGS
-            _RATINGS = combined
-            print(f"  Wrote {len(clean_rows)} rows")
+        # Merge with any existing computed ratings (other seasons / engines)
+        existing = _computed_ratings()
+        new_df   = pd.DataFrame(clean_rows)
+        if not existing.empty:
+            # Drop rows being replaced (same player_season_id + season + engine)
+            mask = ~(
+                existing["player_season_id"].isin(new_df["player_season_id"]) &
+                existing["season"].isin(new_df["season"]) &
+                existing["engine"].isin(new_df["engine"])
+            )
+            combined = pd.concat([existing[mask], new_df], ignore_index=True)
+        else:
+            combined = new_df
+
+        # Held in memory across seasons and written once at the end. The merge
+        # above still runs per season because compute_trajectory() reads the
+        # previous season's ratings out of _RATINGS — but the 112 MB file does
+        # not need re-serialising nineteen times to make that true.
+        _RATINGS = combined
+        written += len(clean_rows)
+        print(f"  {len(clean_rows)} rows staged")
+
+    if written:
+        write_computed("ratings", _RATINGS)
+        print(f"  Wrote {written} rows across {len(seasons)} season(s)")
 
     print("\nDone.")
 

@@ -126,6 +126,23 @@ MIN_COHORT_N  = 20      # below this a cohort cell is noise; fall back a level
 VARIANCE_LAMBDA = 0.5   # 50% inflation toward realised spread -- see header
 OVR_FLOOR, OVR_CEIL = 40.0, 99.0
 
+# ── Interval width per position (v4.5) ────────────────────────────────────
+# Intervals were one band per FAMILY: every defender got the same width whatever
+# position he played, and per-position coverage ranged from 72.8% (CB) to 84.6%
+# (DL) against an 80% target that only held in aggregate.
+#
+# The first attempt scaled the family band by sqrt(1 - reliability) per position,
+# on the reasoning that an interval must carry the part of the target that is
+# measurement rather than player. It failed its own gate: CB 72.8 -> 80.1 and DB
+# 76.1 -> 80.8, but S 75.5 -> 68.8, LB 84.0 -> 72.6, TE 83.1 -> 93.5, and mean
+# |coverage - 80| across positions went 3.2 -> 5.9 points. Reliability bounds what
+# a rating can KNOW; it does not describe how a projection of it ERRS. Recorded in
+# ALTERNATIVES.md §D8 rather than kept as dead code.
+#
+# What ships instead asks the data directly: residual quantiles measured per
+# (position, rating bucket), falling back to the family when a cell is thin.
+MIN_QUANTILE_CELL = 60   # below this a per-position tail is noise; use the family's
+
 BREAKOUT_VS_COHORT =  3.0
 DECLINE_VS_COHORT  = -3.0
 
@@ -860,6 +877,12 @@ def find_comparables(row, pool: pd.DataFrame, k: int = 3) -> list:
 # Main
 # ---------------------------------------------------------------------------
 
+def _q(quantiles: dict, position: str, bucket: int) -> float:
+    """This position's residual quantile at this rating level, else the family's."""
+    v = quantiles.get((position, bucket))
+    return float(v) if v is not None else float(quantiles[("*", bucket)])
+
+
 def _between(s, rng):
     return s.between(rng[0], rng[1])
 
@@ -995,37 +1018,85 @@ def main() -> None:
         k  = 1.0 + VARIANCE_LAMBDA * (float(np.std(tr_act)) / float(np.std(tr_pred)) - 1.0)
         cal = lambda p, mu=mu, k=k: np.clip(mu + k * (p - mu), OVR_FLOOR, OVR_CEIL)
 
+        # Interval quantiles per (position, rating bucket), falling back to the
+        # family when a cell is too thin to estimate a tail from.
+        #
+        # v4.5 replaces a family-wide band. The reason a corner's interval should
+        # differ from a quarterback's is right; the reliability-derived scaling
+        # first tried for it was wrong, and measurably so — it fixed CB (72.8% ->
+        # 80.1%) and DB (76.1% -> 80.8%) while breaking S (75.5% -> 68.8%), LB
+        # (84.0% -> 72.6%) and TE (83.1% -> 93.5%). Mean absolute deviation from
+        # the 80% target went 3.2 -> 5.9 points. Reliability bounds what a rating
+        # can know; it does not predict how a projection of it errs, and those are
+        # different quantities however closely related they sound.
+        #
+        # Residual quantiles measured per position ask the data the question
+        # directly instead of routing it through a proxy.
         va_pred = cal(m.predict(f_va[feats].values.astype(float))) if len(f_va) else np.array([])
         lo_q, hi_q = {}, {}
         if len(va_pred):
             va_res = f_va["next_ovr"].values.astype(float) - va_pred
             va_bkt = np.clip((va_pred // 10).astype(int), 4, 9)
+            va_pos = f_va["position_group"].values
             for b in range(4, 10):
-                r = va_res[va_bkt == b]
-                if len(r) < 50: r = va_res
-                lo_q[b], hi_q[b] = float(np.percentile(r, 10)), float(np.percentile(r, 90))
+                fam_r = va_res[va_bkt == b]
+                if len(fam_r) < 50:
+                    fam_r = va_res
+                lo_q[("*", b)] = float(np.percentile(fam_r, 10))
+                hi_q[("*", b)] = float(np.percentile(fam_r, 90))
+                for p in sorted(set(va_pos)):
+                    r = va_res[(va_bkt == b) & (va_pos == p)]
+                    if len(r) < MIN_QUANTILE_CELL:
+                        r = va_res[va_pos == p]
+                    if len(r) < MIN_QUANTILE_CELL:
+                        continue          # too thin at this position: use family
+                    lo_q[(p, b)] = float(np.percentile(r, 10))
+                    hi_q[(p, b)] = float(np.percentile(r, 90))
         else:
-            for b in range(4, 10): lo_q[b], hi_q[b] = -9.0, 9.0
+            for b in range(4, 10):
+                lo_q[("*", b)], hi_q[("*", b)] = -9.0, 9.0
 
         metrics = {}
         if len(f_te):
             te_cal = cal(m.predict(f_te[feats].values.astype(float)))
             te_act = f_te["next_ovr"].values.astype(float)
             te_cur = f_te["ovr"].values.astype(float)
+            te_pos = f_te["position_group"].values
             mae = lambda p: float(np.mean(np.abs(p - te_act)))
             b = np.clip((te_cal // 10).astype(int), 4, 9)
-            lo = te_cal + np.array([lo_q[i] for i in b])
-            hi = te_cal + np.array([hi_q[i] for i in b])
+            lo_flat = te_cal + np.array([lo_q[("*", i)] for i in b])
+            hi_flat = te_cal + np.array([hi_q[("*", i)] for i in b])
+            lo = te_cal + np.array([_q(lo_q, p, i) for p, i in zip(te_pos, b)])
+            hi = te_cal + np.array([_q(hi_q, p, i) for p, i in zip(te_pos, b)])
+            covered = (te_act >= lo) & (te_act <= hi)
             metrics = {
                 "n": int(len(f_te)),
                 "naive_mae": round(mae(te_cur), 2),
                 "model_mae": round(mae(te_cal), 2),
-                "coverage": round(float(((te_act >= lo) & (te_act <= hi)).mean() * 100), 1),
+                "coverage": round(float(covered.mean() * 100), 1),
+                "coverage_flat": round(float((((te_act >= lo_flat) & (te_act <= hi_flat))).mean() * 100), 1),
                 "sd_ratio": round(float(np.std(te_cal)) / float(np.std(te_act)), 3),
             }
             print(f"\n  {fam.upper()} holdout (n={metrics['n']}): "
                   f"naive {metrics['naive_mae']}  model {metrics['model_mae']}  "
                   f"coverage {metrics['coverage']}%  spread {metrics['sd_ratio']:.0%}")
+            # An aggregate coverage figure can hide two positions missing in
+            # opposite directions, which is the whole reason the widths moved.
+            print(f"    per position (target 80%, family-wide band in brackets):")
+            devs, devs_flat = [], []
+            for p in sorted(set(te_pos)):
+                msk = te_pos == p
+                if msk.sum() < 50:
+                    continue
+                cov_p = 100 * float(covered[msk].mean())
+                flat_p = 100 * float((((te_act >= lo_flat) & (te_act <= hi_flat)))[msk].mean())
+                devs.append(abs(cov_p - 80)); devs_flat.append(abs(flat_p - 80))
+                print(f"      {p:5s} n={int(msk.sum()):5d}  {cov_p:5.1f}%  [{flat_p:5.1f}%]")
+            if devs:
+                print(f"    mean |coverage - 80|: {np.mean(devs):.1f} pts "
+                      f"(family-wide band: {np.mean(devs_flat):.1f} pts)")
+                metrics["coverage_dev"] = round(float(np.mean(devs)), 2)
+                metrics["coverage_dev_flat"] = round(float(np.mean(devs_flat)), 2)
             if metrics["model_mae"] >= metrics["naive_mae"]:
                 print(f"  GATE FAILED ({fam}): {metrics['model_mae']} does not beat "
                       f"naive {metrics['naive_mae']}")
@@ -1134,8 +1205,10 @@ def main() -> None:
             "class_year":       int(row["class_year"]) if pd.notna(row["class_year"]) else None,
             "current_ovr":      round(float(row["ovr"]), 1),
             "predicted_ovr":    round(pred, 1),
-            "proj_low":         round(max(OVR_FLOOR, pred + fq["lo"][b]), 1),
-            "proj_high":        round(min(OVR_CEIL, pred + fq["hi"][b]), 1),
+            # Residual quantiles for THIS position at this rating level, not one
+            # band for the whole family. See the note where lo_q is built.
+            "proj_low":         round(max(OVR_FLOOR, pred + _q(fq["lo"], row["position_group"], b)), 1),
+            "proj_high":        round(min(OVR_CEIL, pred + _q(fq["hi"], row["position_group"], b)), 1),
             "delta":            round(pred - float(row["ovr"]), 1),
             "cohort_expected":  round(float(row["cohort_next"]), 1),
             "cohort_n":         int(row["cohort_n"]),
