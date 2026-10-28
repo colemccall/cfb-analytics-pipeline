@@ -596,3 +596,17 @@ No SP+, strength of schedule or strength of record. Backtest 2016-2025 (n 2,781 
 leave-one-season-out): winner 70.7% vs 62.5% for the rating alone and 56.8% home-always; margin error 13.12 vs 14.80;
 shuffled-results placebo 57.7%. A conference level is measured and switched off (0.1 point of gain).
 Reproduce: `python scripts/validate_rankings.py`.
+
+## v4.14 additions (no formula changed)
+
+- **Postseason in the exports.** `schedules_{season}.json` already carried bowl and playoff games; each row now also has
+  `venue`. `power_games_{season}.json` lists a team's postseason games after its regular-season ones with `post: true`;
+  they are **not** in the results part (`results_games` counts the regular-season rows only; guarded by
+  `tests/test_export_contract.py::TestPostseason`). How a postseason game should weigh is for the strength model to measure.
+- **Team stats already include the postseason.** CFBD `/stats/season` aggregates both: in 2025, 74 of 74 teams that played a
+  postseason game have `games` equal to all their games, none equal to their regular-season games only.
+- **Standings stay regular season.** `computeStandings` keeps `w`/`l` regular-season and adds `pw`/`pl` for the postseason;
+  Team History's record counts every game.
+- **Cards.** `cards/NNNN.json` (script 12 `export_player_cards`): `NNNN = player_id % 1024`; the grid's rows unchanged,
+  `logo_url` dropped, oldest season first. `CONFIG.CARD_SHARDS` must equal the script's `CARD_SHARDS`.
+- **Headshots.** `scripts/19_harvest_headshots.py` matches by school and normalised name; see the Build Log entry for the rate.

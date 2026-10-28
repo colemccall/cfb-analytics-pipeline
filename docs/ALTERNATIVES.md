@@ -243,3 +243,19 @@ projections only — labelled through `projection_source`.
 | SP+, SOS, SOR | Rejected by choice | Outside numbers; the owner suspects they inflate the SEC and Big Ten |
 | Win-loss record first | Rejected unbuilt | A margin cap of 7 (near win/loss) scored 69.1% vs 70.0% |
 | Explain Liberty by opponent-blind team stats | Ruled out | The team-stat rating sits 12-13 points under the roster rating for every group alike |
+
+## v4.14 - cards, postseason, photos, and how strength should be scored
+
+| Option | Status | Why |
+|---|---|---|
+| Hub as the front door, League tab the default | Rejected | Opens on one tab of a team-centred screen; no Dynasty group for anyone who does not follow a team |
+| Read a card from every season's players file (the old way) | Replaced | Opening one card downloaded 82-93 MB over 15-16 requests (the classic modal 19 files, about 200 MB). A per-player shard is about 0.2 MB. Cost: 194 MB added to data/ |
+| Trim the card shards (drop not_rated_reason, class_year_basis, projection_confidence) | Not done | About 10% of 194 MB for fields the card uses; not worth a second format |
+| Betting lines as a SCORER for ratings | Rejected by the owner | The goal is to separate teams, not to match the market; a rating fitted to a line is the line. Lines are never an input either |
+| Ship a per-game log on the card | Not done | 744,359 game-level stat rows; no compact shard was built or sized. Deferred, not rejected |
+| Count the postseason in power now | Not done | Bowls are listed beside power and left out of the sum until the strength model measures how a postseason game should weigh (opt-outs, motivation) |
+| Photos copied into the repo | Rejected | Linked from ESPN's image host instead; the owner chose "try ESPN, measure first" |
+| Photos for every season's players | Not possible | ESPN lists the current roster, so a player who has left has none |
+| Count the postseason as evidence for next season's strength | Measured, no gain | Season s power predicting s+1: winner 66.3% / MAE 14.06 without bowls and playoff, 65.8% / 14.03 with (2016-2024, 4,971 games). The postseason is 5.2% of FBS-vs-FBS games and 16.7% of cross-conference ones |
+| Predict bowl games from regular-season results | Measured, worse than the rating | 485 games: rating alone 66.0% / 12.82, power 59.8% / 13.11 |
+| A results-leaning power (cap 7, bonus 16) | Measured, not adopted | 69.3% / 13.51 against 70.7% / 13.12; across 60 settings 67.6-70.7%. Puts Kentucky 6th over LSU 11th in 2026 through week 8. The owner's call: what the ranking is for |

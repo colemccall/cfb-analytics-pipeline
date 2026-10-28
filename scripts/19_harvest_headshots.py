@@ -127,6 +127,8 @@ def espn_team_ids(teams: list, refresh: bool):
 
 
 def main() -> None:
+    """Fetch (or read from the cache) ESPN's team list and rosters, match athletes to our 2026 roster players, print the
+    report and write data/headshots.json."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--refresh", action="store_true", help="ask ESPN again instead of using the cache")
     args = ap.parse_args()
