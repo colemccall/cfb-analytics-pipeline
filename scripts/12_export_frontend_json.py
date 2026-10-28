@@ -638,6 +638,9 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             "results_rating":   _f(r.get("results_rating")),
             "results_games":    _i(r.get("results_games")),
             "power_rating":     _f(r.get("power_rating")),
+            "rating_part":      _f(r.get("rating_part")),
+            "conf_part":        _f(r.get("conf_part")),
+            "home_edge":        _f(r.get("home_edge")),
             "school":           r.get("school"),
             "conference":       season_conf(r.get("team_id"), r.get("season"), r.get("conference")),
             "color":            r.get("color"),
@@ -663,6 +666,9 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             row["live_power_rating"]   = _f(lrow.get("power_rating"))
             row["live_results_rating"] = _f(lrow.get("results_rating"))
             row["live_results_games"]  = _i(lrow.get("results_games"))
+            row["live_rating_part"]    = _f(lrow.get("rating_part"))
+            row["live_conf_part"]      = _f(lrow.get("conf_part"))
+            row["live_home_edge"]      = _f(lrow.get("home_edge"))
             row["live_through_week"]   = lt.get("through_week")
         rows.append(row)
 
@@ -1466,6 +1472,64 @@ def export_research(T: dict, output_dir: Path) -> None:
 ALL_SEASONS = list(range(2008, CURRENT_SEASON + 1))
 
 
+POWER_GAMES_FIRST_SEASON = 2016   # power_games_{season}.json is exported from here on (and for a season in progress)
+
+
+def export_power_games(T: dict, output_dir: Path, season: int) -> None:
+    """Write power_games_{season}.json: for each team, every game that went into its power rating.
+
+    This is the explanation of the ranking. Each entry is one regular-season game between two FBS
+    teams, from the team's side: what it was worth (the margin capped at +-28 plus 8 for a win or
+    minus 8 for a loss), what the two teams' ratings expected it to be worth, and the difference
+    (`over`). A team's results part is roughly the average of its `over` values, shrunk toward 0 for
+    few games. Seasons before POWER_GAMES_FIRST_SEASON are not exported.
+    """
+    from utils.results_rating import expected_value, game_value
+
+    if season < POWER_GAMES_FIRST_SEASON and season not in T["live_teams"]:
+        return
+    parts: dict = {}
+    home_edge = 0.0
+    lt = T["live_teams"].get(season)
+    if lt:
+        for tid, lrow in lt.get("teams", {}).items():
+            if lrow.get("rating_part") is not None:
+                parts[int(tid)] = {"rating_part": lrow["rating_part"], "conf_part": lrow.get("conf_part") or 0.0}
+                home_edge = lrow.get("home_edge") or home_edge
+    else:
+        tr = T["team_ratings"]
+        rows = tr[(tr["season"] == season) & (tr["engine"].fillna("edge") != "projected")] if "engine" in tr.columns else tr[tr["season"] == season]
+        for _, r in rows.iterrows():
+            if _f(r.get("rating_part")) is not None:
+                parts[int(r["team_id"])] = {"rating_part": float(r["rating_part"]), "conf_part": float(r.get("conf_part") or 0.0)}
+                home_edge = _f(r.get("home_edge")) or home_edge
+    games = T["games"]
+    if not parts or games.empty:
+        return
+    names = dict(zip(T["teams"]["id"], T["teams"]["school"]))
+    g = games[(games["season"] == season) & (games["season_type"] == "regular")]
+    out: dict = {}
+    for _, x in g.iterrows():
+        h, a = _i(x.get("home_team_id")), _i(x.get("away_team_id"))
+        hs, as_ = _i(x.get("home_score")), _i(x.get("away_score"))
+        if h not in parts or a not in parts or hs is None or as_ is None:
+            continue
+        neutral = bool(x.get("neutral_site") == True)   # noqa: E712
+        exp_home = expected_value(parts[h], parts[a], home_edge, neutral)
+        m = float(hs - as_)
+        for tid, opp, sign, is_home, sc, osc in ((h, a, 1.0, True, hs, as_), (a, h, -1.0, False, as_, hs)):
+            val = game_value(sign * m)
+            exp = sign * exp_home
+            out.setdefault(str(tid), []).append({
+                "week": _i(x.get("week")), "opp_id": opp, "opp": names.get(opp), "home": is_home and not neutral,
+                "neutral": neutral, "score": sc, "opp_score": osc, "margin": int(sign * m),
+                "value": round(val, 1), "expected": round(exp, 1), "over": round(val - exp, 1),
+            })
+    for tid in out:
+        out[tid].sort(key=lambda e: (e["week"] is None, e["week"] or 0))
+    write_json(output_dir / f"power_games_{season}.json", out)
+
+
 def main():
     """CLI entry point: export every season (ALL_SEASONS) or --season N into
     --output (default: the sibling app's data/).
@@ -1535,6 +1599,9 @@ def main():
 
         print(f"  team_stats_{season}.json...")
         export_team_stats(T, output_dir, season)
+
+        print(f"  power_games_{season}.json...")
+        export_power_games(T, output_dir, season)
 
     print("\nDone.")
 

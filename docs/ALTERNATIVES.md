@@ -232,3 +232,14 @@ projections only — labelled through `projection_source`.
 | Keep SP+ at half the headline | Rejected | Fits and predicts better (0.884/0.545 vs 0.880/0.518) but is an outside number; the owner's rule is each season's rating from its own players and stats. The cost is published |
 | Any smaller SP+ weight | Rejected unbuilt | Still an outside number in the headline |
 | Re-weighting the QB interception penalty to fit one player | Not done | One player is a reason to look at data, not at a weight; calibration needs a backtest |
+
+## v4.13 - power
+
+| Option | Status | Why |
+|---|---|---|
+| Rank by the team rating alone | Rejected | Ignores results: LSU first with two losses, Kansas State eighth at 3-3 |
+| Results from zero (no rating prior) | Rejected | 70.4% / 13.37 vs 70.7% / 13.12; credits a weak conference's wins as if its opponents were average |
+| Measured conference level | Rejected, kept off | 0.1 point of gain; +9.7 for every SEC team on 8 weeks of data |
+| SP+, SOS, SOR | Rejected by choice | Outside numbers; the owner suspects they inflate the SEC and Big Ten |
+| Win-loss record first | Rejected unbuilt | A margin cap of 7 (near win/loss) scored 69.1% vs 70.0% |
+| Explain Liberty by opponent-blind team stats | Ruled out | The team-stat rating sits 12-13 points under the roster rating for every group alike |

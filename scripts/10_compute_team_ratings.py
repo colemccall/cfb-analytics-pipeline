@@ -45,7 +45,7 @@ load_dotenv()
 from utils.store import read_raw, read_computed, write_computed
 from utils.api_client import load_api_key, fetch_sp_ratings_breakdown, fetch_team_stats
 from utils.line_unit import line_unit_rating
-from utils.results_rating import srs_ratings, power_rating
+from utils.results_rating import power_components
 
 MODEL_VERSION = "v2.0-team"
 
@@ -811,27 +811,39 @@ def compute_team_splits(
 # Main per-season computation
 # ---------------------------------------------------------------------------
 
-def attach_power(rows: list, season: int, team_ids, with_results: bool = True) -> None:
-    """Adds results_rating, results_games and power_rating to each team row, in place.
+def attach_power(rows: list, season: int, teams, with_results: bool = True) -> None:
+    """Adds the power rating and its parts to each team row, in place.
 
-    The results rating is an opponent-adjusted margin rating from the season's regular-season
-    games between FBS teams (utils/results_rating.py); power ranks teams by quality AND results,
-    in points per game above an average team. A projected season has no games, so it passes
-    with_results=False and is ranked on quality alone.
+    power = rating part + conference part + results part (utils/results_rating.py), in points per
+    game above an average FBS team. `teams` is load_teams()'s (id, school, conference) list; a team's
+    conference for the season comes from the harvested season records, falling back to its current
+    one. A projected season has no games, so it passes with_results=False and is ranked on its rating
+    part alone.
     """
-    results, counts = {}, {}
-    games = read_raw("games") if with_results else None
-    if games is not None and not games.empty:
-        g = games[(games["season"] == season) & (games["season_type"] == "regular")]
-        results, _, counts = srs_ratings(g.to_dict("records"), team_ids)
-    quals = [r["overall_rating"] for r in rows if r["overall_rating"] is not None]
-    mean_q = float(np.mean(quals)) if quals else None
+    cur_conf = {int(t[0]): t[2] for t in teams}
+    recs = read_raw("team_records")
+    season_conf = {}
+    if not recs.empty:
+        for r in recs[recs["season"] == season].dropna(subset=["team_id", "conference"]).itertuples():
+            season_conf[int(r.team_id)] = r.conference
+    conf_of = lambda t: season_conf.get(int(t)) or cur_conf.get(int(t))   # noqa: E731
+    quality = {int(r["team_id"]): r["overall_rating"] for r in rows if r["overall_rating"] is not None}
+    games = []
+    if with_results:
+        g = read_raw("games")
+        if not g.empty:
+            games = g[(g["season"] == season) & (g["season_type"] == "regular")].to_dict("records")
+    parts, info = power_components(games, quality, conf_of)
     for r in rows:
-        res = results.get(int(r["team_id"]))
-        r["results_rating"] = round(res, 2) if res is not None else None
-        r["results_games"] = int(counts.get(int(r["team_id"]), 0))
-        pw = power_rating(r["overall_rating"], res, mean_q)
-        r["power_rating"] = round(pw, 2) if pw is not None else None
+        p = parts.get(int(r["team_id"]))
+        r["power_rating"] = round(p["power"], 2) if p else None
+        r["rating_part"] = round(p["rating_part"], 2) if p else None
+        r["conf_part"] = round(p["conf_part"], 2) if p else None
+        r["results_rating"] = round(p["results_part"], 2) if p else None     # the results part
+        r["results_games"] = int(p["games"]) if p else 0
+        r["results_wins"] = int(p["wins"]) if p else 0
+        r["results_losses"] = int(p["losses"]) if p else 0
+        r["home_edge"] = round(info["home_edge"], 2)
 
 
 def run_season(season: int, api_key: str) -> None:
@@ -965,7 +977,7 @@ def run_season(season: int, api_key: str) -> None:
     for r in rows:
         seen[(r["team_id"], r["season"])] = r
     rows = list(seen.values())
-    attach_power(rows, season, {t[0] for t in teams})
+    attach_power(rows, season, teams)
 
     new_df = pd.DataFrame(rows)
     existing = read_computed("team_ratings")
@@ -1079,7 +1091,7 @@ def run_projected_season(season: int) -> None:
             "sub_ratings":      json.dumps(sub_ratings),
         })
 
-    attach_power(rows, season, {t[0] for t in teams}, with_results=False)
+    attach_power(rows, season, teams, with_results=False)
     new_df = pd.DataFrame(rows)
     existing = read_computed("team_ratings")
     if not existing.empty:

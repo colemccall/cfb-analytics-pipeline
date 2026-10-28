@@ -82,3 +82,16 @@ def test_recruiting_seasons_match_exported_files():
     assert _js_int_list("RECRUITING_SEASONS") == on_disk, (
         f"config.js RECRUITING_SEASONS {_js_int_list('RECRUITING_SEASONS')} != exported files {on_disk}"
     )
+
+
+def test_power_game_seasons_match_exported_files():
+    """POWER_GAME_SEASONS must list exactly the seasons with a power_games_{season}.json.
+
+    The Rankings screen asks for these to explain each ranking. One listed without a file is a 404;
+    a file not listed is an explanation the screen never shows.
+    """
+    on_disk = sorted(int(m.group(1)) for p in APP_DATA.glob("power_games_[0-9]*.json")
+                     if (m := re.fullmatch(r"power_games_(\d{4})\.json", p.name)))
+    assert _js_int_list("POWER_GAME_SEASONS") == on_disk, (
+        f"config.js POWER_GAME_SEASONS {_js_int_list('POWER_GAME_SEASONS')} != exported files {on_disk}"
+    )

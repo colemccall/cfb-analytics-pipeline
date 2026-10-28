@@ -579,3 +579,20 @@ SP+ is no longer an input (it was 0.50 of the headline and all of offense and de
 published as sp_overall / sp_offense / sp_defense. Measured on 2016-2025: same-season fit to scoring
 margin 0.884 to 0.880, next-season 0.545 to 0.518 (carry-forward 0.529), offense 0.847 to 0.806, defense
 0.857 to 0.827; shuffled-roster placebo 0.659. Conferences are per season from the harvested records.
+
+---
+
+## v4.13 - power (mirrors METHODS `power-rating`)
+
+```
+rating part  = 0.98 * (team rating - mean team rating)
+value(game)  = clip(margin, +-28) + 8 if won, - 8 if lost
+expected     = (rating part - opponent's rating part) +- home edge
+results part = ridge-shrunk (lambda 2) average of value - expected over the team's games
+power        = rating part + results part           (points per game vs an average FBS team)
+```
+
+No SP+, strength of schedule or strength of record. Backtest 2016-2025 (n 2,781 later games, week-8 cut,
+leave-one-season-out): winner 70.7% vs 62.5% for the rating alone and 56.8% home-always; margin error 13.12 vs 14.80;
+shuffled-results placebo 57.7%. A conference level is measured and switched off (0.1 point of gain).
+Reproduce: `python scripts/validate_rankings.py`.
