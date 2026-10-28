@@ -633,6 +633,11 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             "sp_offense":       _f(r.get("sp_offense")),
             "sp_defense":       _f(r.get("sp_defense")),
             "recruiting_score": _f(r.get("recruiting_score")),
+            # Ranking inputs (utils/results_rating.py): how well the team has done against its
+            # schedule, and the power rating that combines that with the team rating.
+            "results_rating":   _f(r.get("results_rating")),
+            "results_games":    _i(r.get("results_games")),
+            "power_rating":     _f(r.get("power_rating")),
             "school":           r.get("school"),
             "conference":       season_conf(r.get("team_id"), r.get("season"), r.get("conference")),
             "color":            r.get("color"),
@@ -655,6 +660,9 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             row["live_overall_rating"] = _f(lrow.get("overall_rating"))
             row["live_offense_rating"] = _f(lrow.get("offense_rating"))
             row["live_defense_rating"] = _f(lrow.get("defense_rating"))
+            row["live_power_rating"]   = _f(lrow.get("power_rating"))
+            row["live_results_rating"] = _f(lrow.get("results_rating"))
+            row["live_results_games"]  = _i(lrow.get("results_games"))
             row["live_through_week"]   = lt.get("through_week")
         rows.append(row)
 
