@@ -37,6 +37,7 @@ APP_DATA = Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"
 CLASS_YEARS = range(2020, 2027)
 TOP_N = 15           # recruits that count toward a class rank
 PROSPECTS = 400      # best recruits listed per class
+PLAYERS_PER_CLASS = 45   # commits listed per team (the state counts cover all of them)
 
 
 def _num(v):
@@ -83,8 +84,20 @@ def build_class(year: int, rec: pd.DataFrame, players: pd.DataFrame, teams: pd.D
     rows = []
     for tid, g in committed.groupby("committed_team_id"):
         best = g["composite_score"].dropna().sort_values(ascending=False).head(TOP_N)
+        g = g.sort_values(["composite_score"], ascending=False, na_position="last")
+        states = g["hometown_state"].dropna().astype(str).value_counts()
         rows.append({
             "team_id": int(tid), "team": school.get(tid), "commits": int(len(g)),
+            # The class itself, best first, and where it came from by state, for the team's
+            # recruiting screen and its map. Every matched commit is in `states`; the list is
+            # capped so a 40-man class does not bloat the file.
+            "states": {str(k): int(v) for k, v in states.items()},
+            "players": [{
+                "player_id": int(x["player_id"]), "name": _txt(x["name"]), "position": _txt(x.get("position")),
+                "stars": None if pd.isna(x["stars"]) else int(x["stars"]),
+                "national_rank": None if pd.isna(x["national_rank"]) else int(x["national_rank"]),
+                "composite": _num(x["composite_score"]), "state": _txt(x.get("hometown_state")),
+            } for _, x in g.head(PLAYERS_PER_CLASS).iterrows()],
             "five_stars": int((g["stars"] == 5).sum()), "four_stars": int((g["stars"] == 4).sum()),
             "avg_composite": round(float(g["composite_score"].mean()), 4) if g["composite_score"].notna().any() else None,
             "top_avg": round(float(best.mean()), 4) if len(best) >= TOP_N else None,

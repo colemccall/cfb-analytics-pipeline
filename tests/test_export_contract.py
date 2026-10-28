@@ -631,3 +631,63 @@ class TestRecruitingBoard:
         for c in self._classes():
             ranks = [p["national_rank"] for p in c["prospects"] if p["national_rank"] is not None]
             assert ranks == sorted(ranks), f"{c['year']}: prospects are not in rank order"
+
+
+class TestConferencePerSeason:
+    """A team's conference is the one it was in THAT season (v4.11).
+
+    teams.json carries only the current conference, so before this every season showed it:
+    Boise State read as Pac-12 in 2008. The truth is in the harvested season records.
+    """
+
+    RAW = Path(__file__).parent.parent / "data" / "raw" / "team_records.json"
+
+    def test_every_team_season_matches_its_season_record(self):
+        if not self.RAW.exists():
+            pytest.skip("team_records not harvested")
+        records = {(r["team_id"], r["season"]): r["conference"] for r in json.loads(self.RAW.read_text(encoding="utf-8"))
+                   if r.get("team_id") is not None and r.get("conference")}
+        rows = _load("team_ratings.json")
+        checked = wrong = 0
+        for r in rows:
+            want = records.get((r["team_id"], r["season"]))
+            if want is None:
+                continue
+            checked += 1
+            if r["conference"] != want:
+                wrong += 1
+        assert checked > 1000, "too few team-seasons checked to mean anything"
+        assert wrong == 0, f"{wrong} of {checked} team-seasons carry a conference other than their season's"
+
+    def test_boise_state_was_not_always_in_the_pac_12(self):
+        rows = {r["season"]: r["conference"] for r in _load("team_ratings.json") if r["school"] == "Boise State"}
+        assert rows[2009] == "Western Athletic"
+        assert rows[2015] == "Mountain West"
+        assert rows[2026] == "Pac-12", "the season being played falls back to the current conference"
+
+
+class TestRecruitingClassDetail:
+    """recruiting_{year}.json carries each team's class and where it came from (for the map)."""
+
+    def test_state_counts_cover_the_matched_commits_and_the_list_is_best_first(self):
+        files = sorted(APP_DATA.glob("recruiting_[0-9]*.json"))
+        if not files:
+            pytest.skip("no recruiting_{year}.json exported")
+        for p in files:
+            c = json.loads(p.read_text(encoding="utf-8"))
+            for t in c["teams"]:
+                assert sum(t["states"].values()) <= t["commits"], f"{c['year']} {t['team']}: more states than commits"
+                comps = [x["composite"] for x in t["players"] if x["composite"] is not None]
+                assert comps == sorted(comps, reverse=True), f"{c['year']} {t['team']}: class list not best first"
+                assert len(t["players"]) <= min(t["commits"], 45)
+
+
+class TestTransferHomeState:
+    def test_every_transfer_row_carries_a_home_state_field(self):
+        files = sorted(APP_DATA.glob("transfers_[0-9]*.json"))
+        if not files:
+            pytest.skip("no transfers exported")
+        for p in files:
+            for rows in json.loads(p.read_text(encoding="utf-8")).values():
+                for t in rows:
+                    assert "hometown_state" in t, f"{p.name}: a transfer row lacks hometown_state"

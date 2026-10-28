@@ -52,10 +52,10 @@ MODEL_VERSION = "v2.0-team"
 # Weight constants
 # ---------------------------------------------------------------------------
 
-# The headline blend is W_SP_BLEND / W_ROSTER_BLEND / W_STATS_BLEND, below. The
-# W_SP = 0.45 / W_ROSTER = 0.30 / W_RAW = 0.25 that used to sit here were never
-# read by anything, and disagreed with the live 0.50 / 0.30 / 0.20 — removed
-# 2026-09-23 so the first weights a reader finds are the ones that run.
+# The headline blend is W_ROSTER_BLEND / W_STATS_BLEND, below: a team is rated on its
+# own players' ratings and its own team stats from THAT season, nothing external.
+# Until v4.11 it was 0.50 SP+ / 0.30 roster / 0.20 stats; SP+ is now published beside
+# the rating as a reference column (sp_overall) and no longer feeds it.
 
 # Split weights within roster signal
 W_QB   = 0.45;  W_WR_TE = 0.35;  W_OL = 0.20   # pass_off
@@ -154,9 +154,8 @@ def roster_to_ovr(mean_top: float) -> float:
 # The third was missing entirely: team stats were harvested into
 # team_season_stats.json by this very script and then never read, while
 # W_SP/W_ROSTER/W_RAW sat declared and unused. Sum must equal 1.0.
-W_SP_BLEND     = 0.50
-W_ROSTER_BLEND = 0.30
-W_STATS_BLEND  = 0.20
+W_ROSTER_BLEND = 0.60
+W_STATS_BLEND  = 0.40
 
 # Team-stat anchors. Absolute values, not percentiles of the season, so a weak
 # year does not manufacture a great defense — the same rule the player anchors
@@ -179,15 +178,15 @@ W_YDS, W_THIRD = 0.65, 0.35          # within offense
 W_YDS_D, W_THIRD_D, W_HAVOC_D = 0.50, 0.25, 0.25   # within defense
 
 
-def team_stats_to_ovr(stats: dict | None) -> float | None:
-    """What a team's own box score says about it, on the OVR scale.
+def team_stats_split(stats: dict | None):
+    """A team's own box score as (offense OVR, defense OVR, turnover adjustment).
 
-    Opponent-blind by construction — that is precisely why it is only one of
-    three inputs. SP+ carries the schedule adjustment; this carries the fact
-    that the team actually moved the ball.
+    Each is None when its inputs are missing, and the adjustment is 0.0 without a turnover
+    margin. Opponent-blind by construction. team_stats_to_ovr() averages the two halves
+    and adds the adjustment; the offense and defense ratings read the halves directly.
     """
     if not stats:
-        return None
+        return None, None, 0.0
 
     def val(key):
         v = stats.get(key)
@@ -200,30 +199,40 @@ def team_stats_to_ovr(stats: dict | None) -> float | None:
     to, td = val("third_down_pct"), val("third_down_def_pct")
     sk, tf = val("sacks_pg"), val("tfl_pg")
     if yo is None and yd is None:
-        return None
+        return None, None, 0.0
 
-    parts, weights = [], []
+    off = dfn = None
     if yo is not None or to is not None:
-        off, w = 0.0, 0.0
-        if yo is not None: off += _interp_anchors(yo, YARDS_OFF_ANCHORS) * W_YDS;   w += W_YDS
-        if to is not None: off += _interp_anchors(to, THIRD_OFF_ANCHORS) * W_THIRD; w += W_THIRD
-        if w > 0: parts.append(off / w); weights.append(W_STAT_OFF)
+        tot, w = 0.0, 0.0
+        if yo is not None: tot += _interp_anchors(yo, YARDS_OFF_ANCHORS) * W_YDS;   w += W_YDS
+        if to is not None: tot += _interp_anchors(to, THIRD_OFF_ANCHORS) * W_THIRD; w += W_THIRD
+        if w > 0: off = tot / w
     if yd is not None or td is not None or sk is not None:
-        dfn, w = 0.0, 0.0
-        if yd is not None: dfn += _interp_anchors(yd, YARDS_DEF_ANCHORS) * W_YDS_D;   w += W_YDS_D
-        if td is not None: dfn += _interp_anchors(td, THIRD_DEF_ANCHORS) * W_THIRD_D; w += W_THIRD_D
+        tot, w = 0.0, 0.0
+        if yd is not None: tot += _interp_anchors(yd, YARDS_DEF_ANCHORS) * W_YDS_D;   w += W_YDS_D
+        if td is not None: tot += _interp_anchors(td, THIRD_DEF_ANCHORS) * W_THIRD_D; w += W_THIRD_D
         if sk is not None or tf is not None:
-            dfn += _interp_anchors((sk or 0) + (tf or 0), HAVOC_ANCHORS) * W_HAVOC_D
+            tot += _interp_anchors((sk or 0) + (tf or 0), HAVOC_ANCHORS) * W_HAVOC_D
             w += W_HAVOC_D
-        if w > 0: parts.append(dfn / w); weights.append(W_STAT_DEF)
+        if w > 0: dfn = tot / w
+    tm = val("turnover_margin")
+    adj = _interp_anchors(tm, TO_MARGIN_ANCHORS) if tm is not None else 0.0
+    return off, dfn, adj
+
+
+def team_stats_to_ovr(stats: dict | None) -> float | None:
+    """What a team's own box score says about it, on the OVR scale.
+
+    Opponent-blind by construction, which is why it is one input among several and the
+    roster's opponent-adjusted player ratings carry the schedule.
+    """
+    off, dfn, adj = team_stats_split(stats)
+    parts, weights = [], []
+    if off is not None: parts.append(off); weights.append(W_STAT_OFF)
+    if dfn is not None: parts.append(dfn); weights.append(W_STAT_DEF)
     if not parts:
         return None
-
-    base = float(np.average(parts, weights=weights))
-    tm = val("turnover_margin")
-    if tm is not None:
-        base += _interp_anchors(tm, TO_MARGIN_ANCHORS)
-    return float(base)
+    return float(np.average(parts, weights=weights)) + adj
 
 
 def _clip(val: float) -> float:
@@ -707,15 +716,20 @@ def compute_team_splits(
     recruiting_scaledcaled: float | None,
     line_rating: float | None = None,
 ) -> dict | None:
-    """SP+-anchored overall/offense/defense (0-99), blended with roster talent.
+    """Overall/offense/defense (0-99) from the season's own player ratings and team stats.
+
+    Headline = 0.60 roster talent + 0.40 the team's own stats; offense and defense are the
+    same blend over the offensive and defensive halves. `sp` (SP+) is accepted but no longer
+    an input: it is published beside the rating as a reference. The same function rates a
+    played season, a season in progress and, with no stats, a projected one.
 
     sub_ratings (pass_off/run_off/pass_def/run_def) come from position-weighted
     roster splits — these drive the detail bars, not the headline OVR.
 
-    Returns None when the team has no SP+, no roster and no team stats — there is
+    Returns None when the team has no roster rating and no team stats — there is
     no rating to give, and saying 50.0 is a claim we cannot support.
     """
-    # --- Headline ratings: three readings of the same team, blended ---
+    # --- Headline ratings: two readings of the same season, blended ---
     # Roster talent = mean of the team's top-22 starter OVRs across all positions.
     all_starter_ovrs = [r for ratings in roster_by_pos.values() for r in ratings]
     mean_top22 = (float(np.mean(sorted(all_starter_ovrs, reverse=True)[:22]))
@@ -739,31 +753,29 @@ def compute_team_splits(
                       + roster_to_ovr(weighted) * W_ROSTER_WEIGHTED)
     else:
         roster_ovr = None
-    stats_ovr  = team_stats_to_ovr(team_stats)
+    stats_ovr = team_stats_to_ovr(team_stats)
 
-    if sp is not None:
-        sp_ovr = sp_overall_to_ovr(sp["overall"])
-        off    = sp_offense_to_ovr(sp["offense"])
-        def_rating   = sp_defense_to_ovr(sp["defense"])
-        # Renormalize over whichever signals exist so a missing one shifts the
-        # weight rather than silently dragging the rating toward zero.
-        pairs = [(sp_ovr, W_SP_BLEND)]
-        if roster_ovr is not None: pairs.append((roster_ovr, W_ROSTER_BLEND))
-        if stats_ovr  is not None: pairs.append((stats_ovr,  W_STATS_BLEND))
-        wsum = sum(w for _, w in pairs)
-        overall = sum(v * w for v, w in pairs) / wsum
-    elif roster_ovr is not None or stats_ovr is not None:
-        # No SP+ (e.g. FCS / unmatched, or a season not yet played).
-        pairs = [(v, w) for v, w in ((roster_ovr, W_ROSTER_BLEND), (stats_ovr, W_STATS_BLEND))
-                 if v is not None]
-        overall = sum(v * w for v, w in pairs) / sum(w for _, w in pairs)
-        off = def_rating = overall
-    else:
-        # No SP+, no roster, no stats. There is nothing to rate. Returning 50.0
-        # here published a placeholder indistinguishable from a real average team
-        # — and for an unplayed season that is *every* team, which then collided
-        # with the projected rows written later. The caller drops these.
+    def _mix(pairs):
+        pairs = [(v, w) for v, w in pairs if v is not None]
+        return sum(v * w for v, w in pairs) / sum(w for _, w in pairs) if pairs else None
+
+    overall = _mix([(roster_ovr, W_ROSTER_BLEND), (stats_ovr, W_STATS_BLEND)])
+    if overall is None:
+        # No roster rating and no team stats: nothing of THIS season to rate. SP+ is not a
+        # substitute any more, and 50.0 would be a placeholder indistinguishable from a
+        # real average team.
         return None
+
+    # Offense and defense are the same two readings, split: the roster's offensive and
+    # defensive position groups (through the roster scale) and the team's own offensive
+    # and defensive stats. When one side has no input the headline stands in for it.
+    st_off, st_def, _ = team_stats_split(team_stats)
+    r_off = blend([(ros["pass_off"], W_PASS_OFF), (ros["run_off"], W_RUN_OFF)])
+    r_def = blend([(ros["pass_def"], W_PASS_DEF), (ros["run_def"], W_RUN_DEF)])
+    off = _mix([(roster_to_ovr(r_off) if r_off is not None else None, W_ROSTER_BLEND), (st_off, W_STATS_BLEND)])
+    def_rating = _mix([(roster_to_ovr(r_def) if r_def is not None else None, W_ROSTER_BLEND), (st_def, W_STATS_BLEND)])
+    off = overall if off is None else off
+    def_rating = overall if def_rating is None else def_rating
 
     # --- Detail splits: position-weighted roster quality (drives the bars) ---
     # Blend roster splits toward the SP+ offense/defense headline so bars track
@@ -812,13 +824,6 @@ def run_season(season: int, api_key: str) -> None:
     data/computed/team_ratings.json before the new rows are added, so a team
     that no longer qualifies disappears instead of lingering as a stale row.
     Projected rows (engine="projected") are left alone.
-
-    Ordering defect, found 2026-09-23 and not yet fixed: `tss_map` is read
-    from data/computed/team_season_stats BEFORE store_team_season_stats()
-    refreshes it for this season (the inline comment says "above"; the call is
-    below). Each run therefore blends the previous run's per-game stats, and a
-    season's first run blends none. Fixing it moves team ratings, so it needs
-    its own measured pass rather than a drive-by edit.
     """
     print(f"\n{'='*60}")
     print(f"Computing Team Ratings v2 - Season {season}")
@@ -845,14 +850,15 @@ def run_season(season: int, api_key: str) -> None:
     # Per-game team stats, written by store_team_season_stats above. These feed
     # the headline blend directly — they used to be persisted for the frontend
     # and never read back into the rating.
+    # Refreshed BEFORE they are read: this was the other way round until v4.11, so a season's
+    # first run blended no per-game stats at all and later runs blended the previous run's.
+    print("Storing display team stats...")
+    store_team_season_stats(season, api_key, teams)
     _tss = read_computed("team_season_stats")
     tss_map = ({int(r["team_id"]): r.to_dict()
                 for _, r in _tss[_tss["season"] == season].iterrows()}
                if not _tss.empty else {})
     print(f"  {len(tss_map)} teams have per-game season stats")
-
-    print("Storing display team stats...")
-    store_team_season_stats(season, api_key, teams)
 
     print("Rating offensive lines as units...")
     line_map = build_line_unit_ratings(season, build_team_stat_table(season, api_key), teams)

@@ -224,3 +224,11 @@ projections only — labelled through `projection_source`.
 | Class rank by total composite points | ❌ Rejected | Rewards class size over quality |
 | Class rank by average stars | ❌ Rejected | Five coarse buckets; the composite separates a high four-star from a low one |
 | Landing the class year through scripts 07/15/16 | ❌ Not run | Can move ratings; its own measured pass. Script 12 derives it without touching a rating |
+
+## v4.11 - team ratings
+
+| Option | Status | Why |
+|---|---|---|
+| Keep SP+ at half the headline | Rejected | Fits and predicts better (0.884/0.545 vs 0.880/0.518) but is an outside number; the owner's rule is each season's rating from its own players and stats. The cost is published |
+| Any smaller SP+ weight | Rejected unbuilt | Still an outside number in the headline |
+| Re-weighting the QB interception penalty to fit one player | Not done | One player is a reason to look at data, not at a weight; calibration needs a backtest |

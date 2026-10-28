@@ -1,8 +1,9 @@
 """Tests for team rating composition (script 10).
 
-A team rating blends three readings of the same team — SP+, our own player
-ratings, and team stats — renormalizing over whichever exist. Two of those are
-absent for a season that has not been played, which is where this went wrong:
+A team rating blends two readings of the SAME season — our own player ratings and
+the team's own stats — renormalizing over whichever exist. SP+ is a reference column
+and no longer an input (v4.11). Both are absent for a season that has not been played,
+and the stats are absent for a projected one, which is where this once went wrong:
 the no-signal fallback published 50.0 for every FBS team in 2026, and those
 placeholders then sat alongside the projected rows written later, giving 138
 teams two ratings each.
@@ -21,7 +22,6 @@ _spec.loader.exec_module(_s10)
 
 compute_team_splits = _s10.compute_team_splits
 team_stats_to_ovr   = _s10.team_stats_to_ovr
-W_SP_BLEND          = _s10.W_SP_BLEND
 W_ROSTER_BLEND      = _s10.W_ROSTER_BLEND
 W_STATS_BLEND       = _s10.W_STATS_BLEND
 
@@ -48,19 +48,32 @@ def _stats(good=True):
 
 
 class TestBlendWeights:
-    def test_the_three_weights_are_a_whole(self):
-        assert W_SP_BLEND + W_ROSTER_BLEND + W_STATS_BLEND == pytest.approx(1.0)
+    def test_the_two_weights_are_a_whole(self):
+        assert W_ROSTER_BLEND + W_STATS_BLEND == pytest.approx(1.0)
 
-    def test_sp_carries_the_most_weight(self):
-        """SP+ is the only one of the three that already knows the results."""
-        assert W_SP_BLEND > W_ROSTER_BLEND > W_STATS_BLEND
+    def test_sp_plus_does_not_move_the_rating(self):
+        """The rating is built from the season's own players and stats. A wildly different
+        SP+ must change nothing, or an outside number is back in the headline."""
+        hi = compute_team_splits(1, {"overall": 30.0, "offense": 40.0, "defense": 30.0}, _roster(), _stats(True), SP_MEANS, 0.9)
+        lo = compute_team_splits(1, {"overall": -20.0, "offense": -10.0, "defense": -20.0}, _roster(), _stats(True), SP_MEANS, 0.9)
+        none = compute_team_splits(1, None, _roster(), _stats(True), SP_MEANS, 0.9)
+        for k in ("overall_rating", "offense_rating", "defense_rating"):
+            assert hi[k] == lo[k] == none[k]
+
+    def test_offense_and_defense_are_not_the_overall_repeated(self):
+        """A good offense with a bad defense must read that way, with or without stats."""
+        r = {pg: [60.0] * 3 for pg in ("QB", "RB", "WR", "TE", "OL", "EDGE", "DL", "LB", "CB", "S", "K", "P")}
+        for pg in ("QB", "RB", "WR", "TE"):
+            r[pg] = [88.0, 86.0, 84.0]
+        out = compute_team_splits(1, None, r, None, SP_MEANS, None)
+        assert out["offense_rating"] > out["defense_rating"] + 5
+        assert out["offense_rating"] != out["overall_rating"]
 
     def test_team_stats_actually_reach_the_rating(self):
         """Harvested and then silently ignored until v2.1 — the weights existed
         but nothing read them."""
-        sp = {"overall": 15.0, "offense": 32.0, "defense": 17.0}
-        good = compute_team_splits(1, sp, _roster(), _stats(True), SP_MEANS, 0.9)
-        bad = compute_team_splits(1, sp, _roster(), _stats(False), SP_MEANS, 0.9)
+        good = compute_team_splits(1, None, _roster(), _stats(True), SP_MEANS, 0.9)
+        bad = compute_team_splits(1, None, _roster(), _stats(False), SP_MEANS, 0.9)
         assert good["overall_rating"] > bad["overall_rating"]
 
     def test_the_stat_keys_are_the_ones_the_pipeline_writes(self):
@@ -84,29 +97,27 @@ class TestNoSignal:
         out = compute_team_splits(1, None, {}, _stats(), SP_MEANS, None)
         assert out is not None
 
-    def test_sp_alone_is_enough(self):
-        out = compute_team_splits(1, {"overall": 12.0, "offense": 30.0, "defense": 18.0},
-                                  {}, None, SP_MEANS, None)
-        assert out is not None
+    def test_sp_alone_is_not_enough(self):
+        """SP+ is a reference, not an input: a team with nothing of its own season to rate
+        gets no row, rather than a rating that is really somebody else's."""
+        assert compute_team_splits(1, {"overall": 12.0, "offense": 30.0, "defense": 18.0},
+                                   {}, None, SP_MEANS, None) is None
 
 
 class TestRenormalization:
     def test_a_missing_signal_shifts_weight_rather_than_dragging_toward_zero(self):
-        """Dropping team stats must not pull the rating down; it must redistribute
-        their 20% across the signals that remain."""
-        sp = {"overall": 15.0, "offense": 32.0, "defense": 17.0}
-        both = compute_team_splits(1, sp, _roster(), None, SP_MEANS, 0.9)
-        assert both["overall_rating"] > 60.0
+        """Dropping team stats must not pull the rating down; it must hand their 40% to
+        the roster."""
+        roster_only = compute_team_splits(1, None, _roster(), None, SP_MEANS, 0.9)
+        assert roster_only["overall_rating"] > 60.0
 
     def test_identical_signals_produce_that_same_value(self):
-        """If every reading agrees, renormalization is the identity — no blend of
-        weights that sum to one can move off the shared value."""
-        sp_only = compute_team_splits(
-            1, {"overall": 15.0, "offense": 32.0, "defense": 17.0}, {}, None, SP_MEANS, None)
-        with_roster = compute_team_splits(
-            1, {"overall": 15.0, "offense": 32.0, "defense": 17.0},
-            _roster(sp_only["overall_rating"] + 2), None, SP_MEANS, None)
-        assert abs(with_roster["overall_rating"] - sp_only["overall_rating"]) < 12
+        """If both readings agree, renormalization is the identity: no blend of weights
+        that sum to one can move off the shared value."""
+        s = _stats(True)
+        from_stats = team_stats_to_ovr(s)
+        r = compute_team_splits(1, None, {}, s, SP_MEANS, None)
+        assert abs(r["overall_rating"] - from_stats) < 0.01
 
 
 class TestBounds:

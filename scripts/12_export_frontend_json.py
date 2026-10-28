@@ -222,6 +222,18 @@ def season_trio(T: dict, season: int) -> dict:
     return out
 
 
+# {(team_id, season): conference} from the harvested season records. teams.json carries only a
+# team's CURRENT conference, so before v4.11 every season showed it there: Boise State was a
+# Pac-12 team in 2008. Filled by load_tables(); seasons with no record (the one being played)
+# fall back to the team's current conference, which is correct for them.
+_CONF_BY_SEASON: dict = {}
+
+
+def season_conf(team_id, season, fallback):
+    """The conference a team was in during `season`, else `fallback` (its current one)."""
+    return _CONF_BY_SEASON.get((_i(team_id), _i(season))) or fallback
+
+
 def load_tables() -> dict:
     """Load all raw and computed tables into memory. Called once per run."""
     print("Loading source tables...")
@@ -245,6 +257,11 @@ def load_tables() -> dict:
         "team_season_stats": read_computed("team_season_stats"),
     }
     t["live_roster"], t["live_teams"] = load_live_files()
+    _recs = read_raw("team_records")
+    _CONF_BY_SEASON.clear()
+    if not _recs.empty:
+        for _r in _recs.dropna(subset=["team_id", "season", "conference"]).itertuples():
+            _CONF_BY_SEASON[(int(_r.team_id), int(_r.season))] = _r.conference
     for name, df in t.items():
         if isinstance(df, pd.DataFrame):
             print(f"  {name:<20} {len(df):>8} rows")
@@ -481,7 +498,7 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
             "team_id":          _i(row.get("team_id")),
             "team":             row.get("school"),
             "team_abbr":        row.get("abbreviation"),
-            "conference":       row.get("conference"),
+            "conference":       season_conf(row.get("team_id"), season, row.get("conference")),
             "team_color":       row.get("color"),
             "logo_url":         row.get("logo_url"),
             "overall_rating":   _f(row.get("overall_rating")),
@@ -617,7 +634,7 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             "sp_defense":       _f(r.get("sp_defense")),
             "recruiting_score": _f(r.get("recruiting_score")),
             "school":           r.get("school"),
-            "conference":       r.get("conference"),
+            "conference":       season_conf(r.get("team_id"), r.get("season"), r.get("conference")),
             "color":            r.get("color"),
             "logo_url":         r.get("logo_url"),
             "sub_ratings":      sub,
@@ -691,7 +708,7 @@ def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
             "class_year":      _i(row.get("class_year")),
             "team":            row.get("school"),
             "team_abbr":       row.get("abbreviation"),
-            "conference":      row.get("conference"),
+            "conference":      season_conf(row.get("team_id"), season, row.get("conference")),
             "team_color":      row.get("color"),
             "overall":         _f(row.get("overall_rating")),
             "position_rating": _f(row.get("position_rating")),
@@ -1117,7 +1134,7 @@ def export_transfers(T: dict, output_dir: Path, season: int) -> None:
         print(f"  transfers_{season}.json: no linked transfers for this season")
         return
 
-    merged = tr_s.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
+    merged = tr_s.merge(pl[["id", "name", "hometown_state"]].rename(columns={"id": "pl_id"}),
                         left_on="player_id", right_on="pl_id", how="left")
 
     if not tm.empty:
@@ -1164,6 +1181,7 @@ def export_transfers(T: dict, output_dir: Path, season: int) -> None:
             "player_id":      pid,
             "name":           row.get("name"),
             "position_group": row.get("position_group"),
+            "hometown_state": row.get("hometown_state") if isinstance(row.get("hometown_state"), str) else None,
             "transfer_year":  season,
             "portal_date":    portal_date,
             "from_school":    row.get("from_school") or "Unknown school",
@@ -1273,7 +1291,7 @@ def export_team_history(T: dict, output_dir: Path) -> None:
             "season":           sea,
             "wins":             wins_by[tid].get(sea),
             "losses":           losses_by[tid].get(sea),
-            "conference":       get_conf(tid, sea),
+            "conference":       season_conf(tid, sea, get_conf(tid, sea)),
             "sp_overall":       _f(row.get("sp_overall")),
             "overall_rating":   _f(row.get("overall_rating")),
             "offense_rating":   _f(row.get("offense_rating")),

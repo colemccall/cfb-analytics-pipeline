@@ -564,3 +564,18 @@ class_rank   = descending rank of top_avg among teams that have one
 
 Roster reconciliation, 2026: 5,468 + 2,115 + 6,108 + 3,191 = 16,882. The three numbers are never
 averaged or combined; the live number is provisional (about 7% high in the one back-test).
+
+---
+
+## v4.11 - team ratings (mirrors METHODS `team-ratings`)
+
+```
+overall = 0.60 roster + 0.40 team stats           renormalised when one is absent
+offense = 0.60 roster_to_ovr(0.50 pass_off + 0.50 run_off) + 0.40 team-stat offense
+defense = 0.60 roster_to_ovr(0.55 pass_def + 0.45 run_def) + 0.40 team-stat defense
+```
+
+SP+ is no longer an input (it was 0.50 of the headline and all of offense and defense); it stays
+published as sp_overall / sp_offense / sp_defense. Measured on 2016-2025: same-season fit to scoring
+margin 0.884 to 0.880, next-season 0.545 to 0.518 (carry-forward 0.529), offense 0.847 to 0.806, defense
+0.857 to 0.827; shuffled-roster placebo 0.659. Conferences are per season from the harvested records.
