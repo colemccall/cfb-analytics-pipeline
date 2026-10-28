@@ -15,6 +15,7 @@ pipeline-only checkout still runs green.
 """
 
 import json
+from collections import Counter
 import re
 from pathlib import Path
 
@@ -200,6 +201,126 @@ class TestRosterIntegrity:
                         dupes.append((p.get("name"), seen[pid], team_id))
                     seen[pid] = team_id
             assert not dupes, f"season {s}: players on multiple rosters: {dupes[:5]}"
+
+
+@pytest.mark.parametrize("season", range(2016, 2027))
+class TestRosterCardContract:
+    """What the menu's roster and player card need from the data, every season 2016-2026.
+
+    The card opens from a roster row; if that row lacks an id, a name or a position, or the ratings
+    file holds a player no roster lists, a card is blank or unreachable. Measured 2026-10-28 over
+    170,805 roster rows: no gaps, no duplicates, no orphans. These keep it that way. A roster row with
+    no ratings row is legitimate (3,528 in 2026; 4,278 in 2025) and is explained by the screen.
+    """
+
+    @pytest.fixture
+    def pair(self, season):
+        if not (APP_DATA / f"rosters_{season}.json").exists():
+            pytest.skip(f"no roster file for {season}")
+        return _load(f"rosters_{season}.json"), _load(f"players_{season}.json")
+
+    def test_every_roster_row_has_an_id_a_name_and_a_position(self, pair, season):
+        rosters, _ = pair
+        bad = [(t, p.get("player_id"), p.get("name")) for t, rows in rosters.items() for p in rows
+               if p.get("player_id") is None or not p.get("name") or not p.get("position_group")]
+        assert not bad, f"{season}: {len(bad)} roster rows lack an id, a name or a position, e.g. {bad[:3]}"
+
+    def test_no_player_is_listed_twice_on_a_roster(self, pair, season):
+        rosters, _ = pair
+        dupes = [(t, pid) for t, rows in rosters.items()
+                 for pid, n in Counter(p.get("player_id") for p in rows).items() if n > 1]
+        assert not dupes, f"{season}: players listed twice on one roster, e.g. {dupes[:3]}"
+
+    def test_every_ratings_row_is_on_its_teams_roster(self, pair, season):
+        rosters, players = pair
+        on = {t: {p.get("player_id") for p in rows} for t, rows in rosters.items()}
+        orphans = [(p["id"], p.get("name"), p.get("team_id")) for p in players
+                   if p["id"] not in on.get(str(p.get("team_id")), set())]
+        assert not orphans, f"{season}: {len(orphans)} ratings rows no roster lists, e.g. {orphans[:3]}"
+
+
+class TestPostseason:
+    """Bowls and the playoff are in the schedules, labelled, and shown apart from what power counts.
+
+    Measured 2026-10-28: games.json holds 889 postseason games (34-54 a season, 139 in 2023 when
+    FCS playoff games are in it); schedules already listed them but the menu showed them as 'W1'
+    and 'W2'. Team stats (CFBD /stats/season) already include them: in 2025, 74 of 74 teams that
+    played a postseason game have games == all games, none have games == regular games only.
+    """
+
+    @pytest.mark.parametrize("season", range(2008, 2026))
+    def test_schedules_carry_the_postseason_and_say_which_it_is(self, season):
+        sched = _load(f"schedules_{season}.json")
+        rows = [g for games in sched.values() for g in games]
+        kinds = {g["season_type"] for g in rows}
+        assert kinds <= {"regular", "postseason"}, f"{season}: unknown season types {kinds}"
+        assert any(g["season_type"] == "postseason" for g in rows), f"{season}: no postseason games in the schedules"
+        assert all("venue" in g and (g["venue"] is None or isinstance(g["venue"], str)) for g in rows)
+
+    @pytest.mark.parametrize("season", range(2016, 2026))
+    def test_a_postseason_game_between_two_teams_is_on_both_schedules(self, season):
+        sched = _load(f"schedules_{season}.json")
+        seen = {}
+        for tid, games in sched.items():
+            for g in games:
+                if g["season_type"] == "postseason" and g["opp_is_fbs"]:
+                    seen.setdefault(g["game_id"], set()).add(tid)
+        lonely = [gid for gid, tids in seen.items() if len(tids) != 2]
+        assert not lonely, f"{season}: postseason games on only one team's schedule: {lonely[:5]}"
+
+    @pytest.mark.parametrize("season", range(2016, 2026))
+    def test_power_lists_postseason_games_after_the_counted_ones_and_does_not_count_them(self, season):
+        pg = _load(f"power_games_{season}.json")
+        tr = {r["team_id"]: r for r in _load("team_ratings.json") if r["season"] == season and r.get("results_games") is not None}
+        for tid, games in pg.items():
+            flags = [bool(g.get("post")) for g in games]
+            assert flags == sorted(flags), f"{season} team {tid}: a counted game follows a postseason game"
+            if int(tid) in tr:
+                counted = sum(1 for g in games if not g.get("post"))
+                assert tr[int(tid)]["results_games"] == counted, \
+                    f"{season} team {tid}: results part counts {tr[int(tid)]['results_games']} games, table lists {counted}"
+
+
+class TestCardShards:
+    """cards/NNNN.json: one player's whole career in one ~150 KB file, equal to the grid's rows.
+
+    Opening a card used to download 82-93 MB (every season's players file). The shards must hold
+    exactly what the grid holds, or a card disagrees with the table it was opened from.
+    """
+
+    @pytest.fixture(scope="class")
+    def cards(self):
+        d = APP_DATA / "cards"
+        if not d.exists():
+            pytest.skip("no cards/ export")
+        return d
+
+    def test_shard_files_are_numbered_within_the_shard_count(self, cards):
+        n = int(re.search(r"^CARD_SHARDS = (\d+)", (Path(__file__).parent.parent / "scripts" / "12_export_frontend_json.py")
+                          .read_text(encoding="utf-8"), re.M).group(1))
+        nums = [int(p.stem) for p in cards.glob("*.json")]
+        assert nums and max(nums) < n and all(re.fullmatch(r"\d{4}", p.stem) for p in cards.glob("*.json"))
+
+    @pytest.mark.parametrize("season", [2026, 2025, 2021, 2016])
+    def test_every_grid_row_is_in_its_shard_unchanged(self, cards, season):
+        n = int(re.search(r"^CARD_SHARDS = (\d+)", (Path(__file__).parent.parent / "scripts" / "12_export_frontend_json.py")
+                          .read_text(encoding="utf-8"), re.M).group(1))
+        loaded = {}
+        missing = []
+        for p in _load(f"players_{season}.json"):
+            k = p["id"] % n
+            shard = loaded.get(k) or loaded.setdefault(k, json.loads((cards / f"{k:04d}.json").read_text(encoding="utf-8")))
+            rows = [r for r in shard.get(str(p["id"]), []) if r["season"] == season]
+            want = {a: b for a, b in p.items() if a != "logo_url"}
+            if len(rows) != 1 or rows[0] != want:
+                missing.append(p["id"])
+        assert not missing, f"{season}: {len(missing)} grid rows missing or different in their shard, e.g. {missing[:5]}"
+
+    def test_a_players_seasons_are_oldest_first_and_unique(self, cards):
+        for path in list(cards.glob("*.json"))[:40]:
+            for pid, rows in json.loads(path.read_text(encoding="utf-8")).items():
+                seasons = [r["season"] for r in rows]
+                assert seasons == sorted(set(seasons)), f"{path.name} player {pid}: seasons {seasons}"
 
 
 class TestSchedules:

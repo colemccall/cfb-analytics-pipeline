@@ -1075,6 +1075,7 @@ def export_schedules(T: dict, output_dir: Path, season: int) -> None:
         home_sc   = _i(g.get("home_score"))
         away_sc   = _i(g.get("away_score"))
         game_date = str(g["game_date"]) if g.get("game_date") else None
+        venue     = g.get("venue") if isinstance(g.get("venue"), str) and g.get("venue") else None
 
         # For result calc: FCS opponent scores may be null — treat as 0 for W/L but
         # still store null in opp_score so UI can display "—" rather than "0".
@@ -1103,6 +1104,7 @@ def export_schedules(T: dict, output_dir: Path, season: int) -> None:
                 "week":         _i(g.get("week")),
                 "game_date":    game_date,
                 "season_type":  g.get("season_type"),
+                "venue":        venue,
                 "is_home":      is_home,
                 "neutral_site": bool(g.get("neutral_site")),
                 "opponent":     opponent,
@@ -1472,16 +1474,20 @@ def export_research(T: dict, output_dir: Path) -> None:
 ALL_SEASONS = list(range(2008, CURRENT_SEASON + 1))
 
 
+CARD_SHARDS = 1024                # cards/NNNN.json holds the players whose id % CARD_SHARDS == NNNN (js/config.js CARD_SHARDS agrees)
+CARD_DROP = {"logo_url"}          # the only field a card does not need; everything else ships as the grid has it
 POWER_GAMES_FIRST_SEASON = 2016   # power_games_{season}.json is exported from here on (and for a season in progress)
 
 
 def export_power_games(T: dict, output_dir: Path, season: int) -> None:
     """Write power_games_{season}.json: for each team, every game that went into its power rating.
 
-    This is the explanation of the ranking. Each entry is one regular-season game between two FBS
-    teams, from the team's side: what it was worth (the margin capped at +-28 plus 8 for a win or
-    minus 8 for a loss), what the two teams' ratings expected it to be worth, and the difference
-    (`over`). A team's results part is roughly the average of its `over` values, shrunk toward 0 for
+    This is the explanation of the ranking. Each entry is one game between two FBS teams, from the
+    team's side. Regular-season games are what power counts; postseason games (bowls and the
+    playoff) are listed after them with `post: true` and are shown, not counted, until the
+    strength model decides how they should weigh. Each entry has what it was worth (the margin
+    capped at +-28 plus 8 for a win or minus 8 for a loss), what the two teams' ratings expected it
+    to be worth, and the difference (`over`). A team's results part is roughly the average of its `over` values, shrunk toward 0 for
     few games. Seasons before POWER_GAMES_FIRST_SEASON are not exported.
     """
     from utils.results_rating import expected_value, game_value
@@ -1507,7 +1513,7 @@ def export_power_games(T: dict, output_dir: Path, season: int) -> None:
     if not parts or games.empty:
         return
     names = dict(zip(T["teams"]["id"], T["teams"]["school"]))
-    g = games[(games["season"] == season) & (games["season_type"] == "regular")]
+    g = games[(games["season"] == season) & (games["season_type"].isin(["regular", "postseason"]))]
     out: dict = {}
     for _, x in g.iterrows():
         h, a = _i(x.get("home_team_id")), _i(x.get("away_team_id"))
@@ -1524,10 +1530,48 @@ def export_power_games(T: dict, output_dir: Path, season: int) -> None:
                 "week": _i(x.get("week")), "opp_id": opp, "opp": names.get(opp), "home": is_home and not neutral,
                 "neutral": neutral, "score": sc, "opp_score": osc, "margin": int(sign * m),
                 "value": round(val, 1), "expected": round(exp, 1), "over": round(val - exp, 1),
+                **({"post": True} if x.get("season_type") == "postseason" else {}),
             })
     for tid in out:
-        out[tid].sort(key=lambda e: (e["week"] is None, e["week"] or 0))
+        out[tid].sort(key=lambda e: (bool(e.get("post")), e["week"] is None, e["week"] or 0))
     write_json(output_dir / f"power_games_{season}.json", out)
+
+
+def export_player_cards(output_dir: Path) -> None:
+    """Write cards/{shard:04d}.json: every season of each rated player's ratings row, grouped by player id.
+
+    A player card needs one player's whole career (the season stats, the rating history, the
+    career table). Reading that from players_{season}.json costs every season's file: measured
+    2026-10-28, opening one card downloaded 82-93 MB across 15 requests, and the classic modal
+    19 files (about 200 MB). A shard is {player_id: [row per season, oldest first]} for the players
+    whose id % CARD_SHARDS equals the file's number, about 140 KB. The rows are the grid's rows
+    unchanged (read back from the files just written, so a card cannot disagree with the grid)
+    minus CARD_DROP. A rostered player with no ratings row has no entry; the card is drawn from
+    the roster row instead.
+    """
+    shards: dict = defaultdict(dict)
+    n_rows = 0
+    for season in ALL_SEASONS:
+        f = output_dir / f"players_{season}.json"
+        if not f.exists():
+            continue
+        for p in json.loads(f.read_text(encoding="utf-8")):
+            pid = p.get("id")
+            if pid is None:
+                continue
+            shards[int(pid) % CARD_SHARDS].setdefault(str(pid), []).append({k: v for k, v in p.items() if k not in CARD_DROP})
+            n_rows += 1
+    cards_dir = output_dir / "cards"
+    cards_dir.mkdir(parents=True, exist_ok=True)
+    for old in cards_dir.glob("*.json"):      # this directory belongs to this function; a shard that empties is removed
+        old.unlink()
+    total = 0
+    for shard, players in shards.items():
+        path = cards_dir / f"{shard:04d}.json"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(_clean_nan(players), fh, separators=(",", ":"), default=_json_default, allow_nan=False)
+        total += path.stat().st_size
+    print(f"  Wrote cards/: {len(shards)} shards, {sum(len(v) for v in shards.values())} players, {n_rows} player-seasons, {total / 1e6:.0f} MB")
 
 
 def main():
@@ -1543,6 +1587,8 @@ def main():
     parser.add_argument("--season", type=int, default=None,
                         help="Single season to export (default: all seasons)")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--cards", action="store_true",
+                        help="also rebuild cards/ on a single-season run (a full run always does)")
     args = parser.parse_args()
 
     output_dir: Path = args.output
@@ -1602,6 +1648,10 @@ def main():
 
         print(f"  power_games_{season}.json...")
         export_power_games(T, output_dir, season)
+
+    if args.season is None or args.cards:
+        print("\ncards/ (one shard file per player-id group)...")
+        export_player_cards(output_dir)
 
     print("\nDone.")
 

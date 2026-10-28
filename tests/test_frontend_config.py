@@ -84,6 +84,15 @@ def test_recruiting_seasons_match_exported_files():
     )
 
 
+def test_card_shard_count_matches_the_export_script():
+    """CONFIG.CARD_SHARDS must equal script 12's CARD_SHARDS: the shard a card is read from is
+    player_id % CARD_SHARDS in both places, and a mismatch reads the wrong file for most players."""
+    js = int(re.search(r"CARD_SHARDS:\s*(\d+)", (APP_DATA.parent / "js" / "config.js").read_text(encoding="utf-8")).group(1))
+    py = int(re.search(r"^CARD_SHARDS = (\d+)", (Path(__file__).parent.parent / "scripts" / "12_export_frontend_json.py")
+                       .read_text(encoding="utf-8"), re.M).group(1))
+    assert js == py, f"config.js CARD_SHARDS {js} != script 12 CARD_SHARDS {py}"
+
+
 def test_power_game_seasons_match_exported_files():
     """POWER_GAME_SEASONS must list exactly the seasons with a power_games_{season}.json.
 
