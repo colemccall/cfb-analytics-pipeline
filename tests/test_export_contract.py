@@ -538,3 +538,96 @@ class TestClassYear:
         assert not bad, (
             f"{len(bad)} rows carry a class year with no anchor named. "
             "`first_fbs` is a floor and has to be labelled as one.")
+
+
+class TestThreeRatings:
+    """A season being played carries three ratings per player, never combined.
+
+    Last season earned (rating_prev), the preseason projection (overall_rating) and
+    earned-to-date (live_rating), each with the reason when it is absent. Script 12
+    writes the fields only for a season with a live file from script 17; every
+    played season must export exactly as before.
+    """
+
+    PREV = {"rated", "not_rated", "unrated", "no_season"}
+    LIVE = {"rated", "too_few_games", "no_games", "not_rated"}
+
+    @pytest.fixture(scope="class")
+    def season(self, manifest):
+        live = sorted(int(p.stem.split("_")[1]) for p in APP_DATA.glob("live_*.json"))
+        if not live:
+            pytest.skip("no live_{season}.json exported — run script 17 then 12")
+        return live[-1]
+
+    @pytest.fixture(scope="class")
+    def roster(self, season):
+        by_team = _load(f"rosters_{season}.json")
+        return [p for rows in by_team.values() for p in rows]
+
+    def test_every_roster_row_carries_the_fields(self, roster):
+        missing = [p["player_id"] for p in roster if "live_status" not in p or "rating_prev_status" not in p]
+        assert not missing, f"{len(missing)} roster rows without the three-ratings fields"
+
+    def test_statuses_are_from_the_vocabulary(self, roster):
+        assert {p["live_status"] for p in roster} <= self.LIVE
+        assert {p["rating_prev_status"] for p in roster} <= self.PREV
+
+    def test_a_number_exists_only_where_its_status_says_so(self, roster):
+        for p in roster:
+            assert (p["live_rating"] is not None) == (p["live_status"] == "rated"), p["player_id"]
+            assert (p["rating_prev"] is not None) == (p["rating_prev_status"] == "rated"), p["player_id"]
+            if p["live_rating"] is not None:
+                assert p["live_basis"] in ("production", "blended"), "a recruiting-basis number was published as earned"
+
+    def test_the_roster_reconciles_with_the_live_file(self, roster, season):
+        live = _load(f"live_{season}.json")
+        assert len(roster) == live["players_on_rosters"], (
+            f"{len(roster)} roster rows vs {live['players_on_rosters']} on rosters in live_{season}.json")
+        rated = sum(1 for p in roster if p["live_status"] == "rated")
+        assert rated == live["players_rated"]
+
+    def test_the_player_grid_lists_every_live_rated_player(self, season):
+        grid = {p["id"] for p in _load(f"players_{season}.json")}
+        missing = [p["player_id"] for p in _load(f"live_{season}.json")["players"] if p["player_id"] not in grid]
+        assert not missing, f"{len(missing)} live-rated players are absent from players_{season}.json"
+
+    def test_the_three_numbers_are_not_merged(self, roster):
+        """Live and projection are separate numbers: where both exist they must differ somewhere."""
+        both = [p for p in roster if p["live_rating"] is not None and p["overall_rating"] is not None]
+        assert any(p["live_rating"] != p["overall_rating"] for p in both), "live equals projection everywhere: suspicious"
+
+    def test_played_seasons_gain_no_extra_fields(self, manifest):
+        last = manifest["last_played_season"]
+        rows = _load(f"players_{last}.json")[:200]
+        assert not any("live_status" in r or "rating_prev" in r for r in rows)
+
+
+class TestRecruitingBoard:
+    """recruiting_{year}.json (script 18): the menu's prospect board and class ranks."""
+
+    def _classes(self):
+        files = sorted(APP_DATA.glob("recruiting_[0-9]*.json"))
+        if not files:
+            pytest.skip("no recruiting_{year}.json exported — run script 18")
+        return [json.loads(p.read_text(encoding="utf-8")) for p in files]
+
+    def test_class_ranks_are_dense_and_only_on_full_classes(self):
+        for c in self._classes():
+            ranks = sorted(t["class_rank"] for t in c["teams"] if t["class_rank"] is not None)
+            assert ranks == list(range(1, len(ranks) + 1)), f"{c['year']}: class ranks are not 1..n"
+            for t in c["teams"]:
+                if t["class_rank"] is not None:
+                    assert t["top_avg"] is not None, "a ranked class has no average"
+                else:
+                    assert t["top_avg"] is None, "an unranked class carries a ranking average"
+
+    def test_a_missing_value_is_null_not_zero(self):
+        for c in self._classes():
+            for p in c["prospects"]:
+                assert p["composite"] is None or p["composite"] > 0, f"{p['name']}: composite 0"
+                assert p["stars"] is None or 1 <= p["stars"] <= 5
+
+    def test_prospects_are_ordered_by_national_rank(self):
+        for c in self._classes():
+            ranks = [p["national_rank"] for p in c["prospects"] if p["national_rank"] is not None]
+            assert ranks == sorted(ranks), f"{c['year']}: prospects are not in rank order"

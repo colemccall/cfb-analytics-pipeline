@@ -212,3 +212,15 @@ about the defensive ratings and is the clearest single argument for the next pha
 
 **Standing rule, unchanged:** NIL never enters an earned rating. Research and, if validated,
 projections only — labelled through `projection_source`.
+
+---
+
+## v4.9 — three ratings and the recruiting class rank
+
+| Option | Status | Why |
+|---|---|---|
+| One blended 2026 number (projection updated by games played) | ❌ Rejected unbuilt | Hides the disagreement the owner asked to see; no backtest of a blend over half a season exists |
+| To-date file holding only players with 3+ games | ❌ Rejected | A blank cannot say "no games" vs "2 games" vs "unrated by design"; `live_status` can |
+| Class rank by total composite points | ❌ Rejected | Rewards class size over quality |
+| Class rank by average stars | ❌ Rejected | Five coarse buckets; the composite separates a high four-star from a low one |
+| Landing the class year through scripts 07/15/16 | ❌ Not run | Can move ratings; its own measured pass. Script 12 derives it without touching a rating |

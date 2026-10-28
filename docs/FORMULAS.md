@@ -546,3 +546,21 @@ rating, so for 2026 the term renormalises out.
 - Two thirds of any roster has no meaningful production, so for them the number is mostly a
   recruiting grade in a production-shaped costume — which is exactly the OL problem in §2,
   differing only in degree.
+
+---
+
+## v4.9 — three ratings (mirrors METHODS `three-ratings`) and class rank (`recruiting-class-rank`)
+
+```
+rating_prev  = ratings[engine=edge, season=2025, player_id]       null + rating_prev_status when absent
+rating_proj  = the existing 2026 projection                        unchanged
+live_rating  = script 17 chain on 2026 games, pace-rescaled        null unless live_status == "rated"
+live_status  in { rated, too_few_games, no_games, not_rated }
+rating_prev_status in { rated, not_rated, unrated, no_season }
+
+top_avg      = mean(composite of a team's best 15 matched commits)  null if fewer than 15
+class_rank   = descending rank of top_avg among teams that have one
+```
+
+Roster reconciliation, 2026: 5,468 + 2,115 + 6,108 + 3,191 = 16,882. The three numbers are never
+averaged or combined; the live number is provisional (about 7% high in the one back-test).

@@ -48,7 +48,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.store import read_raw, read_computed, read_ratings
+from utils.store import read_raw, read_computed, read_ratings, COMPUTED_DIR
 from utils.class_year import attach_class_year
 from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score
 
@@ -148,6 +148,80 @@ def _i(val, default=None):
 # Load shared DataFrames once
 # ---------------------------------------------------------------------------
 
+def load_live_files() -> tuple:
+    """Read script 17's outputs: (live_roster, live_teams) as {season: ...}.
+
+    live_roster[season] = {player_id: {games, live_rating, live_basis, status}} for EVERY
+    rostered player; live_teams[season] = {team_id: team row} from live_{season}.json,
+    plus the week they run through. Both empty for a season script 17 has not rated.
+    """
+    roster, teams = {}, {}
+    for path in sorted(COMPUTED_DIR.glob("live_roster_*.json")):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        roster[int(doc["season"])] = {
+            "through_week": doc.get("through_week"),
+            "players": {int(r["player_id"]): r for r in doc["players"]},
+        }
+    for path in sorted(COMPUTED_DIR.glob("live_[0-9]*.json")):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        teams[int(doc["season"])] = {
+            "through_week": doc.get("through_week"),
+            "teams": {int(t["team_id"]): t for t in doc.get("teams", [])},
+        }
+    return roster, teams
+
+
+def season_trio(T: dict, season: int) -> dict:
+    """{player_id: fields} for a season with earned-to-date ratings on file; {} otherwise.
+
+    The three ratings a 2026 card shows side by side, each with the reason when it
+    is absent, and NEVER combined into one number:
+
+      rating_prev      the season before, EARNED (engine=edge). A player keeps his rating
+                       if he changed teams; if two rows, the higher. Status says why not:
+                       rated | not_rated (offensive line) | unrated (on a roster, no
+                       rating) | no_season (not on any FBS roster that year)
+      overall_rating   the preseason projection (written by the caller, unchanged)
+      live_*           earned so far this season, rescaled to full-season pace (script
+                       17). live_status: rated | too_few_games | no_games | not_rated.
+
+    A season with no live file gets no extra fields, so every played season exports
+    exactly as before.
+    """
+    live = T["live_roster"].get(season)
+    if not live:
+        return {}
+    ps, rat = T["player_seasons"], T["ratings"]
+    prev_ps = ps[ps["season"] == season - 1][["id", "player_id", "position_group"]]
+    prev_ids = set(prev_ps["player_id"].dropna().astype("int64"))
+    ol_prev = set(prev_ps.loc[prev_ps["position_group"] == "OL", "player_id"].dropna().astype("int64"))
+    prev = {}
+    if not rat.empty:
+        r = rat[(rat["season"] == season - 1) & rat["overall_rating"].notna()][
+            ["player_season_id", "overall_rating", "rating_basis"]]
+        m = r.merge(prev_ps[["id", "player_id"]], left_on="player_season_id", right_on="id")
+        m = m.sort_values("overall_rating", ascending=False).drop_duplicates("player_id")
+        prev = {int(a): (float(b), c) for a, b, c in zip(m["player_id"], m["overall_rating"], m["rating_basis"])}
+    out = {}
+    for pid, lv in live["players"].items():
+        if pid in prev:
+            rv, basis, status = prev[pid][0], prev[pid][1], "rated"
+        else:
+            rv, basis = None, None
+            status = "not_rated" if pid in ol_prev else "unrated" if pid in prev_ids else "no_season"
+        out[pid] = {
+            "rating_prev": round(rv, 1) if rv is not None else None,
+            "rating_prev_basis": basis,
+            "rating_prev_status": status,
+            "live_rating": lv.get("live_rating"),
+            "live_basis": lv.get("live_basis"),
+            "live_games": lv.get("games"),
+            "live_status": lv.get("status"),
+            "live_through_week": live.get("through_week"),
+        }
+    return out
+
+
 def load_tables() -> dict:
     """Load all raw and computed tables into memory. Called once per run."""
     print("Loading source tables...")
@@ -170,8 +244,12 @@ def load_tables() -> dict:
         "team_ratings":     read_computed("team_ratings"),
         "team_season_stats": read_computed("team_season_stats"),
     }
+    t["live_roster"], t["live_teams"] = load_live_files()
     for name, df in t.items():
-        print(f"  {name:<20} {len(df):>8} rows")
+        if isinstance(df, pd.DataFrame):
+            print(f"  {name:<20} {len(df):>8} rows")
+    for _s, _lv in t["live_roster"].items():
+        print(f"  live_roster {_s:<8} {len(_lv['players']):>8} players, through week {_lv['through_week']}")
     # Class year, derived once here so every export below reads the same value.
     #
     # `player_seasons.year` is not a class year - see utils/class_year.py. It was
@@ -294,6 +372,25 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
     if ratings_season.empty:
         print(f"  players.json: no ratings for season {season}")
         return
+
+    # A season with earned-to-date ratings also lists anyone who has a live or a
+    # previous-season rating but no projection (a late arrival, a walk-on who has
+    # played): the grid is "everyone with a rating of any of the three kinds".
+    trio = season_trio(T, season)
+    if trio:
+        have = set(ratings_season["player_season_id"].dropna().astype("int64"))
+        extra = [int(r.id) for r in ps[ps["season"] == season].itertuples()
+                 if int(r.id) not in have and pd.notna(r.player_id)
+                 and (trio.get(int(r.player_id), {}).get("rating_prev") is not None
+                      or trio.get(int(r.player_id), {}).get("live_rating") is not None)]
+        if extra:
+            # No projection was made for these players, and no rating of ours is attached
+            # to that absence: provenance "not_projected", the same stated non-projection
+            # the offensive line carries.
+            ratings_season = pd.concat(
+                [ratings_season, pd.DataFrame({"player_season_id": extra, "season": season,
+                                               "provenance": "not_projected"})],
+                ignore_index=True)
 
     # ratings.player_id is the Supabase internal PK — NOT the CFB API player id.
     # The correct CFB API player id lives in player_seasons.player_id.
@@ -422,6 +519,7 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
             "projection_confidence": row.get("projection_confidence"),
             "projection_low":        _f(row.get("projection_low")),
             "projection_high":       _f(row.get("projection_high")),
+            **trio.get(_i(row.get("cfb_player_id")), {}),
         })
 
     players.sort(key=lambda p: p["overall_rating"] or 0, reverse=True)
@@ -533,6 +631,14 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             row[k] = sub.get(k)
         row["sp_plus"]       = sub.get("sp_offense_scaled") or sub.get("sp_overall_scaled")
         row["recruit_score"] = sub.get("recruiting_scaled")
+        # A season being played: the earned-to-date team rating beside the projection.
+        lt = T["live_teams"].get(_i(r.get("season")), {})
+        lrow = lt.get("teams", {}).get(_i(r.get("team_id")))
+        if lrow:
+            row["live_overall_rating"] = _f(lrow.get("overall_rating"))
+            row["live_offense_rating"] = _f(lrow.get("offense_rating"))
+            row["live_defense_rating"] = _f(lrow.get("defense_rating"))
+            row["live_through_week"]   = lt.get("through_week")
         rows.append(row)
 
     write_json(output_dir / "team_ratings.json", rows)
@@ -850,6 +956,7 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
         merged["rec_composite"] = None
 
     merged = merged[merged["team_id"].notna()]
+    trio = season_trio(T, season)
 
     rosters: dict = {}
     for _, row in merged.iterrows():
@@ -883,6 +990,7 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
             "projection_confidence": row.get("projection_confidence"),
             "projection_low":        _f(row.get("projection_low")),
             "projection_high":       _f(row.get("projection_high")),
+            **trio.get(_i(row["player_id"]), {}),
         })
 
     for tid in rosters:

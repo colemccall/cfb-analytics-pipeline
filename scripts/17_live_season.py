@@ -48,6 +48,15 @@ sys.path.insert(0, str(ROOT))
 APP_DATA = ROOT.parent / "cfb-analytics-app" / "data"
 EARNED_BASES = ("production", "blended")
 
+# What a rostered player's live rating is, and why when it is absent. Written to
+# live_roster_{season}.json for script 12, which puts it on every roster row so a
+# card can say "2 games - not yet rated" instead of showing a bare dash.
+#   rated          earned-to-date rating (production or blended basis)
+#   too_few_games  has played, but not enough countable games for an EDGE yet
+#   no_games       no game on record this season
+#   not_rated      a position we do not rate per player (offensive line)
+LIVE_STATUSES = ("rated", "too_few_games", "no_games", "not_rated")
+
 
 def _run(script: str, args: list, data_dir: Path, season: int) -> None:
     """Run one pipeline script against the private data folder.
@@ -88,6 +97,35 @@ def season_progress(games: pd.DataFrame, season: int) -> dict:
             rec[int(tid)] = (w + won, l + (not won))
     return {"scheduled": len(g), "completed": len(done),
             "through_week": int(done["week"].max()) if len(done) else 0, "records": rec}
+
+
+def live_roster(earned: pd.DataFrame, ps_all: pd.DataFrame, edge: pd.DataFrame) -> list:
+    """One row per rostered player: games played, live rating (or None) and why.
+
+    The 5,468 rated players are a third of a 16,882-player roster; the rest are
+    reserves, players with 1 or 2 games, and linemen. Without a row for each, a
+    roster card cannot tell "not rated yet" from "missing".
+    """
+    games = dict(zip(edge["player_season_id"], edge["games_played"]))
+    rating = {int(r.player_season_id): (float(r.overall_rating), r.rating_basis) for r in earned.itertuples()}
+    out = []
+    for r in ps_all.itertuples():
+        psid = int(r.player_season_id)
+        g = games.get(psid)
+        # None = no per-game rows for him (a player rated from his season aggregate):
+        # the count is unknown, which is not the same as zero.
+        g = int(g) if g is not None and pd.notna(g) else None
+        if r.position_group == "OL":
+            status, val, basis = "not_rated", None, None
+        elif psid in rating:
+            status = "rated"
+            val, basis = rating[psid]
+            val = round(val, 1)
+        else:
+            status, val, basis = ("too_few_games" if (g or 0) > 0 else "no_games"), None, None
+        out.append({"player_id": int(r.player_id), "player_season_id": psid, "games": g,
+                    "live_rating": val, "live_basis": basis, "status": status})
+    return out
 
 
 def build_export(season: int, sandbox: Path, progress: dict) -> dict:
@@ -133,9 +171,11 @@ def build_export(season: int, sandbox: Path, progress: dict) -> dict:
 
     ps = _load(sandbox / "raw" / "player_seasons.json")
     ps = ps[ps["season"] == season][["id", "player_id", "team_id", "position_group"]].rename(columns={"id": "player_season_id"})
+    ps_all = ps.copy()          # every rostered player, for live_roster()
     names = _load(sandbox / "raw" / "players.json")[["id", "name"]].rename(columns={"id": "player_id"})
     edge = _load(sandbox / "raw" / "player_edge.json")
     edge = edge[edge["season"] == season][["player_season_id", "games_played", "pace_factor"]]
+    roster = live_roster(earned, ps_all, edge)
     m = earned.merge(ps, on="player_season_id").merge(names, on="player_id", how="left").merge(edge, on="player_season_id", how="left")
 
     players = []
@@ -167,6 +207,7 @@ def build_export(season: int, sandbox: Path, progress: dict) -> dict:
         "players_on_rosters": int(len(ps)),
         "validation": validation,
         "teams": teams, "players": players,
+        "_roster": roster,          # popped by main(): written to its own computed-only file
     }
 
 
@@ -203,6 +244,13 @@ def main() -> None:
         if not args.keep_sandbox:
             shutil.rmtree(sandbox, ignore_errors=True)
 
+    roster = export.pop("_roster")
+    roster_doc = {"season": args.season, "through_week": export["through_week"],
+                  "generated_at": export["generated_at"], "players": roster}
+    (ROOT / "data" / "computed" / f"live_roster_{args.season}.json").write_text(
+        json.dumps(roster_doc, separators=(",", ":")), encoding="utf-8")
+    by = {k: sum(1 for p in roster if p["status"] == k) for k in LIVE_STATUSES}
+    print(f"roster statuses: {by}")
     text = json.dumps(export, separators=(",", ":"), ensure_ascii=False)
     for dest in (ROOT / "data" / "computed", APP_DATA):
         dest.mkdir(parents=True, exist_ok=True)

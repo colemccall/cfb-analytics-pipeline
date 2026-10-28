@@ -69,3 +69,16 @@ def test_live_seasons_match_exported_files():
     assert _js_int_list("LIVE_SEASONS") == on_disk, (
         f"config.js LIVE_SEASONS {_js_int_list('LIVE_SEASONS')} != exported files {on_disk}"
     )
+
+
+def test_recruiting_seasons_match_exported_files():
+    """RECRUITING_SEASONS must list exactly the class years with a recruiting_{year}.json.
+
+    The menu's Recruiting screen offers these years. One listed without a file is a 404;
+    a file not listed is a class the site never shows.
+    """
+    on_disk = sorted(int(m.group(1)) for p in APP_DATA.glob("recruiting_[0-9]*.json")
+                     if (m := re.fullmatch(r"recruiting_(\d{4})\.json", p.name)))
+    assert _js_int_list("RECRUITING_SEASONS") == on_disk, (
+        f"config.js RECRUITING_SEASONS {_js_int_list('RECRUITING_SEASONS')} != exported files {on_disk}"
+    )
