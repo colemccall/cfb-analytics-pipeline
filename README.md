@@ -30,13 +30,12 @@ cfb-analytics-pipeline/
 │   ├── raw/          # harvest output, one file per entity (gitignored)
 │   ├── computed/     # ratings engine output (gitignored)
 │   └── coaching_changes_seed.csv
-├── archive/sql/      # retired Supabase DDL — reference only, never executed
 └── .cache/           # API response cache by MD5 hash (gitignored)
 ```
 
 ### Key architectural decisions
 
-**Local JSON, no database.** Every script reads and writes plain JSON through `utils/store.py` (`read_raw`, `read_computed`, `write_computed`). The project previously ran on Supabase/PostgreSQL; that layer is fully retired, and the only credential required now is a CFB Data API key. The retired DDL lives in `archive/sql/` as field-level documentation, since the JSON files mirror those tables one-to-one.
+**Local JSON, no database.** Every script reads and writes plain JSON through `utils/store.py` (`read_raw`, `read_computed`, `write_computed`). The project previously ran on Supabase/PostgreSQL; that layer is fully retired, and the only credential required now is a CFB Data API key. The retired DDL lives in the portfolio `archive/supabase/sql/` as field-level documentation, since the JSON files mirror those tables one-to-one.
 
 **API response caching.** Every API response is cached as `.cache/{md5}.json`. Re-runs are near-instant. Never delete unless intentionally re-fetching.
 
@@ -101,9 +100,6 @@ Scripts are numbered by their dependency chain. Run them in this order for a com
 07  Player ratings — Engine A  (requires EDGE from script 06)
     python scripts/07_compute_player_ratings.py --season 2025
 
-08  EA CFB 27 ratings  (plain HTTP — no browser needed)
-    python scripts/08_harvest_ea_cfb27_ratings.py
-
 10  Team ratings  (requires script 07)
     python scripts/10_compute_team_ratings.py --season 2025
 
@@ -134,10 +130,9 @@ after the first export.
 
 **Not part of the chain:** `scripts/validate_ratings.py` writes nothing. It prints
 the per-position distribution (n, mean, p50/p90/p99, how many clear 85 and 90) and
-within-position Spearman against EA CFB 27 over matched players. Run it after any
-change to 06 or 07 and read the table before shipping — distribution shape is a
-hard gate on this project, and EA is a reference for "too generous / too stingy /
-is the ceiling right", never a target.
+nothing else: the EA agreement section was removed on 2026-10-27 with the EA data. Run it
+after any change to 06 or 07 and read the table before shipping — distribution shape is a
+hard gate on this project. The outside check that remains is `validate_vs_draft.py`.
 
 ```bash
 python scripts/validate_ratings.py --season 2025
@@ -165,6 +160,28 @@ that has not been played; that path computes from the roster alone and calls no 
 After exporting, update the season constants in the app's `js/config.js`
 (`LAST_PLAYED_SEASON`, `CURRENT_SEASON`, `PROJECTED_SEASONS`) to match the new
 `manifest.json`. `pytest tests/test_export_contract.py` fails if they disagree.
+
+### A season in progress
+
+Once games are played the season has results but no final ratings. Do not run the normal
+chain on it: a part-season row written to `engine="edge"` would be read by script 15 as a
+finished season. Script 17 rates it in a **private copy of the data** and exports one file:
+
+```bash
+set CFB_REFRESH_YEARS=2026       # bypass the cache for 2026 (it has no expiry)
+python scripts/01_harvest_games_players_stats.py --year 2026
+python scripts/09_harvest_supplemental.py --dataset team_advanced_season --seasons 2026
+python scripts/17_live_season.py --season 2026     # -> data/live_2026.json (app) + computed/live_2026.json
+python scripts/validate_pace.py                    # the back-test the correction rests on
+```
+
+Two switches make this safe. `CFB_REFRESH_YEARS=2026,...` makes `utils/api_client.py` skip its cache
+for those years' requests; without it a re-harvest returns whatever was cached before the games.
+`CFB_DATA_DIR=<folder>` points `utils/store.py` at another data folder, which is how script 17 and
+`validate_pace.py` run the real scripts without writing to real data. Script 06 gained
+`--in-progress` (rescale each team's EDGE to full-season pace: x sqrt(games scheduled / games
+completed)) and `--through-week N` (back-test cut). `METHODS` entry `live-season` has the
+measurement; the app's Build Log entry is `v4.8-live-and-retro`.
 
 ---
 
@@ -223,7 +240,6 @@ The `ratings.engine` column supports multiple rating systems per player-season:
 |--------|--------|--------|
 | `edge` | 07 | EDGE formula with opponent adjustment |
 | `engine_b` | 11 | 60% recruiting + 40% NIL valuation |
-| `ea_cfb27` | 08 | EA Sports CFB 27 ratings (2026 roster) |
 
 ---
 
@@ -243,7 +259,6 @@ transfers            — references player_id; team-gated fuzzy name matching
 plays                — raw play-by-play; player attribution via passer/rusher/receiver/defender IDs
 team_ratings         — OVR + sub-scores (pass_off, run_off, pass_def, run_def, special_teams)
 coaching_changes     — HC/OC/DC/ST roles with from/to school and year
-ea_ratings           — EA CFB 27 ratings, 54 attributes per player, linked to player_id
 nil_valuations       — On3 NIL values (currently empty — On3 blocks scraping)
 ```
 
@@ -278,7 +293,6 @@ pytest tests/ -v
 | `data/computed/` | Ratings engine output | No |
 | `data/coaching_changes_seed.csv` | Historical coaching data seed file | Yes |
 | `.cache/` | API response cache keyed by MD5 hash | No |
-| `archive/sql/` | Retired Supabase DDL, reference only | Yes |
 
 ---
 
@@ -286,7 +300,7 @@ pytest tests/ -v
 
 | Document | What it covers |
 |----------|----------------|
-| [`docs/RATING_AND_PROJECTION_MODEL.md`](docs/RATING_AND_PROJECTION_MODEL.md) | How ratings and projections are built, **where they measurably fail**, and what EA CFB 27 could fix. Read this before changing either engine — it quantifies the OL problem (77% recruiting), the production-blind majority (67% of any roster), and the backup→starter blind spot (r = +0.10). Analysis only; nothing in it is implemented. |
+| [`docs/RATING_AND_PROJECTION_MODEL.md`](docs/RATING_AND_PROJECTION_MODEL.md) | How ratings and projections are built, **where they measurably fail**, and what an outside rating could fix. Read this before changing either engine — it quantifies the OL problem (77% recruiting), the production-blind majority (67% of any roster), and the backup→starter blind spot (r = +0.10). Analysis only; nothing in it is implemented. |
 | [`docs/INTERNAL_REFERENCE.md`](docs/INTERNAL_REFERENCE.md) | File inventory, the export→frontend contract, and known contract gaps. |
 | [`docs/AUDIT_FINDINGS.md`](docs/AUDIT_FINDINGS.md) | Historical audit; §9 is the standing argument for absolute anchors over pool-relative scaling. |
 
@@ -294,7 +308,7 @@ pytest tests/ -v
 
 ## Notes
 
-- Scripts 04 (On3 NIL) and 05 (ESPN coaching tracker) require Selenium + Chrome. Everything else runs over plain HTTP — script 08 reads EA's Next.js data route (`/_next/data/{buildId}/…/ratings.json?team=N`) directly, no browser needed.
+- Scripts 04 (On3 NIL) and 05 (ESPN coaching tracker) require Selenium + Chrome. Everything else runs over plain HTTP.
 - On3 actively blocks scraping, so `nil_valuations.json` is empty and Engine B (script 11) runs recruiting-only until a working NIL source lands.
 - Script 01 with `--historical` fetches 2008–2020 data. Plays are the largest payload (~40k per season) and fetched last.
 - If you add a new season, re-run scripts 01 → 06 → 07 → 10 → 12 in order.

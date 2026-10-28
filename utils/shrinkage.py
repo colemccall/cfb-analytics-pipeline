@@ -33,6 +33,7 @@ Z80 = 1.2815515655446004
 
 
 def _finite(xs) -> list[float]:
+    """Coerce an iterable to floats, silently dropping anything non-numeric, NaN or infinite."""
     out = []
     for x in xs:
         try:

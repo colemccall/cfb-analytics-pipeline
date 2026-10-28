@@ -69,6 +69,25 @@ def _percentile_of_score(scores: list, score: float) -> float:
 
 
 def main() -> None:
+    """Build team_performance.json (the residual leaderboard) and coaching_impact.json.
+
+    Per team-season with a finite SP+:
+      talent      = mean composite of the team's recruits from classes t−3..t−1,
+                    min-max scaled to 0–100 between the 1st and 99th percentile of
+                    ALL individual recruit composites (not of team averages)
+      imputation  = a team-season with no recruits takes the conference-season
+                    median talent (else the season median), flagged talent_imputed
+      regression  = OLS over all team-seasons:  SP+ ~ talent + is_p5 + 1
+      residual    = actual SP+ − predicted SP+, with a tie-corrected percentile
+      shrinkage   = each residual shrunk toward the population mean with n = 1
+                    and the population SD as both prior and noise, i.e. w = 0.5:
+                    a single season is treated as half signal
+
+    Two things the output cannot see: is_p5 reads the team's CURRENT conference
+    for every season (realignment is not applied — Utah is P5 in its Mountain
+    West years), and R² is one number for the whole archive, repeated on every
+    row. Finally hands the records to coaching_event_study().
+    """
     print("Loading data...")
     recruiting   = read_raw("recruiting")
     team_ratings = read_computed("team_ratings")

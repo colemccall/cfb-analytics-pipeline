@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 def _default(o):
+    """json.dump fallback: Decimal → float, numpy scalars → Python via .item(); anything else raises TypeError."""
     import decimal
     if isinstance(o, decimal.Decimal):
         return float(o)

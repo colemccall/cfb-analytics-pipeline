@@ -69,6 +69,14 @@ POSITION_GROUP_MAP = {
 # ---------------------------------------------------------------------------
 
 def build_stat_lookup(player_stats_raw: list) -> dict:
+    """Index /stats/player/season rows by (player name, team), both lowercased.
+
+    The API returns one row per stat, so this folds them into one dict per
+    player: {(name, team): {"passingYDS": 3120, "rushingTD": 4, ...}}. The key
+    is category + statType with the first letter of statType upper-cased —
+    the same key shape every downstream script reads ("defensiveQB HUR"
+    keeps its space because the API's statType has one).
+    """
     lookup: dict = {}
     for entry in player_stats_raw:
         player_name = entry.get("player", "")
@@ -84,6 +92,14 @@ def build_stat_lookup(player_stats_raw: list) -> dict:
 
 
 def find_player_stats(stat_lookup: dict, first_name: str, last_name: str, team: str) -> dict:
+    """Return a roster player's stat dict from build_stat_lookup(), or {}.
+
+    The stats endpoint carries names, not player ids, so this joins on name.
+    Exact "first last" + team first; failing that, same team and same last
+    name where one first name is a prefix of the other ("Chris" / "Christopher").
+    A same-team, same-surname pair with unrelated first names will not match —
+    by design, since a wrong join credits one player with another's season.
+    """
     team_l = team.lower()
     full = f"{first_name} {last_name}".lower()
     if (full, team_l) in stat_lookup:
@@ -101,6 +117,11 @@ def find_player_stats(stat_lookup: dict, first_name: str, last_name: str, team: 
 
 
 def build_ppa_lookup(ppa_raw: list) -> dict:
+    """Index /ppa/players/season rows by (name, team) → averagePPA["all"] as a float.
+
+    Unparseable values are stored as 0.0, not skipped, so a player who appears
+    in the PPA feed with a bad value is indistinguishable from one at 0.0.
+    """
     lookup: dict = {}
     for entry in ppa_raw:
         name = entry.get("name", "")
@@ -115,6 +136,11 @@ def build_ppa_lookup(ppa_raw: list) -> dict:
 
 
 def find_player_ppa(ppa_lookup: dict, first_name: str, last_name: str, team: str) -> float:
+    """Return a roster player's average PPA from build_ppa_lookup(), or 0.0.
+
+    Same name-matching rule as find_player_stats(). 0.0 is also the miss value,
+    so a player with no PPA row and one with a PPA of exactly zero look alike.
+    """
     team_l = team.lower()
     full = f"{first_name} {last_name}".lower()
     if (full, team_l) in ppa_lookup:
@@ -132,6 +158,12 @@ def find_player_ppa(ppa_lookup: dict, first_name: str, last_name: str, team: str
 
 
 def build_usage_lookup(usage_raw: list) -> dict:
+    """Index /player/usage rows by API player id → overall/pass/rush usage and games.
+
+    Usage is keyed by id (not name) because the endpoint carries one. It covers
+    offensive skill players only — defenders are effectively absent (see the
+    `usage-coverage` METHODS entry) — and nothing before 2013.
+    """
     lookup: dict = {}
     for entry in usage_raw:
         pid = entry.get("id")
@@ -148,6 +180,14 @@ def build_usage_lookup(usage_raw: list) -> dict:
 
 
 def build_awards_lookup(awards_raw: list) -> dict:
+    """Index /awards rows by (name, team) → the highest award tier the player earned.
+
+    Tiers: 3 = All-American or a national position award (Outland, Rimington,
+    Lombardi, Bednarik); 2 = all-conference first team; 1 = all-conference
+    second team / honorable mention. Anything else is dropped. Matching is by
+    substring of the award text, so a new award whose name contains
+    "all-american" is picked up automatically — and a renamed one is lost.
+    """
     lookup: dict = {}
     for entry in awards_raw:
         name  = (entry.get("player") or entry.get("name") or "").lower().strip()
@@ -174,6 +214,7 @@ def build_awards_lookup(awards_raw: list) -> dict:
 # ---------------------------------------------------------------------------
 
 def _load_json(path: Path) -> list:
+    """Read a JSON list from `path`; a missing file or a non-list payload returns []"""
     if not path.exists():
         return []
     with open(path, encoding="utf-8") as f:
@@ -444,6 +485,18 @@ def save_season_stats(
     player_stats_raw, ppa_raw, usage_raw, awards_raw,
     player_id_map, ps_id_map, rosters_by_team, team_id_map, season,
 ) -> None:
+    """Build and save one `season_aggregate` stat row per rostered player.
+
+    Joins four feeds onto the roster: box-score totals (by name), PPA (by
+    name), usage (by API id) and award tier (by name). A player gets a row only
+    if at least one of stats / PPA / usage is present. Usage fields default to
+    0 when absent, so `snap_pct == 0` in the output means "no usage row" as
+    often as it means "did not play" — downstream code must not read it as a
+    measured zero before 2013 or for defenders.
+
+    Rows are de-duplicated on (player_season_id, season, stat_type) and merged
+    into data/raw/stats.json via _save_stat_rows (replace-by-key, not append).
+    """
     stat_lookup   = build_stat_lookup(player_stats_raw)
     ppa_lookup    = build_ppa_lookup(ppa_raw)
     usage_lookup  = build_usage_lookup(usage_raw)
@@ -499,6 +552,11 @@ def save_season_stats(
 
 def save_postseason_stats(postseason_stats_raw, player_id_map, ps_id_map,
                            rosters_by_team, team_id_map, season) -> None:
+    """Build and save one `postseason_aggregate` stat row per rostered player.
+
+    Box-score totals only — PPA, usage and awards are not fetched for the
+    postseason. Same name join and replace-by-key save as save_season_stats().
+    """
     stat_lookup = build_stat_lookup(postseason_stats_raw)
     ps_lookup   = _build_ps_lookup_local(season)
     rows = []
@@ -534,6 +592,15 @@ def save_postseason_stats(postseason_stats_raw, player_id_map, ps_id_map,
 
 
 def save_game_stats(game_stats_raw, player_id_map, team_id_map, game_id_map, season) -> None:
+    """Build and save one `game_aggregate` stat row per player per game.
+
+    Walks the /games/players payload (game → team → category → type →
+    athlete), which carries API player ids, so this join is by id rather than
+    by name. A player is kept only when his (player, team) has a
+    player_season for this season; games not in `game_id_map` are skipped.
+    Keys use the same category + type-label shape as the season rows. This is
+    the per-game input script 06 computes EDGE from.
+    """
     ps_lookup = _build_ps_lookup_local(season)
     rows_dict: dict = {}
 
@@ -596,6 +663,13 @@ def save_game_stats(game_stats_raw, player_id_map, team_id_map, game_id_map, sea
 # ---------------------------------------------------------------------------
 
 def run_year(api_key: str, season: int) -> None:
+    """Harvest one season end to end: teams → rosters → games → season, postseason
+    and per-game player stats.
+
+    Order matters: each step writes the id maps the next one joins on.
+    Every write is an upsert into data/raw/, so re-running a season replaces
+    its rows rather than duplicating them.
+    """
     print(f"\n{'='*60}")
     print(f"Season {season}")
     print(f"{'='*60}")
@@ -640,6 +714,10 @@ def run_year(api_key: str, season: int) -> None:
 
 
 def main():
+    """CLI entry point. Default is SEASONS_PRIMARY (2021–2025); --historical,
+    --all-seasons or --year N select other ranges. Seasons run sequentially
+    with a 1 s pause between them to stay under the API rate limit.
+    """
     parser = argparse.ArgumentParser(description="Fetch CFB Data API -> local JSON")
     parser.add_argument("--year",        type=int,       help="Single year")
     parser.add_argument("--historical",  action="store_true", help="2008-2020 backfill")

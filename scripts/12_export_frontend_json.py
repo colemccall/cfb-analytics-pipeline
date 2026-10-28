@@ -10,7 +10,7 @@ were stale duplicates with no consumers and have been deleted.
 Seasons that have not been played carry engine="projected" ratings from script
 16 instead of engine="edge". ratings_for() picks the right frame per season, and
 every projected row exports provenance/projection_source/projection_confidence
-/projection_low/projection_high/ea_ovr so the UI cannot render a projection as
+/projection_low/projection_high so the UI cannot render a projection as
 an earned number.
 
 Exports (season-agnostic):
@@ -18,7 +18,6 @@ Exports (season-agnostic):
   team_ratings.json         — team OVR + sub-score splits, all seasons
   team_history.json         — year-by-year progression    {team_id: [{season,...}]}
   player_transfers.json     — portal moves keyed by player
-  ea_ratings_{season}.json  — EA CFB 27 overalls, slimmed (cross-check column)
   manifest.json             — seasons, last_played_season, projected_seasons
   research/index.json       — published findings index
 
@@ -50,6 +49,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.store import read_raw, read_computed, read_ratings
+from utils.class_year import attach_class_year
 from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score
 
 DEFAULT_OUTPUT = Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"
@@ -62,6 +62,7 @@ TOP_N_PER_POSITION = 50
 # ---------------------------------------------------------------------------
 
 def _parse_stat_data(v) -> dict:
+    """Return a stat blob as a dict whether stored as a dict or a JSON string; anything unparseable → {}."""
     if isinstance(v, dict):
         return v
     try:
@@ -93,6 +94,11 @@ def _clean_nan(o):
 
 
 def write_json(path: Path, data) -> None:
+    """Write `data` to `path` as compact JSON after _clean_nan(), creating parent
+    directories. allow_nan=False makes a surviving NaN raise here rather than
+    ship as the bare `NaN` token browsers refuse to parse (the contract suite
+    guards the same seam).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(_clean_nan(data), f, separators=(",", ":"), default=_json_default, allow_nan=False)
@@ -102,6 +108,7 @@ def write_json(path: Path, data) -> None:
 
 
 def _json_default(o):
+    """json.dump fallback: Decimal → float, numpy scalars → Python via .item(); anything else raises."""
     import decimal
     if isinstance(o, decimal.Decimal):
         return float(o)
@@ -111,6 +118,7 @@ def _json_default(o):
 
 
 def _parse_shap(val) -> dict:
+    """Return stored SHAP values as a dict whether stored as a dict or a JSON string; anything else → {}."""
     if isinstance(val, dict):
         return val
     if isinstance(val, str):
@@ -159,12 +167,27 @@ def load_tables() -> dict:
         # separate frame so a projected rating can never be silently mixed into
         # an earned season's export.
         "ratings_projected": read_ratings("projected"),
-        "ea_ratings":       read_raw("ea_ratings"),
         "team_ratings":     read_computed("team_ratings"),
         "team_season_stats": read_computed("team_season_stats"),
     }
     for name, df in t.items():
         print(f"  {name:<20} {len(df):>8} rows")
+    # Class year, derived once here so every export below reads the same value.
+    #
+    # `player_seasons.year` is not a class year - see utils/class_year.py. It was
+    # exported as one anyway, under the name `year`, and the site rendered it as
+    # FR/SO/JR/SR: 46,610 of 71,320 rated rows with a plausible stored value said
+    # "year 4", so a player card could call a true freshman a senior. The raw
+    # column is dropped from the exported frame entirely rather than left beside
+    # the derived one, so no consumer can pick the wrong one; a contract test
+    # asserts the exports carry no `year` key.
+    if not t["player_seasons"].empty:
+        t["player_seasons"] = attach_class_year(
+            t["player_seasons"], t["recruiting"])
+        _cy = t["player_seasons"]["class_year"]
+        print(f"  class_year derived for {len(_cy)} player-seasons "
+              f"({int(_cy.isna().sum())} undeterminable, exported as null)")
+
     t["stats_index"] = build_stats_index(t["stats"])
     return t
 
@@ -241,6 +264,20 @@ def ratings_for(T: dict, season: int) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def export_players(T: dict, output_dir: Path, season: int) -> None:
+    """Write players_{season}.json — one row per rated player-season, sorted by OVR.
+
+    The rating frame is ratings_for(season): projected for an unplayed season,
+    earned otherwise, never both. Joins, in order: player_seasons (the ONLY
+    correct route from a rating to a player — ratings.player_id is a legacy
+    internal key), players, teams, the best recruiting row per player (highest
+    composite, whichever class it came from), player_edge (EDGE, archetypes,
+    coverage_share) and season/postseason stat blobs.
+
+    Rows with no player name are dropped. `class_year` is the DERIVED class
+    year from utils/class_year.py, not player_seasons.year. Projected rows
+    carry provenance, projection_source/confidence/low/high so the
+    UI cannot present them as earned.
+    """
     rat = ratings_for(T, season)
     ps  = T["player_seasons"]
     pl  = T["players"]
@@ -261,7 +298,7 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
     # ratings.player_id is the Supabase internal PK — NOT the CFB API player id.
     # The correct CFB API player id lives in player_seasons.player_id.
     # Join path: ratings.player_season_id → player_seasons.id → player_seasons.player_id → players.id
-    ps_slim = ps[["id", "player_id", "position_group", "year", "team_id"]] \
+    ps_slim = ps[["id", "player_id", "position_group", "class_year", "class_year_basis", "team_id"]] \
                 .rename(columns={"id": "ps_id", "player_id": "cfb_player_id", "team_id": "ps_team_id"})
     ratings_season = ratings_season.merge(ps_slim, left_on="player_season_id", right_on="ps_id", how="left")
     ratings_season = ratings_season.rename(columns={"ps_team_id": "team_id"})
@@ -335,7 +372,12 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
             "name":             row.get("name"),
             "position":         row.get("position"),
             "position_group":   row.get("position_group"),
-            "year":             _i(row.get("year")),
+            # The DERIVED class year, null where undeterminable. Never the raw
+            # `player_seasons.year`, which is not a class year at all: it is
+            # constant across the career for 84.0% of multi-season players and
+            # says year 4 for 65% of the rated rows that carry a plausible value.
+            "class_year":       _i(row.get("class_year")),
+            "class_year_basis": row.get("class_year_basis"),
             "height_in":        _i(row.get("height_in")),
             "weight_lbs":       _i(row.get("weight_lbs")),
             "hometown_state":   row.get("hometown_state"),
@@ -380,7 +422,6 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
             "projection_confidence": row.get("projection_confidence"),
             "projection_low":        _f(row.get("projection_low")),
             "projection_high":       _f(row.get("projection_high")),
-            "ea_ovr":                _f(row.get("ea_ovr")),
         })
 
     players.sort(key=lambda p: p["overall_rating"] or 0, reverse=True)
@@ -392,6 +433,11 @@ def export_players(T: dict, output_dir: Path, season: int) -> None:
 # ---------------------------------------------------------------------------
 
 def export_teams(T: dict, output_dir: Path, season: int) -> None:
+    """Write teams.json — every team's identity (school, colours, logo, stadium)
+    plus `player_count`, the number of rated player-seasons in `season`.
+    `conference` here is the team's CURRENT conference; per-season conference
+    lives in team_history.json.
+    """
     tm  = T["teams"]
     rat = ratings_for(T, season)
     ps  = T["player_seasons"]
@@ -498,6 +544,12 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
 # ---------------------------------------------------------------------------
 
 def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
+    """Write ratings_by_position_{season}.json — {position_group: top 50 by OVR}.
+
+    Uses the same projected-or-earned frame as export_players(). Rows with a
+    null OVR sort last but still occupy slots, so a group with fewer than 50
+    rated players can carry unrated rows at the bottom.
+    """
     rat = ratings_for(T, season)
     ps  = T["player_seasons"]
     pl  = T["players"]
@@ -509,7 +561,7 @@ def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
 
     # ratings.player_id is Supabase internal; use player_seasons.player_id (CFB API id)
     ratings_season = rat[rat["season"] == season].copy()
-    ratings_season = ratings_season.merge(ps[["id", "player_id", "team_id", "position_group", "year"]]
+    ratings_season = ratings_season.merge(ps[["id", "player_id", "team_id", "position_group", "class_year"]]
                         .rename(columns={"id": "ps_id", "player_id": "cfb_player_id"}),
                         left_on="player_season_id", right_on="ps_id", how="left")
     ratings_season = ratings_season.merge(pl[["id", "name"]].rename(columns={"id": "pl_id"}),
@@ -530,7 +582,7 @@ def export_ratings_by_position(T: dict, output_dir: Path, season: int) -> None:
         by_position[pg].append({
             "id":              _i(row.get("cfb_player_id")),
             "name":            row.get("name"),
-            "year":            _i(row.get("year")),
+            "class_year":      _i(row.get("class_year")),
             "team":            row.get("school"),
             "team_abbr":       row.get("abbreviation"),
             "conference":      row.get("conference"),
@@ -739,6 +791,14 @@ def export_similar_players(T: dict, output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def export_rosters(T: dict, output_dir: Path, season: int) -> None:
+    """Write rosters_{season}.json — {team_id: [player, …]} for EVERY player on a
+    roster that season, rated or not, sorted by OVR.
+
+    Starts from player_seasons (not ratings), so reserves and withheld OL
+    appear with a null OVR and their rating_status / rating_basis. Projection
+    columns are selected only if the frame has them — they exist only on the
+    projected engine. Players with no team_id are dropped.
+    """
     ps  = T["player_seasons"]
     pl  = T["players"]
     rat = ratings_for(T, season)
@@ -759,11 +819,11 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
     if not rat.empty:
         # Projection columns only exist on the projected engine, so select them
         # conditionally — omitting them here silently exported every projected
-        # roster row with a null source and no EA cross-check.
+        # roster row with a null source.
         want = ["player_season_id", "overall_rating", "trajectory_score",
                 "breakout_probability", "shap_values",
                 "provenance", "projection_source", "projection_confidence",
-                "projection_low", "projection_high", "ea_ovr"]
+                "projection_low", "projection_high"]
         cols = [c for c in want if c in rat.columns]
         ratings_season = rat[rat["season"] == season][cols].copy()
         merged = merged.merge(ratings_season, left_on="id", right_on="player_season_id",
@@ -799,7 +859,7 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
             "player_season_id": _i(row["id"]),
             "name":             row.get("name"),
             "position_group":   row.get("position_group"),
-            "year":             _i(row.get("year")),
+            "class_year":       _i(row.get("class_year")),
             "height_in":        _i(row.get("height_in")),
             "weight_lbs":       _i(row.get("weight_lbs")),
             "hometown_state":   row.get("hometown_state"),
@@ -823,7 +883,6 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
             "projection_confidence": row.get("projection_confidence"),
             "projection_low":        _f(row.get("projection_low")),
             "projection_high":       _f(row.get("projection_high")),
-            "ea_ovr":                _f(row.get("ea_ovr")),
         })
 
     for tid in rosters:
@@ -837,6 +896,14 @@ def export_rosters(T: dict, output_dir: Path, season: int) -> None:
 # ---------------------------------------------------------------------------
 
 def export_schedules(T: dict, output_dir: Path, season: int) -> None:
+    """Write schedules_{season}.json — {team_id: [game, …]}, each game from that
+    team's side.
+
+    An opponent with no team_id of ours (FCS) keeps the name harvested with
+    the game and gets opp_is_fbs=False so the UI names it without linking it.
+    A null opponent score counts as 0 when deciding W/L but is exported as
+    null. Unplayed games have result=None.
+    """
     games = T["games"]
     teams = T["teams"]
 
@@ -916,6 +983,15 @@ def export_schedules(T: dict, output_dir: Path, season: int) -> None:
 # ---------------------------------------------------------------------------
 
 def export_transfers(T: dict, output_dir: Path, season: int) -> None:
+    """Write transfers_{season}.json — {team_id: [transfer, …]}, each move listed
+    under BOTH schools with direction "out" (origin) and "in" (destination).
+
+    ovr_previous is the EARNED rating at the origin school the season before;
+    ovr_current is the earned rating at the destination this season. Only the
+    earned frame is read, so for an unplayed season ovr_current is always null —
+    a projection is never shown as a transfer's result. Unresolved schools
+    export as "Unknown school"; unlinked transfers are skipped.
+    """
     tr  = T["transfers"]
     pl  = T["players"]
     ps  = T["player_seasons"]
@@ -1046,6 +1122,13 @@ def _build_conf_history(teams: "pd.DataFrame") -> dict:
 
 
 def export_team_history(T: dict, output_dir: Path) -> None:
+    """Write team_history.json — {team_id: [season row, …]} newest first, across
+    every season with a team rating.
+
+    W/L is counted from every game with both scores (postseason included; ties
+    count for neither). Conference is resolved per season via
+    _build_conf_history(), whose realignment overrides are a frozen constant.
+    """
     tr    = T["team_ratings"]
     games = T["games"]
     teams = T["teams"]
@@ -1098,6 +1181,10 @@ def export_team_history(T: dict, output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def export_team_stats(T: dict, output_dir: Path, season: int) -> None:
+    """Write team_stats_{season}.json — {team_id: per-game team metrics} from
+    data/computed/team_season_stats, NaN → null. Not written for a season with
+    no rows, which includes every unplayed season.
+    """
     ts = T.get("team_season_stats")
     if ts is None or ts.empty:
         return
@@ -1169,121 +1256,6 @@ def export_player_transfers(T: dict, output_dir: Path) -> None:
 # Export: research/index.json
 # ---------------------------------------------------------------------------
 
-# The handful of EA attributes that actually describe a position, so a player's
-# card can show what EA thinks he is rather than only what it thinks he is worth.
-# Shipping all 54 would be a 12 MB file to say very little.
-EA_ATTRS_BY_POS = {
-    "QB":   ["throwPower", "throwAccuracyShort", "throwAccuracyMid", "throwAccuracyDeep",
-             "throwUnderPressure", "awareness", "speed"],
-    "RB":   ["speed", "acceleration", "agility", "breakTackle", "carrying", "bCVision", "trucking"],
-    "WR":   ["speed", "catching", "shortRouteRunning", "mediumRouteRunning",
-             "deepRouteRunning", "spectacularCatch", "catchInTraffic"],
-    "TE":   ["catching", "shortRouteRunning", "catchInTraffic", "runBlock", "speed", "strength"],
-    "OL":   ["passBlock", "runBlock", "passBlockPower", "runBlockPower",
-             "impactBlocking", "strength", "awareness"],
-    "EDGE": ["powerMoves", "finesseMoves", "blockShedding", "pursuit", "tackle",
-             "strength", "acceleration"],
-    "DL":   ["powerMoves", "finesseMoves", "blockShedding", "pursuit", "tackle",
-             "strength", "acceleration"],
-    "LB":   ["tackle", "hitPower", "pursuit", "playRecognition", "zoneCoverage",
-             "blockShedding", "speed"],
-    "CB":   ["manCoverage", "zoneCoverage", "press", "speed", "acceleration",
-             "playRecognition", "tackle"],
-    "S":    ["zoneCoverage", "manCoverage", "playRecognition", "tackle", "hitPower",
-             "speed", "pursuit"],
-    "DB":   ["manCoverage", "zoneCoverage", "press", "speed", "playRecognition", "tackle"],
-    "K":    ["kickPower", "kickAccuracy", "awareness"],
-    "P":    ["kickPower", "kickAccuracy", "awareness"],
-}
-
-# EA's own position labels -> our 12 groups, for picking the attribute set.
-_EA_POS_TO_GROUP = {
-    "QB": "QB", "HB": "RB", "RB": "RB", "FB": "RB", "WR": "WR", "TE": "TE",
-    "LT": "OL", "LG": "OL", "C": "OL", "RG": "OL", "RT": "OL", "OL": "OL",
-    "LE": "EDGE", "RE": "EDGE", "DE": "EDGE", "EDGE": "EDGE", "LEDG": "EDGE", "REDG": "EDGE",
-    "DT": "DL", "DL": "DL",
-    "LOLB": "LB", "ROLB": "LB", "MLB": "LB", "LB": "LB",
-    "MIKE": "LB", "WILL": "LB", "SAM": "LB",
-    "CB": "CB", "FS": "S", "SS": "S", "S": "S", "DB": "DB", "K": "K", "P": "P",
-}
-
-_ATTR_LABELS = {
-    "throwPower": "Throw Power", "throwAccuracyShort": "Short Accuracy",
-    "throwAccuracyMid": "Mid Accuracy", "throwAccuracyDeep": "Deep Accuracy",
-    "throwUnderPressure": "Under Pressure", "awareness": "Awareness",
-    "speed": "Speed", "acceleration": "Acceleration", "agility": "Agility",
-    "breakTackle": "Break Tackle", "carrying": "Carrying", "bCVision": "Vision",
-    "trucking": "Trucking", "catching": "Catching",
-    "shortRouteRunning": "Short Routes", "mediumRouteRunning": "Mid Routes",
-    "deepRouteRunning": "Deep Routes", "spectacularCatch": "Spectacular Catch",
-    "catchInTraffic": "Catch in Traffic", "runBlock": "Run Block",
-    "passBlock": "Pass Block", "passBlockPower": "Pass Block Power",
-    "runBlockPower": "Run Block Power", "impactBlocking": "Impact Blocking",
-    "strength": "Strength", "powerMoves": "Power Moves",
-    "finesseMoves": "Finesse Moves", "blockShedding": "Block Shedding",
-    "pursuit": "Pursuit", "tackle": "Tackle", "hitPower": "Hit Power",
-    "playRecognition": "Play Recognition", "zoneCoverage": "Zone Coverage",
-    "manCoverage": "Man Coverage", "press": "Press",
-    "kickPower": "Kick Power", "kickAccuracy": "Kick Accuracy",
-}
-
-
-def export_ea_ratings(T: dict, output_dir: Path) -> None:
-    """EA CFB 27 overalls plus a position-relevant slice of their attributes.
-
-    The raw table carries 54 attributes per player (12 MB). Shipping the six or
-    seven that describe the position keeps the file small while letting a card
-    say what EA thinks a player *is*, not just what he is worth.
-    """
-    ea = T.get("ea_ratings")
-    if ea is None or ea.empty:
-        print("  ea_ratings: none on file — skipping")
-        return
-
-    tm = T["teams"]
-    ps = T["player_seasons"]
-    # EA's team names are its own; map through our player_seasons where matched
-    # so the frontend can group by the same team_id it uses everywhere else.
-    season = int(ea["ea_season"].max()) if "ea_season" in ea.columns else None
-    tid_by_pid = {}
-    if season is not None and not ps.empty:
-        for r in ps[ps["season"] == season].itertuples(index=False):
-            if pd.notna(r.player_id) and pd.notna(r.team_id):
-                tid_by_pid[int(r.player_id)] = int(r.team_id)
-    school_by_tid = dict(zip(tm["id"], tm["school"])) if not tm.empty else {}
-
-    rows = []
-    for r in ea.itertuples(index=False):
-        pid = _i(getattr(r, "player_id", None))
-        tid = tid_by_pid.get(pid) if pid else None
-        pos = getattr(r, "position", None)
-        grp = _EA_POS_TO_GROUP.get(pos)
-
-        attrs = getattr(r, "attributes", None)
-        picked = []
-        if isinstance(attrs, dict) and grp:
-            for key in EA_ATTRS_BY_POS.get(grp, []):
-                v = _i(attrs.get(key))
-                if v is not None:
-                    picked.append({"key": key, "label": _ATTR_LABELS.get(key, key), "value": v})
-
-        rows.append({
-            "ea_player_id": _i(getattr(r, "ea_player_id", None)),
-            "player_id":    pid,
-            "name":         getattr(r, "name", None),
-            "team_id":      tid,
-            "team":         school_by_tid.get(tid) or getattr(r, "ea_team", None),
-            "position":     pos,
-            "position_group": grp,
-            "class_year":   getattr(r, "class_year", None),
-            "ovr":          _i(getattr(r, "ovr", None)),
-            "attributes":   picked or None,
-        })
-    rows.sort(key=lambda x: x["ovr"] or 0, reverse=True)
-    name = f"ea_ratings_{season}.json" if season else "ea_ratings.json"
-    write_json(output_dir / name, rows)
-
-
 def export_manifest(T: dict, output_dir: Path) -> None:
     """One source of truth for which seasons exist and which are projected.
 
@@ -1315,6 +1287,10 @@ def export_manifest(T: dict, output_dir: Path) -> None:
 
 
 def export_research(T: dict, output_dir: Path) -> None:
+    """Write data/research/index.json plus one research/{key}.json per
+    research_cache entry. research_cache is currently empty, so this writes
+    `[]` — see the backlog item in CLAUDE.md §6 (wire it or delete it).
+    """
     rc = T["research_cache"]
     research_dir = output_dir / "research"
 
@@ -1357,6 +1333,14 @@ ALL_SEASONS = list(range(2008, CURRENT_SEASON + 1))
 
 
 def main():
+    """CLI entry point: export every season (ALL_SEASONS) or --season N into
+    --output (default: the sibling app's data/).
+
+    Season-agnostic files first (teams, team ratings, history, similar players,
+    player transfers, manifest, research), then the six per-season
+    files. Tables are loaded once. Note that teams.json's player_count reflects
+    the LAST season in the run.
+    """
     parser = argparse.ArgumentParser(description="Export local data -> static JSON for frontend")
     parser.add_argument("--season", type=int, default=None,
                         help="Single season to export (default: all seasons)")
@@ -1389,9 +1373,6 @@ def main():
 
     print("player_transfers.json...")
     export_player_transfers(T, output_dir)
-
-    print("ea_ratings_{season}.json...")
-    export_ea_ratings(T, output_dir)
 
     print("manifest.json...")
     export_manifest(T, output_dir)

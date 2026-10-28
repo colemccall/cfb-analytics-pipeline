@@ -3,33 +3,17 @@
 Read-only. Writes nothing, changes nothing — run it after any weight, anchor or
 input change to scripts 06/07 and read the table before shipping.
 
-Two questions, which are not the same question:
+The question it answers:
 
 1. **Shape.** Per position: how many players, where the mass sits, and how many
    clear 85 and 90. Distribution shape is a hard gate on this project — a tweak
    that helps one player but lifts every running back with him is wrong, and the
    only way to see that is the whole distribution, every time.
 
-2. **Agreement.** Within-position Spearman against EA Sports CFB 27, over the
-   players both sides have. EA is a **reference, not a target**: it never supplies
-   a number, it answers "are we too generous, too stingy, is the ceiling in the
-   right place". Rank-matching to it every season would reintroduce exactly the
-   pool-relative scaling AUDIT_FINDINGS §9 exists to forbid.
-
-   The comparison is deliberately restricted to matched players and scored under
-   *our* position groups, so both sides describe the same population. EA counts
-   here are therefore lower than EA's published totals, which cover its whole
-   roster including players we never matched.
-
-   One caveat that cannot be engineered away: we hold exactly one season of EA
-   data (CFB 27, 2026), so this is a cross-section against the most recent played
-   season, never a backtest.
-
 Usage:
     python scripts/validate_ratings.py                        # 2025, engine=edge
     python scripts/validate_ratings.py --season 2024
     python scripts/validate_ratings.py --season 2026 --engine projected
-    python scripts/validate_ratings.py --season 2025 --no-ea
 """
 
 import argparse
@@ -70,58 +54,16 @@ def distribution(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-def ea_agreement(df: pd.DataFrame, ea: pd.DataFrame) -> pd.DataFrame:
-    """Within-position rank agreement with EA, over players both sides have.
-
-    Spearman, not Pearson: the two scales are not the same instrument, and only
-    the ordering is meant to be comparable.
-    """
-    ea = ea[ea["player_id"].notna()][["player_id", "ovr"]].copy()
-    ea["player_id"] = ea["player_id"].astype("int64")
-    # EA ships one row per player; ours is per player-season. Best rating wins so
-    # a player who changed teams mid-season is not counted twice.
-    mine = df[df["player_id"].notna()].copy()
-    mine["player_id"] = mine["player_id"].astype("int64")
-    mine = mine.sort_values("overall_rating", ascending=False) \
-               .drop_duplicates(subset=["player_id"], keep="first")
-
-    m = mine.merge(ea, on="player_id", how="inner")
-    out = []
-    for pg in POSITION_ORDER:
-        g = m[m["position_group"] == pg]
-        if len(g) < 10:
-            continue
-        # A position we decline to rate has nothing to correlate. Printing NaN
-        # reads as a broken computation; "withheld" reads as the decision it is.
-        # OL is the case: its old rating scored -0.2742 here, which is what
-        # withdrawing it was for.
-        if g["overall_rating"].notna().sum() < 10:
-            out.append({"pos": pg, "matched": len(g), "spearman": "withheld",
-                        "ours 85+": "—", "EA 85+": int((g["ovr"] >= 85).sum()),
-                        "ours 90+": "—", "EA 90+": int((g["ovr"] >= 90).sum())})
-            continue
-        out.append({
-            "pos":       pg,
-            "matched":   len(g),
-            "spearman":  round(float(g["overall_rating"].corr(g["ovr"], method="spearman")), 4),
-            "ours 85+":  int((g["overall_rating"] >= 85).sum()),
-            "EA 85+":    int((g["ovr"] >= 85).sum()),
-            "ours 90+":  int((g["overall_rating"] >= 90).sum()),
-            "EA 90+":    int((g["ovr"] >= 90).sum()),
-        })
-    frame = pd.DataFrame(out)
-    if not frame.empty:
-        overall = m["overall_rating"].corr(m["ovr"], method="spearman")
-        frame.attrs["pooled"] = round(float(overall), 4)
-        frame.attrs["n"] = len(m)
-    return frame
-
-
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Rating distribution + EA agreement report")
+    """Print a season's rating distribution per position.
+
+    A readout, not a gate: it exits 1 only when there are no ratings for the
+    requested engine/season. Position group and player id are joined from
+    player_seasons, the join anchor, because rating rows do not carry them.
+    """
+    ap = argparse.ArgumentParser(description="Rating distribution report")
     ap.add_argument("--season", type=int, default=2025)
     ap.add_argument("--engine", default="edge")
-    ap.add_argument("--no-ea", action="store_true", help="skip the EA comparison")
     args = ap.parse_args()
 
     ratings = read_ratings(args.engine)
@@ -144,24 +86,6 @@ def main() -> None:
 
     print(f"\n=== {args.season} · engine={args.engine} · {len(season)} rated player-seasons ===\n")
     print(distribution(season).to_string(index=False))
-
-    if args.no_ea:
-        return
-    ea = read_raw("ea_ratings")
-    if ea.empty or "player_id" not in ea.columns:
-        print("\n(no EA ratings on file — run script 08)")
-        return
-
-    agree = ea_agreement(season, ea)
-    if agree.empty:
-        print("\n(too few matched players for an EA comparison)")
-        return
-    print(f"\n=== vs EA CFB 27 · {agree.attrs['n']} matched players ===")
-    print("EA counts cover matched players only, under our position groups.\n")
-    print(agree.to_string(index=False))
-    print(f"\npooled Spearman (all positions): {agree.attrs['pooled']}")
-    print("Within-position is the number that matters — pooling one is inflated by "
-          "position-level differences in scale.\n")
 
 
 if __name__ == "__main__":

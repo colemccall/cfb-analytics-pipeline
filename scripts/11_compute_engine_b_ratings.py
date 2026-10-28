@@ -121,6 +121,10 @@ def _best_recruiting_by_player(recruiting: pd.DataFrame) -> dict[int, list[dict]
 
 
 def _nil_by_player(nil_df: pd.DataFrame) -> dict[int, float]:
+    """Index NIL valuations by player_id → valuation_usd (float). Rows missing
+    either value are skipped; an absent column returns {}. Currently always
+    {} — the NIL source is blocked (see script 04).
+    """
     if nil_df.empty or "player_id" not in nil_df.columns:
         return {}
     col = "valuation_usd" if "valuation_usd" in nil_df.columns else None
@@ -186,6 +190,17 @@ def compute_nil_position_medians(rows: list[dict]) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 def compute_engine_b(row: dict, nil_medians: dict[str, float]) -> dict | None:
+    """One player-season → an Engine B rating row, or None when there is neither
+    a recruiting composite nor a NIL value.
+
+        ovr = 0.60·recruit_to_ovr + 0.40·nil_to_ovr   when both exist
+            = whichever one exists                      otherwise
+
+    clipped to [30, 99]. `shap_values` stores each input's deviation from a
+    neutral 65. Engine B is a talent estimate, not an earned rating: it never
+    reads production, and it is stored under engine="engine_b" so it cannot
+    overwrite an Engine A row.
+    """
     pg = row.get("position_group") or "ATH"
 
     composite = row.get("recruit_composite")
@@ -229,6 +244,10 @@ def compute_engine_b(row: dict, nil_medians: dict[str, float]) -> dict | None:
 
 def run_season(season: int, player_seasons: pd.DataFrame,
                recruiting_idx: dict, nil_idx: dict) -> list[dict]:
+    """Compute Engine B for every player-season in `season`, skipping players
+    with no inputs, and return one row per player_season_id (first wins).
+    NIL position medians are computed per season from the rows themselves.
+    """
     print(f"\n[Engine B] Season {season}")
     rows = fetch_player_seasons(season, player_seasons, recruiting_idx, nil_idx)
     print(f"  {len(rows)} player-seasons loaded")
@@ -279,6 +298,11 @@ def merge_into_ratings(new_rows: list[dict]) -> None:
 
 
 def main():
+    """CLI entry point: --season N (repeatable; default 2021–2026). Loads
+    player_seasons, best recruiting row per player and NIL once, computes each
+    season, and merges into data/computed/ratings.json under engine_b.
+    Writes nothing if no rows were computed.
+    """
     parser = argparse.ArgumentParser(description="Engine B ratings -> data/computed/ratings.json")
     parser.add_argument("--season", type=int, action="append", dest="seasons",
                         help="Season to process (default: 2021–2026). Repeatable.")

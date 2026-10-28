@@ -136,7 +136,7 @@ class TestProvenance:
 
     def test_projected_seasons_carry_provenance(self, manifest):
         """Every row says what it is. "not_projected" is a legitimate answer —
-        offensive linemen are exported so EA's opinion can be shown beside our
+        offensive linemen are exported so a lineman stays on his own roster beside our
         refusal — but it must come with no rating of ours attached."""
         for s in manifest["projected_seasons"]:
             players = _load(f"players_{s}.json")
@@ -156,7 +156,7 @@ class TestProvenance:
             )
 
     def test_projected_rows_name_their_source(self, manifest):
-        valid = {"engine_d", "carry", "recruiting", "ea_cfb27"}
+        valid = {"engine_d", "carry", "recruiting"}
         for s in manifest["projected_seasons"]:
             for p in _load(f"players_{s}.json"):
                 if p.get("overall_rating") is None:
@@ -444,3 +444,97 @@ class TestLineUnitRating:
         assert any(r.get("line_unit_inputs") for r in withrating), (
             "the team page renders the inputs as bars; without them it has "
             "a number and no explanation")
+
+
+class TestClassYear:
+    """The exported class year is derived, and unknown is allowed to be unknown.
+
+    `player_seasons.year` is not a class year. Measured on the store 2026-08-18:
+    constant across the whole career for 24,972 of 29,722 players with three or
+    more seasons that carry a plausible value (84.0%), never incrementing, an
+    outright calendar year in 114,612 of 269,552 rows, and — over rated rows with
+    a plausible value — saying "year 4" for 46,610 of 71,320 (65%).
+
+    It was exported under the name `year` and the site rendered it as FR/SO/JR/SR
+    anyway. `cohort_curves.json` is keyed on the *derived* class year that script
+    15 computes, and script 16 looked that table up with the raw one, so the
+    projection carry path asked "what do juniors do next" of a table that had
+    never been told who the juniors were.
+
+    These tests pin the three things that fix has to keep true.
+    """
+
+    @pytest.fixture(scope="class")
+    def players(self, manifest):
+        season = manifest["last_played_season"]
+        path = APP_DATA / f"players_{season}.json"
+        if not path.exists():
+            pytest.skip(f"players_{season}.json not exported yet")
+        return _load(f"players_{season}.json")
+
+    def test_no_consumer_reads_the_raw_year_field(self):
+        """The raw column is not exported at all, under any name a page could
+        mistake for a class year. Leaving it beside the derived one is how a
+        consumer picks the wrong one — which is the defect, not a risk of it."""
+        offenders = []
+        for path in sorted(APP_DATA.glob("players_*.json")):
+            rows = _load(path.name)
+            if rows and isinstance(rows[0], dict) and "year" in rows[0]:
+                offenders.append(path.name)
+        for name in ("rosters_2025.json", "top_players.json"):
+            p = APP_DATA / name
+            if not p.exists():
+                continue
+            rows = _load(name)
+            sample = rows[0] if isinstance(rows, list) and rows else None
+            if isinstance(rows, dict):
+                first = next(iter(rows.values()), None)
+                sample = first[0] if isinstance(first, list) and first else None
+            if isinstance(sample, dict) and "year" in sample:
+                offenders.append(name)
+        assert not offenders, (
+            f"these exports still carry a raw `year` key: {offenders}. "
+            "It is not a class year; export `class_year` from utils/class_year.py.")
+
+    def test_class_year_is_plausible_or_null(self, players):
+        bad = [p for p in players
+               if p.get("class_year") is not None
+               and not (1 <= p["class_year"] <= 6)]
+        assert not bad, f"{len(bad)} rows carry an out-of-range class year"
+
+    def test_unknown_renders_as_unknown_not_as_a_freshman(self, players):
+        """The branch this whole design exists for. A defaulted class year hands
+        every unmatched transfer the full true-freshman recruiting prior, which
+        is precisely backwards — so undeterminable must be null, and it must
+        actually occur. If this reads zero the default has crept back in."""
+        unknown = [p for p in players if p.get("class_year") is None]
+        assert unknown, (
+            "no row has an unknown class year. 1.7% of rated player-seasons are "
+            "left-censored with no recruiting anchor; a run with none of them "
+            "means the unknown branch has been filled with a default.")
+        for p in unknown:
+            assert p.get("class_year_basis") in (None, "unknown"), (
+                f"{p.get('name')} has no class year but claims basis "
+                f"{p.get('class_year_basis')}")
+
+    def test_the_distribution_is_not_a_spike(self, players):
+        """The stored field's tell was that 65% of it said one value. Whatever
+        the derived distribution's exact shape, no single class year may hold a
+        majority of the rows."""
+        from collections import Counter
+        c = Counter(p["class_year"] for p in players
+                    if p.get("class_year") is not None)
+        assert c, "no class years exported at all"
+        top, n = c.most_common(1)[0]
+        assert n < 0.5 * sum(c.values()), (
+            f"class year {top} holds {n}/{sum(c.values())} rows — that is a "
+            "default, not a distribution")
+
+    def test_the_basis_is_named_when_the_year_is(self, players):
+        named = [p for p in players if p.get("class_year") is not None]
+        assert named
+        bad = [p for p in named
+               if p.get("class_year_basis") not in ("recruiting", "first_fbs")]
+        assert not bad, (
+            f"{len(bad)} rows carry a class year with no anchor named. "
+            "`first_fbs` is a floor and has to be labelled as one.")

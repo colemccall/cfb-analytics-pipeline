@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+import os
 from decimal import Decimal
 from datetime import date, datetime
 from pathlib import Path
@@ -23,12 +24,19 @@ import pandas as pd
 from utils.json_utils import clean_nan
 
 _ROOT     = Path(__file__).parent.parent
-RAW_DIR   = _ROOT / "data" / "raw"
-COMPUTED_DIR  = _ROOT / "data" / "computed"
+# CFB_DATA_DIR points the whole store at another data folder (raw/ and computed/
+# inside it). It exists so an experiment or a provisional run — the in-season
+# "live" ratings, the pace validation — can rate into a private copy and never
+# write a partial season into the files every other script reads. Unset, nothing
+# changes. Set before the process starts: the paths are read once at import.
+_DATA     = Path(os.environ["CFB_DATA_DIR"]) if os.environ.get("CFB_DATA_DIR") else _ROOT / "data"
+RAW_DIR   = _DATA / "raw"
+COMPUTED_DIR  = _DATA / "computed"
 
 
 class _Encoder(json.JSONEncoder):
     def default(self, o):
+        """Decimal → float, date/datetime → ISO string, numpy scalar → Python; else defer to json."""
         if isinstance(o, Decimal):
             return float(o)
         if isinstance(o, (date, datetime)):
@@ -39,6 +47,7 @@ class _Encoder(json.JSONEncoder):
 
 
 def _load_json(path: Path) -> list[dict]:
+    """Read a JSON list from `path`; a missing file or a non-list payload returns []."""
     if not path.exists():
         return []
     with open(path, encoding="utf-8") as f:

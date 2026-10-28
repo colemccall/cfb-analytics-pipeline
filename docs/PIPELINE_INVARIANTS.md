@@ -37,8 +37,8 @@ No build step. 41 unit tests in `tests/` — no network or credentials required.
 **Local JSON only — there is no database.** Every script reads and writes plain JSON via
 `utils/store.py` (`read_raw`, `read_computed`, `read_ratings`, `write_computed`). The project
 previously ran on Supabase/PostgreSQL; that layer was fully retired in Aug 2026. The only
-credential needed is `CFB_API_KEY`. Retired DDL is in `archive/sql/` as field documentation
-only — never executed. **Do not reintroduce psycopg2, supabase, or DATABASE_URL.**
+credential needed is `CFB_API_KEY`. Retired DDL lives in the portfolio
+`archive/supabase/sql/` as field documentation only — never executed. **Do not reintroduce psycopg2, supabase, or DATABASE_URL.**
 
 **Always engine-filter when reading ratings.** `data/computed/ratings.json` holds every
 engine's output in one file keyed by `(player_season_id, season, engine)`. Reading it
@@ -244,7 +244,7 @@ the same player of ours. Script 03 has its own transfer-specific variant requiri
 05 → coaching changes (seed CSV + ESPN tracker, Selenium)
 06 → EDGE scores per player-season
 07 → player ratings, engine='edge'  (needs 06)
-08 → EA CFB 27 ratings (plain HTTP via EA's Next.js data route — no browser)
+08 → (retired 2026-10-27: the EA CFB 27 harvest; the number is kept so the order below stays stable)
 09 → supplemental harvest: 17 datasets the API survey found and we were not using
      (coaches, draft picks, advanced season/game stats, havoc, returning production,
       betting lines, pregame WP, CFP field, play counts, wepa, talent, records, ATS,
@@ -267,10 +267,10 @@ again at the end: 15, 16 and the projected team ratings all land after the first
 
 `scripts/validate_ratings.py` is not part of the chain — it writes nothing. Run it after any
 change to 06/07 and read the table before shipping: per-position distribution plus
-within-position Spearman against EA. Distribution shape is a hard gate.
+(until 2026-10-27) within-position Spearman against EA. Distribution shape is a hard gate.
 
-`scripts/validate_vs_draft.py` is the external check. EA is one season and can never be a
-backtest; the draft is eighteen years deep and was decided without seeing our numbers. Drafted
+`scripts/validate_vs_draft.py` is the external check, and since 2026-10-27 the only one that
+survives. EA was one season and could never be a backtest; the draft is eighteen years deep and was decided without seeing our numbers. Drafted
 players average a peak rating of 82.8 against 62.8 undrafted, and P(drafted | rating band) is
 monotone across all six bands. **Our defensive ratings order draft picks at Spearman 0.13–0.25
 against 0.42–0.49 for offence** — the clearest external evidence for why usage and the defensive
@@ -283,8 +283,7 @@ rating are the next phase.
 | `edge` | 07 | EDGE formula, opponent-adjusted, era-bucketed anchors |
 | `engine_b` | 11 | 60% recruiting + 40% NIL (recruiting-only while NIL is empty) |
 | `engine_d` | 15 | Career EDGE curve + cohort development, variance-calibrated (own file, `trajectory.json`) |
-| `projected` | 16 | Upcoming-season rating: engine_d → cohort carry → recruiting → EA CFB 27 |
-| `ea_cfb27` | 08 | EA Sports CFB 27 ratings, 54 attributes (own file, `ea_ratings.json`) |
+| `projected` | 16 | Upcoming-season rating: engine_d → cohort carry → recruiting (EA CFB 27 was a last source until 2026-10-27) |
 
 **Every ranked research finding is shrunk and carries an interval** (`utils/shrinkage.py`).
 Ranking 2,310 noisy team-seasons puts luck at the top by construction. `shrink_mean` for
@@ -424,14 +423,15 @@ both hits and misses are cached.
 harvested rosters, `engine='projected'` player and team ratings, EA CFB 27 side by side.
 Engine D was rebuilt on career EDGE curves + cohort development (MAE 8.24 vs 9.32 naive,
 80% intervals covering 79.8%), and every projection ships drivers, a plain-English
-explanation and historical comparables. Full record:
-`cfb-analytics-app/CHANGELOG_v3.2_projections.md`.
+explanation and historical comparables. Full record: the app's Build Log entry
+`v3.2-projections` (`cfb-analytics-app/js/changes.js`).
 
 **Shipped v3.3 / rating v4.2 (Aug 2026):** projections split by position family with OL no
 longer projected at all, an opportunity model for offensive skill, secondary archetypes, a
 position-by-position rating recalibration against EA as an external reference, coverage denial
 measured against the offense actually faced, and the recovery of players whose season aggregate
-the API never wrote. Full record: `cfb-analytics-app/CHANGELOG_v3.3_ratings.md`.
+the API never wrote. Full record: the app's Build Log entry `v3.3-ratings`
+(`cfb-analytics-app/js/changes.js`).
 
 **Next phase: usage, then the defensive rating.** Snap share and PPA are already harvested,
 inside the `season_aggregate` payload, and unlike anything EA-based they are historical and can

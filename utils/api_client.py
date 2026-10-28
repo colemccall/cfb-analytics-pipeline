@@ -27,6 +27,20 @@ CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", ".cache")
 VERIFY_TLS = os.getenv("CFB_API_INSECURE", "").strip() not in ("1", "true", "True")
 
 
+def refresh_years() -> set:
+    """Seasons whose cached responses must not be trusted, from CFB_REFRESH_YEARS.
+
+    The cache has no expiry, which is right for a finished season and wrong for
+    one being played: 2026 was cached in August (rosters, a schedule with no
+    results) and a re-harvest in October would silently have returned August.
+    Setting CFB_REFRESH_YEARS=2026 (comma-separated for several) makes every
+    request whose `year` parameter is listed skip the cache and overwrite it.
+    Unset by default, so nothing changes for a played season.
+    """
+    raw = os.getenv("CFB_REFRESH_YEARS", "")
+    return {int(x) for x in raw.replace(" ", "").split(",") if x.isdigit()}
+
+
 def load_api_key() -> str:
     """Load CFB_API_KEY from .env. Raises RuntimeError if missing."""
     load_dotenv()
@@ -61,7 +75,10 @@ def _get(api_key: str, path: str, params: dict | None = None, retries: int = 5) 
     cache_key = _cache_key(path, params)
     cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
 
-    if os.path.exists(cache_file):
+    year = (params or {}).get("year")
+    refresh = year is not None and str(year).isdigit() and int(year) in refresh_years()
+
+    if os.path.exists(cache_file) and not refresh:
         print(f"  [cache] {path} {params or ''}")
         with open(cache_file) as f:
             return json.load(f)

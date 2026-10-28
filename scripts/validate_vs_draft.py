@@ -75,6 +75,14 @@ def peak_ratings() -> pd.DataFrame:
 
 
 def main() -> None:
+    """External check: do players we rated highly get drafted, and does draft round track peak OVR?
+
+    Joins /draft/picks to our players on the CFBD athlete id (college_athlete_id
+    = players.cfb_api_id), attaches each player's peak EARNED OVR, and prints
+    match rates, peak OVR by round and drafted-vs-undrafted gaps. Most picks
+    we never rated are offensive linemen, whom we deliberately do not rate.
+    Exits 1 when draft data or earned ratings are missing.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-export", action="store_true")

@@ -212,6 +212,7 @@ def schema_of(obj, prefix: str = "", depth: int = 0) -> dict:
 
 
 def summarize(body) -> dict:
+    """Reduce a probe response to {count, schema, sample}: a list is counted and typed from its first element; a dict counts as 1."""
     if body is None:
         return {"count": 0, "schema": {}, "sample": None}
     if isinstance(body, dict):
@@ -255,6 +256,7 @@ def usage(api_key: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 def load_spec(api_key: str, offline: bool) -> dict:
+    """Fetch the API's OpenAPI spec (cached like any probe) and return its `paths`; {} if it cannot be loaded."""
     res = probe(api_key, SPEC_PATH, {}, offline)
     if res.get("status") != 200 or not res.get("body"):
         print("  could not load the OpenAPI spec; cannot enumerate endpoints")
@@ -263,6 +265,16 @@ def load_spec(api_key: str, offline: bool) -> dict:
 
 
 def phase_schema(api_key: str, paths: dict, offline: bool) -> list[dict]:
+    """Probe every GET endpoint in the spec once and record status, record count,
+    schema and likely join keys.
+
+    Required parameters come from FIXTURE; an endpoint needing one FIXTURE lacks
+    is recorded as "no fixture" rather than probed. `year` is always added when
+    supported so the probe is bounded to one season — but never `team`, because
+    several endpoints filter by a different team relationship than the name
+    suggests. A 400 is retried with team, then week, since some endpoints need a
+    narrowing parameter the spec does not mark required.
+    """
     print(f"\n=== schema: {len(paths)} endpoints ===")
     rows = []
     for path in sorted(paths):
@@ -324,6 +336,10 @@ def phase_schema(api_key: str, paths: dict, offline: bool) -> list[dict]:
 
 
 def phase_coverage(api_key: str, offline: bool) -> dict:
+    """For each PRIORITY endpoint, count records per season in COVERAGE_YEARS.
+    None means the call did not return 200 — not that the season is empty.
+    This table is what answers "when does this data actually start".
+    """
     print(f"\n=== coverage: {len(PRIORITY)} endpoints x {len(COVERAGE_YEARS)} seasons ===")
     out: dict = {}
     for path in PRIORITY:
@@ -421,6 +437,12 @@ VERIFIED_ABSENT = [
 
 
 def write_outputs(spec_rows, coverage, joins, usage_delta):
+    """Write data/computed/api_inventory.json and the generated
+    docs/API_INVENTORY.md: the verified-absent list with evidence, every
+    endpoint's status and join keys, the season-coverage grid and the request
+    cost of the survey. The app's Methods page reads the JSON (via the export);
+    the markdown is never hand-edited.
+    """
     COMPUTED_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "endpoints": [{k: v for k, v in r.items() if k != "sample"} for r in spec_rows],
@@ -513,6 +535,11 @@ def write_outputs(spec_rows, coverage, joins, usage_delta):
 
 
 def main() -> None:
+    """CLI entry point: run the schema, coverage and join phases (or one via
+    --phase); --offline serves everything from .cache/ and issues no requests.
+    Reports the live request count and the rolling 7-day usage delta. Outputs
+    are written only when the schema phase ran.
+    """
     ap = argparse.ArgumentParser(description="Survey the CFB Data API (read-only)")
     ap.add_argument("--phase", choices=["all", "schema", "coverage", "join"], default="all")
     ap.add_argument("--offline", action="store_true", help="cache only; issue no requests")

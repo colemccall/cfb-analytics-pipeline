@@ -61,6 +61,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.store import read_raw, read_ratings
+from utils.class_year import derive_class_year, recruit_year_map
 from utils.draft import apply_departure_rate, departure_rates, drafted_by_player
 from utils.json_utils import write_json
 from utils.stat_agg import aggregate_game_stats
@@ -299,39 +300,6 @@ def flag_interruptions(avails) -> list:
     return flags
 
 
-def derive_class_year(seasons, recruit_years, first_seasons) -> np.ndarray:
-    """Class year, derived — because the stored one is not a class year at all.
-
-    `player_seasons.year` is a static player attribute, not a per-season value.
-    Of 29,722 players with three or more seasons and a plausible stored value, it
-    is CONSTANT across the whole career for 84% and erratic for the rest; not one
-    increments correctly. On top of that it holds a calendar year outright for
-    114,612 of 269,552 rows, almost all before 2017.
-
-    That silently broke the cohort curves, which are the explainable backbone of
-    every projection: a cell keyed (position, class year) was not measuring what
-    juniors do next, it was mixing one player's freshman, sophomore and junior
-    seasons under whichever label he happened to carry. Jaden Mickey played four
-    seasons and was labelled a junior in all of them.
-
-    Two anchors, in order of trust:
-      1. recruit_year from the recruiting table — a real enrolment date,
-         available for 52% of player-seasons.
-      2. the first season we observe him — a FLOOR, not a truth: a career that
-         began before our data starts looks younger than it was.
-    Where both apply they agree exactly 72% of the time and within a year 90%.
-    """
-    seasons = np.asarray(seasons, dtype=float)
-    ry = pd.to_numeric(pd.Series(recruit_years).reset_index(drop=True),
-                       errors="coerce").to_numpy(dtype=float)
-    fs = np.asarray(first_seasons, dtype=float)
-
-    from_recruit = seasons - ry + 1.0
-    from_first = np.clip(seasons - fs + 1.0, 1, 6)
-    usable = np.isfinite(from_recruit) & (from_recruit >= 1) & (from_recruit <= 6)
-    return np.where(usable, from_recruit, from_first)
-
-
 def build_career_frame(ratings_df, player_seasons_df, player_edge_df,
                        recruiting_df, players_df) -> pd.DataFrame:
     """One row per player-season carrying the shape of that player's career so far."""
@@ -363,22 +331,32 @@ def build_career_frame(ratings_df, player_seasons_df, player_edge_df,
     df["avail"] = (df["games_played"].fillna(0)
                    / df["team_games"].fillna(1).clip(lower=1)).clip(0, 1)
 
-    # Class year, derived rather than read — see derive_class_year.
-    _ry = pd.Series(dtype=float)
-    if not recruiting_df.empty and "recruit_year" in recruiting_df.columns:
-        _r = recruiting_df[recruiting_df["player_id"].notna()].copy()
-        _r["player_id"] = _r["player_id"].astype("int64")
-        _ry = (_r.sort_values("recruit_year").drop_duplicates("player_id")
-                 .set_index("player_id")["recruit_year"])
+    # Class year, derived rather than read — see utils/class_year.py.
+    #
+    # The first-FBS-season anchor is taken over EVERY season in player_seasons,
+    # not over `df`. `df` is the rated-and-EDGE-scored subset, so a player's
+    # first row here is often his second or third year on a roster, and the floor
+    # anchor computed on it came out systematically too young.
+    _ry = recruit_year_map(recruiting_df)
+    _first = (player_seasons_df.dropna(subset=["player_id"])
+              .assign(player_id=lambda d: d["player_id"].astype("int64"))
+              .groupby("player_id")["season"].min())
     _stored = pd.to_numeric(df["class_year"], errors="coerce")
-    df["class_year"] = derive_class_year(
-        df["season"].to_numpy(),
-        df["player_id"].map(_ry) if len(_ry) else pd.Series([np.nan] * len(df)),
-        df.groupby("player_id")["season"].transform("min").to_numpy(),
+    _pid = df["player_id"].astype("int64")
+    df["class_year"], df["class_year_basis"] = derive_class_year(
+        df["season"],
+        _pid.map(_ry) if len(_ry) else pd.Series([np.nan] * len(df)),
+        _pid.map(_first),
     )
     _moved = int((_stored != df["class_year"]).sum())
+    _unknown = int(df["class_year"].isna().sum())
     print(f"  class year derived for {len(df)} rows "
-          f"({_moved} differ from the stored value, which does not increment)")
+          f"({_moved} differ from the stored value, which does not increment; "
+          f"{_unknown} undeterminable and left unknown)")
+    # An unknown class year cannot key a cohort cell. Dropping is the honest
+    # treatment: filling it with 1 would put left-censored fifth-year players in
+    # the true-freshman cell, which is the cell with the largest delta.
+    df = df[df["class_year"].notna()].copy()
 
     df = df.sort_values(["player_id", "season"])
     career = defaultdict(list)
@@ -667,6 +645,15 @@ def _cohort_reference_pct(C: pd.DataFrame) -> pd.Series:
 
 
 def apply_cohort(C: pd.DataFrame, lookup: dict, global_delta: float) -> pd.DataFrame:
+    """Attach each player-season's cohort expectation to the career frame.
+
+    The cohort is (position, class year, production decile); its delta is the
+    mean next-season OVR change in the training window. Falls back to the
+    coarse (position, class year) cell, then to `global_delta` with
+    cohort_n = 0. Adds pct_bucket, cohort_delta, cohort_n and
+    cohort_next = ovr + cohort_delta — the baseline `vs_cohort` is measured
+    against and the line every explanation starts from.
+    """
     bucket = (_cohort_reference_pct(C) // 10).clip(0, 9)
     deltas, ns = [], []
     for pg, cy, pb in zip(C["position_group"], C["class_year"], bucket):
@@ -888,6 +875,29 @@ def _between(s, rng):
 
 
 def main() -> None:
+    """Train (or load) Engine D and write next-season projections.
+
+    Pipeline: career frame → opportunity features → cohort curves (also
+    written to cohort_curves.json for script 16) → NFL departure rate per
+    cohort from /draft/picks → drop OL entirely → one XGBoost model per
+    family: offence (QB/RB/WR/TE, with opportunity features) and defence
+    (career curve + cohort only).
+
+    Per family: predictions are variance-inflated around the training mean
+    (k from VARIANCE_LAMBDA = 0.5 of the gap between actual and predicted SD),
+    80% intervals are validation-residual quantiles per (position, rating
+    decile) falling back to the family, and the TEST window reports naive vs
+    model MAE and per-position coverage. HARD GATE: if a family's model MAE is
+    not below naive carry-forward the script exits 1 and writes nothing.
+
+    Saved models (data/models/engine_d_{family}.json) are reused unless
+    --retrain is passed; calibration and intervals are recomputed every run
+    either way. Labels: breakout / decline / steady by vs_cohort, with two
+    overrides — a return to a pre-injury peak is "bounceback", and an
+    offensive breakout with no path to the ball is demoted to "steady".
+    Writes trajectory.json (list + _meta accuracy) and trajectory_detail.json
+    (explanation, SHAP drivers, comparables) for --predict-season + 1.
+    """
     parser = argparse.ArgumentParser(description="Engine D — career-curve next-season projection")
     parser.add_argument("--retrain", action="store_true")
     parser.add_argument("--predict-season", type=int, default=None,

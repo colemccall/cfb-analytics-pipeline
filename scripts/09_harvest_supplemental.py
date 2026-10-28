@@ -173,6 +173,13 @@ def norm_coaches(rows: list, season: int) -> list[dict]:
 
 
 def norm_draft(rows: list, season: int) -> list[dict]:
+    """Flatten /draft/picks rows for one draft year.
+
+    `college_athlete_id` is the CFBD athlete id — the same id space as
+    players.cfb_api_id, and the join validate_vs_draft.py uses (94.5% match;
+    the misses never appear in an FBS box score). `team_id` is resolved from
+    the college team name.
+    """
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -287,6 +294,10 @@ def norm_lines(rows: list, season: int) -> list[dict]:
 
 
 def norm_cfp(rows: list, season: int) -> list[dict]:
+    """Normalise /playoff rows for one season: one row per CFP participant with
+    seed, committee rank, bid type, bye and elimination round. This is the
+    ground truth for the playoff model — 12 rows a season under the 12-team format.
+    """
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -322,6 +333,7 @@ def norm_player_success(rows: list, season: int) -> list[dict]:
 
 
 def norm_wepa(rows: list, season: int, kind: str) -> list[dict]:
+    """Flatten WEPA rows (opponent-adjusted EPA) for one season, tagging which WEPA endpoint (`kind`) each came from."""
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -334,6 +346,7 @@ def norm_wepa(rows: list, season: int, kind: str) -> list[dict]:
 
 
 def norm_ratings_external(rows: list, season: int, source: str) -> list[dict]:
+    """Flatten an external team-rating feed (SRS, Elo, FPI, …) for one season, tagging the `source`."""
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -345,6 +358,10 @@ def norm_ratings_external(rows: list, season: int, source: str) -> list[dict]:
 
 
 def norm_games_by_id(rows: list, season: int, id_key: str = "id") -> list[dict]:
+    """Flatten game-keyed rows (betting lines, pregame win probability, …) for
+    one season, carrying the CFBD game id (`id_key`) and both team ids resolved
+    from team names.
+    """
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -486,6 +503,14 @@ def all_dataset_names() -> list[str]:
 # ---------------------------------------------------------------------------
 
 def harvest_one(name: str, seasons: list[int], api_key: str, dry_run: bool = False) -> int:
+    """Harvest one single-endpoint dataset from DATASETS and write it to data/raw/.
+
+    Season-agnostic specs make one request. Otherwise seasons before the
+    spec's `first` are skipped (the endpoint has no data there, and asking
+    costs a request), each remaining season is fetched and normalised, and
+    write_raw() replaces exactly those seasons in the file. With dry_run,
+    prints the request plan and writes nothing. Returns rows written.
+    """
     spec = DATASETS[name]
     if spec.get("season_agnostic"):
         print(f"\n[{name}] {spec['endpoint']} — season-agnostic")
@@ -514,6 +539,10 @@ def harvest_one(name: str, seasons: list[int], api_key: str, dry_run: bool = Fal
 
 
 def harvest_multi(name: str, seasons: list[int], api_key: str, dry_run: bool = False) -> int:
+    """Harvest a MULTI dataset — several endpoints feeding one file — for every
+    season ≥ the spec's `first`. Each part's rows are tagged by the spec's
+    normaliser. Same season-replacing write and dry-run behaviour as harvest_one().
+    """
     spec = MULTI[name]
     years = [y for y in seasons if y >= spec["first"]]
     parts = spec["parts"]
@@ -573,6 +602,14 @@ def harvest_play_stats(seasons: list[int], api_key: str, dry_run: bool = False) 
 
 
 def main() -> None:
+    """CLI entry point: --list prints every dataset with its first season and
+    purpose; --dataset A B … or --all harvests (play_stats is opt-in only —
+    ~130 requests a season); --seasons narrows the range; --dry-run prints
+    the plan without an API key.
+
+    A dataset that raises is logged and skipped so one dead endpoint cannot
+    cost the rest of an --all run.
+    """
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", nargs="+", help="dataset names (see --list)")

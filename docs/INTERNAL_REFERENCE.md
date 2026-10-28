@@ -115,7 +115,7 @@ Scope: Both repos — cfb-analytics-pipeline + cfb-analytics-app
 
 > **The app repo owns its own documentation.** For the authoritative frontend
 > architecture see `cfb-analytics-app/README.md` (script load order, theme system,
-> design-system primitives) and `cfb-analytics-app/CHANGELOG_v3.1_redesign.md`.
+> design-system primitives) and the app's Build Log entry `v3.1-redesign` (`js/changes.js`).
 > The summary below covers only the pipeline→frontend contract.
 
 Script 12 (plus 13–15) writes `cfb-analytics-app/data/*.json`. `js/dataLoader.js` is the

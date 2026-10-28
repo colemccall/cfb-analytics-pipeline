@@ -426,6 +426,19 @@ def persistence_table(reliab: dict, composite: dict | None = None) -> pd.DataFra
 
 
 def main() -> None:
+    """Split-half reliability of the ratings, per position, from --from-season (2016).
+
+    Each player-season's games are split into halves (≥ --min-games each), the
+    production composite is computed per half, and Spearman-Brown gives
+    `reliability`; the same halves pushed through script 07's full OVR mapping
+    give `ovr_reliability` (bench rows with a constant OVR excluded). Prints a
+    GATE line: the tiers and recruiting blend must not REDUCE repeatability at
+    any position. noise_ceiling = √reliability bounds any external validation.
+
+    --starters-only restricts to 8+ games; --decompose adds observation-count,
+    event-decile and career-blend sections; results are exported to
+    data/computed/reliability.json unless --no-export.
+    """
     ap = argparse.ArgumentParser(description="Split-half reliability of the ratings")
     ap.add_argument("--from-season", type=int, default=2016,
                     help="first season to include (2016+ is when the modern defensive "

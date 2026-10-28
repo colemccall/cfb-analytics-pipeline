@@ -21,13 +21,12 @@ SOURCE CHAIN — first hit wins, best signal first:
                 recruit averages 62.9 as a true freshman; the career recruiting
                 anchors would say ~90. Adjusted for position and, as measured,
                 a small schedule tilt.
-  4. ea_cfb27   EA CFB 27's own overall, for players with no signal of ours
-                (JUCO arrivals, unrated walk-ons). Deliberately LAST: it is a
-                third party's opinion. Every row carries ea_ovr alongside
-                whatever source won, so the side-by-side always renders.
+  (EA CFB 27's overall was a fourth, last-resort source until 2026-10-27.
+  It was removed with the rest of the EA data; the 273 players it covered
+  now fall through to "no signal" and get no projected row.)
 
 Inputs : player_seasons, ratings (computed, engine=edge), player_edge, recruiting,
-         ea_ratings, games, team_ratings, trajectory.json, cohort_curves.json
+         games, team_ratings, trajectory.json, cohort_curves.json
 Output : data/computed/ratings.json  (engine="projected" rows for --season)
 
 Usage:
@@ -47,6 +46,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.store import read_raw, read_ratings, read_computed, write_computed
+from utils.class_year import derive_class_year, recruit_year_map
 
 _ROOT = Path(__file__).parent.parent
 TRAJECTORY_PATH = _ROOT.parent / "cfb-analytics-app" / "data" / "trajectory.json"
@@ -83,7 +83,7 @@ FRESHMAN_POS_ADJ = {
 SOS_COEF = 0.024
 SOS_CAP  = 1.5
 
-CONFIDENCE = {"engine_d": "high", "carry": "medium", "recruiting": "low", "ea_cfb27": "low"}
+CONFIDENCE = {"engine_d": "high", "carry": "medium", "recruiting": "low"}
 
 # Positions we refuse to project. OL has no individual blocking data in any
 # public source, so its rating is 77% recruiting composite (measured) and
@@ -133,7 +133,7 @@ def _position_ceilings() -> dict:
 
 # Interval half-widths by source, from each method's own error on holdout data.
 # Freshmen get the widest band: it is the least certain thing we publish.
-INTERVAL = {"engine_d": None, "carry": 9.0, "recruiting": 13.0, "ea_cfb27": 13.0}
+INTERVAL = {"engine_d": None, "carry": 9.0, "recruiting": 13.0}
 
 
 def _interp(x, anchors):
@@ -143,6 +143,10 @@ def _interp(x, anchors):
 
 
 def load_cohort_curves() -> tuple:
+    """Load cohort_curves.json written by script 15 → (full, coarse, global_delta).
+    If the file is missing, carry-forward degrades to a flat global delta of 0
+    and says so — script 15 must run first.
+    """
     if not COHORT_PATH.exists():
         print(f"  WARNING: {COHORT_PATH.name} missing — run script 15 first. "
               f"Carry-forward will use a flat global delta.")
@@ -191,6 +195,23 @@ def build_sos(season: int, games_df, team_ratings_df) -> dict:
 
 
 def main() -> None:
+    """Write engine="projected" ratings for every player on --season's roster.
+
+    Source chain, first hit wins: engine_d (script 15's projection) → carry
+    (last season's earned OVR + cohort delta, keyed on DERIVED class year) →
+    recruiting (true freshmen via FRESHMAN_OVR_ANCHORS + position adjustment +
+    a capped schedule tilt). A player with none of these gets no row.
+    OL rows are written with no rating of ours and provenance "not_projected",
+    so a lineman stays on his own roster beside the stated refusal.
+
+    Every rating is clipped to [OVR_FLOOR, per-position ceiling] and carries
+    projection_source, projection_confidence and an interval (script 15's own,
+    or ±INTERVAL[source]). Players with no signal at all get no row.
+
+    HARD GATE: the projected SD must be 60–140% of last season's earned SD, or
+    the script exits 1 without writing. On success it replaces only the
+    projected rows for this season in data/computed/ratings.json.
+    """
     ap = argparse.ArgumentParser(description="Projected ratings for an unplayed season")
     ap.add_argument("--season", type=int, default=DEFAULT_SEASON)
     args = ap.parse_args()
@@ -201,7 +222,6 @@ def main() -> None:
     ps_df   = read_raw("player_seasons")
     edge_df = read_raw("player_edge")
     rec_df  = read_raw("recruiting")
-    ea_df   = read_raw("ea_ratings")
     games   = read_raw("games")
     tr_df   = read_computed("team_ratings")
     earned  = read_ratings("edge")
@@ -217,9 +237,42 @@ def main() -> None:
     engine_d = load_engine_d()
     print(f"  engine_d projections available for {len(engine_d)} players")
 
+    # Class year, derived once for the whole store - see utils/class_year.py.
+    #
+    # This used to read `player_seasons.year` straight through and call it a
+    # class year. `cohort_curves.json` is KEYED on the derived class year that
+    # script 15 computes, so the curve was being built on one quantity and read
+    # with another: the carry path asked "what do juniors do next" of a table
+    # that had never been told who the juniors were.
+    _ry = recruit_year_map(rec_df)
+    _first = (ps_df.dropna(subset=["player_id"])
+              .assign(player_id=lambda d: d["player_id"].astype("int64"))
+              .groupby("player_id")["season"].min())
+
+    def _class_years(frame):
+        pid = frame["player_id"].astype("int64")
+        return derive_class_year(
+            frame["season"],
+            pid.map(_ry) if len(_ry) else pd.Series([np.nan] * len(frame)),
+            pid.map(_first),
+        )
+
     # Previous season's earned OVR + production percentile, for the carry path.
-    prev_ps = ps_df[ps_df["season"] == prev][["id", "player_id", "position_group", "year"]] \
-        .rename(columns={"id": "ps_id", "year": "class_year"})
+    prev_ps = ps_df[ps_df["season"] == prev][
+        ["id", "player_id", "position_group", "season"]].rename(
+        columns={"id": "ps_id"}).copy()
+    prev_ps["class_year"], _ = _class_years(prev_ps)
+    prev_ps = prev_ps.drop(columns=["season"])
+
+    # The roster being projected gets the same derivation. `cy` feeds the
+    # freshman/veteran branches below, and an unknown one stays unknown: None
+    # reaches the cohort fallback rather than the true-freshman cell.
+    _roster_cy, _roster_basis = _class_years(roster)
+    class_year_by_ps = {int(i): (None if pd.isna(v) else int(v))
+                        for i, v in zip(roster["id"], _roster_cy)}
+    _unknown_cy = sum(1 for v in class_year_by_ps.values() if v is None)
+    print(f"  class year derived for {len(class_year_by_ps)} roster rows "
+          f"({_unknown_cy} undeterminable, carried as unknown)")
     prev_rat = earned[["player_season_id", "overall_rating"]] \
         .rename(columns={"player_season_id": "ps_id", "overall_rating": "ovr"})
     prev_edge = edge_df[edge_df["season"] == prev][["player_season_id", "edge_score"]] \
@@ -240,12 +293,6 @@ def main() -> None:
             if pid not in rec_by_pid:
                 rec_by_pid[pid] = {"composite": row.composite_score, "stars": row.stars,
                                    "year": row.recruit_year}
-
-    ea_by_pid = {}
-    if not ea_df.empty and "player_id" in ea_df.columns:
-        for row in ea_df.dropna(subset=["player_id"]).itertuples(index=False):
-            ea_by_pid[int(row.player_id)] = float(row.ovr) if pd.notna(row.ovr) else None
-    print(f"  EA CFB 27 overalls matched for {len(ea_by_pid)} players")
 
     sos = build_sos(season, games, tr_df)
     sos_mean = float(np.mean(list(sos.values()))) if sos else 0.0
@@ -268,15 +315,12 @@ def main() -> None:
         if pid is None:
             continue
         pg = row.position_group
-        cy = row.year
+        cy = class_year_by_ps.get(int(row.id))
         tid = int(row.team_id) if pd.notna(row.team_id) else None
-        ea_ovr = ea_by_pid.get(pid)
 
-        # Positions we refuse to project still get a row, carrying no rating of
-        # ours but keeping EA's opinion. Declining to publish a number is not a
-        # reason to withhold the one number that does exist for these players —
-        # an offensive lineman's card should show EA's overall next to our
-        # stated refusal, not two blanks.
+        # Positions we refuse to project still get a row, carrying no rating and
+        # provenance "not_projected", so a lineman stays on his own roster
+        # instead of vanishing from it.
         if pg in EXCLUDED_POSITIONS:
             counts["excluded_ol"] += 1
             out.append({
@@ -295,7 +339,6 @@ def main() -> None:
                 "projection_confidence": None,
                 "projection_low":        None,
                 "projection_high":       None,
-                "ea_ovr":                ea_ovr,
             })
             continue
 
@@ -329,10 +372,6 @@ def main() -> None:
                     base += float(np.clip(tilt, -SOS_CAP, SOS_CAP))
                 ovr, source = base, "recruiting"
 
-        # 4 — EA's opinion, only when we have nothing of our own
-        if ovr is None and ea_ovr is not None:
-            ovr, source = float(ea_ovr), "ea_cfb27"
-
         if ovr is None:
             counts["no_signal"] += 1
             continue
@@ -363,7 +402,6 @@ def main() -> None:
             "projection_confidence": _confidence(source, pg),
             "projection_low":        low,
             "projection_high":       high,
-            "ea_ovr":                ea_ovr,
         })
 
     print(f"\n  source mix: " + "  ".join(f"{k}={v}" for k, v in sorted(counts.items())))
@@ -380,7 +418,7 @@ def main() -> None:
         sys.exit(1)
     print(f"  projected OVR: mean {vals.mean():.1f}  SD {vals.std():.1f}  "
           f"min {vals.min():.1f}  max {vals.max():.1f}"
-          + (f"   (+{n_unrated} rows carrying EA only, no rating of ours)" if n_unrated else ""))
+          + (f"   (+{n_unrated} rows with no rating of ours: positions not projected)" if n_unrated else ""))
 
     # Distribution gate — the standing rule is that a season's ratings must not
     # silently compress. Compare against last season's earned distribution.

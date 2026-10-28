@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
 from utils.store import read_raw, read_computed, write_computed
+from utils.class_year import derive_class_year, recruit_year_map
 from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score
 
 MODEL_VERSION = "v4.0-edge-direct"
@@ -344,6 +345,7 @@ def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
 
 
 def _stat_float(stats, key):
+    """Read `stats[key]` as a float; missing or unparseable → 0.0 (a counting-stat default, not a NaN rule)."""
     v = stats.get(key)
     try:
         return float(v) if v is not None else 0.0
@@ -460,7 +462,7 @@ def compute_stat_features(stats: dict, pg: str) -> dict:
             "team_rush_ypa":      _stat_float(stats, "team_rush_ypa"),
             "team_sack_rate_inv": 1.0 - min(_stat_float(stats, "team_sack_rate"), 1.0),
             "award_tier":         _stat_float(stats, "award_tier"),
-            "experience":         2.0,   # placeholder; overwritten below from players.year
+            "experience":         2.0,   # placeholder; overwritten below from the derived class year
         }
 
     if pg == "EDGE":
@@ -828,6 +830,36 @@ def _raw(table: str) -> pd.DataFrame:
 _RATINGS: pd.DataFrame | None = None
 
 
+_FIRST_SEASON: pd.Series | None = None
+_RECRUIT_YEAR: pd.Series | None = None
+
+
+def _first_fbs_season() -> pd.Series:
+    """player_id -> earliest season in player_seasons, over the WHOLE archive.
+
+    Computed on the full table rather than on the position/season slice being
+    rated: a slice's earliest row is often the player's second or third year, and
+    a floor anchor computed on it comes out systematically too young.
+    """
+    global _FIRST_SEASON
+    if _FIRST_SEASON is None:
+        ps = _raw("player_seasons")
+        if ps.empty:
+            _FIRST_SEASON = pd.Series(dtype=float)
+        else:
+            ps = ps.dropna(subset=["player_id"])
+            _FIRST_SEASON = (ps.assign(player_id=ps["player_id"].astype("int64"))
+                             .groupby("player_id")["season"].min())
+    return _FIRST_SEASON
+
+
+def _recruit_years() -> pd.Series:
+    global _RECRUIT_YEAR
+    if _RECRUIT_YEAR is None:
+        _RECRUIT_YEAR = recruit_year_map(_raw("recruiting"))
+    return _RECRUIT_YEAR
+
+
 def _computed_ratings() -> pd.DataFrame:
     global _RATINGS
     if _RATINGS is None:
@@ -836,6 +868,7 @@ def _computed_ratings() -> pd.DataFrame:
 
 
 def _parse_stat_data(val) -> dict:
+    """Return a stat blob as a dict whether it arrives as a dict or a JSON string; anything else → {}."""
     if isinstance(val, dict):
         return val
     if isinstance(val, str):
@@ -973,6 +1006,19 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
     tm_df = _raw("teams")[["id", "conference"]].rename(columns={"id": "team_id"})
     ps_df = ps_df.merge(tm_df, on="team_id", how="left")
 
+    # Class year, derived - see utils/class_year.py. `player_seasons.year` is
+    # not a class year: constant across the career for 84.0% of players with
+    # three or more seasons, never incrementing, and an outright calendar year
+    # for 114,612 of 269,552 rows. It is carried on as `year` for the OL
+    # experience feature only, which wants a magnitude and not a class.
+    _pid = pd.to_numeric(ps_df["player_id"], errors="coerce")
+    _ry, _fs = _recruit_years(), _first_fbs_season()
+    ps_df["class_year"], ps_df["class_year_basis"] = derive_class_year(
+        ps_df["season"],
+        _pid.map(_ry) if len(_ry) else pd.Series([np.nan] * len(ps_df)),
+        _pid.map(_fs) if len(_fs) else pd.Series([np.nan] * len(ps_df)),
+    )
+
     # Transfer flag
     tr_df = _raw("transfers")
     if not tr_df.empty:
@@ -994,14 +1040,25 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
 
         feats = compute_stat_features(raw_stats, pg)
         if pg == "OL":
-            feats["experience"] = _sf(year, 2.0)
+            # The derived class year, not the stored one. OL is withheld
+            # (NOT_RATED_POSITIONS) so nothing ships from this, but leaving the
+            # raw value here would leave a live consumer of a field that is not a
+            # class year - see test_no_consumer_reads_the_raw_year_field.
+            feats["experience"] = _sf(row.get("class_year"), 2.0)
         feats["recruit_composite"] = _composite_to_100(cs)
         feats["transfer_flag"]     = 1 if (pid, season) in tr_set else 0
         # Store raw INT count for pre-2016 CLASSIC defensive rating system.
         if pg in DEFENSIVE_POSITIONS:
             feats["interceptionsINT"] = _sf(raw_stats.get("interceptionsINT"), 0.0)
         feats["stars"]             = stars
-        feats["year"]              = _si(year)
+        # The raw stored value, kept only so a debug dump can show what the
+        # API said. Nothing computes on it; see class_year below.
+        feats["stored_year_unused"] = _si(year)
+        # The derived class year, and what derived it. NaN where neither
+        # anchor reaches - never defaulted to 1, because a defaulted class
+        # year hands an unmatched transfer the full true-freshman prior.
+        feats["class_year"]        = row.get("class_year")
+        feats["class_year_basis"]  = row.get("class_year_basis")
         feats["team_id"]           = team_id
         feats["name"]              = name
         feats["player_season_id"]  = ps_id
@@ -1579,9 +1636,14 @@ def compute_breakout(df: pd.DataFrame, ratings: np.ndarray) -> np.ndarray:
     probs  = []
     for i, (_, row) in enumerate(df.iterrows()):
         rec = row.get("recruit_composite", 40)
-        yr  = row.get("year", 3)
+        # The derived class year. This read `player_seasons.year`, which is not a
+        # class year, so "young" was decided by a field that says 4 for 65% of the
+        # rated rows carrying a plausible value and a calendar year for the rest.
+        # An unknown class year is NOT young: a breakout is a claim about a player
+        # early in his career, and we would be making it without knowing that.
+        yr  = row.get("class_year")
         rat = ratings[i]
-        young     = yr in (1, 2)
+        young     = yr is not None and not pd.isna(yr) and int(yr) in (1, 2)
         high_rec  = rec > 70
         below_med = rat < median
         if young and high_rec and below_med:
@@ -1979,6 +2041,16 @@ def validate_distribution(rows: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point: rate every position (or --position X) for --season N
+    (default 2025) or --all-seasons (2008–2026).
+
+    Per season: rate_position() for each group → validate_distribution() (a
+    printed readout, not a gate) → strip `_`-prefixed scratch columns → merge
+    into the in-memory `_RATINGS`, replacing rows that match on
+    (player_season_id, season, engine). `_RATINGS` must be updated season by
+    season because compute_trajectory() reads the previous season from it, but
+    data/computed/ratings.json (~112 MB) is written once, at the end.
+    """
     global _RATINGS
     parser = argparse.ArgumentParser()
     parser.add_argument("--season",      type=int, default=2025)

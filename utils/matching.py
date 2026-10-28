@@ -46,6 +46,7 @@ _NAME_SUFFIXES = [" jr.", " jr", " sr.", " sr", " ii", " iii", " iv"]
 
 
 def strip_suffix(name: str) -> str:
+    """Lowercase and trim a name, then remove ONE trailing generational suffix from _NAME_SUFFIXES (Jr., III, …)."""
     name = (name or "").lower().strip()
     for suffix in _NAME_SUFFIXES:
         if name.endswith(suffix):

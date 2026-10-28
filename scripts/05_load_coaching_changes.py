@@ -54,6 +54,7 @@ ESPN_ROLE_MAP = {
 # ---------------------------------------------------------------------------
 
 def _make_driver():
+    """Return a headless Selenium Chrome driver. Duplicate of script 04's."""
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -94,6 +95,9 @@ def build_team_index() -> dict:
 
 
 def match_team(name: str, team_index: dict, threshold: float = 0.80) -> int | None:
+    """Resolve a school name to our team_id: exact lowercase hit, else the single
+    closest difflib match at `threshold` (0.80), else None.
+    """
     name_l = name.lower().strip()
     if name_l in team_index:
         return team_index[name_l]
@@ -108,6 +112,12 @@ def match_team(name: str, team_index: dict, threshold: float = 0.80) -> int | No
 # ---------------------------------------------------------------------------
 
 def load_seed_csv(csv_path: Path, team_index: dict) -> list[dict]:
+    """Load the hand-maintained seed CSV (team, coach_name, role, start_season,
+    end_season, prior_team) → coaching rows.
+
+    Rows whose team does not resolve, or whose role is not in VALID_ROLES, are
+    skipped and reported. A blank end_season means the coach is still there.
+    """
     rows = []
     unmatched = []
 
@@ -194,6 +204,12 @@ def scrape_espn_coaching(team_index: dict, espn_url: str = ESPN_URL) -> list[dic
 
 
 def _parse_espn_article(article, team_index: dict) -> list[dict]:
+    """Walk an ESPN coaching-tracker article in document order → coaching rows.
+
+    An h2/h3 that fuzzy-matches a school (threshold 0.75) sets the current
+    team; each following p/li is parsed as a coach line for that team until
+    the next school heading. Text before the first school heading is ignored.
+    """
     rows = []
     current_team_id = None
 
@@ -220,6 +236,15 @@ def _parse_espn_article(article, team_index: dict) -> list[dict]:
 
 
 def _parse_espn_coach_line(text: str, team_id: int) -> dict | None:
+    """Parse one tracker line ("John Smith (from Oregon), hired as DC ...") → row, or None.
+
+    Role comes from the first ESPN_ROLE_MAP keyword found. The season is the
+    first 202x year in the text, else the current year. A line containing
+    fired/resigned/left/departed/stepping down is a DEPARTURE: it gets
+    end_season and a None start_season. The name is the leading run of 2–4
+    capitalised words, so a line that does not start with the coach's name
+    is dropped.
+    """
     text_l = " " + text.lower() + " "
 
     role = None
@@ -305,6 +330,11 @@ def save_coaching(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point: seed CSV then ESPN scrape (either can be skipped with
+    --espn-only / --csv-only), concatenated and written to
+    data/raw/coaching_changes.json. Rows are NOT de-duplicated across the two
+    sources here.
+    """
     parser = argparse.ArgumentParser(description="Coaching changes -> data/raw/coaching_changes.json")
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
     parser.add_argument("--csv-only", action="store_true", help="Skip ESPN scrape")

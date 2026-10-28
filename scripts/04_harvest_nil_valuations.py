@@ -43,6 +43,12 @@ MATCH_SEASONS = [2025, 2024]
 # ---------------------------------------------------------------------------
 
 def _make_driver():
+    """Return a headless Selenium Chrome driver dressed to look like a normal browser.
+
+    Uses webdriver-manager when installed, otherwise expects chromedriver on
+    PATH. Duplicated verbatim in script 05; On3 blocks it regardless (see the
+    module docstring), so it has not been worth extracting.
+    """
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -92,6 +98,13 @@ def _wait_for_players(driver, timeout: int = PAGE_LOAD_WAIT):
 # ---------------------------------------------------------------------------
 
 def scrape_nil_rankings(max_pages: int = MAX_PAGES) -> list[dict]:
+    """Scrape On3's NIL ranking pages → [{name, team, position, valuation_usd, ...}].
+
+    Stops at the first page that times out or has no player rows. On3 uses
+    hashed class names, so four selector patterns are tried in turn. In
+    practice On3 blocks the driver and this returns [] — see module docstring.
+    The driver is always quit, including on error.
+    """
     from bs4 import BeautifulSoup
 
     driver = _make_driver()
@@ -136,6 +149,12 @@ def scrape_nil_rankings(max_pages: int = MAX_PAGES) -> list[dict]:
 
 
 def _parse_nil_row(row) -> dict | None:
+    """Parse one On3 NIL row → dict, or None if it has no player name.
+
+    Valuations like "$1.2M" / "$850K" / "$12,000" are converted to integer
+    dollars; an unparseable valuation is None, never 0 — a missing NIL value
+    must not read as a player worth nothing.
+    """
     try:
         name_el = (
             row.select_one("[class*='PlayerName']")
@@ -236,6 +255,10 @@ def save_nil(entries: list[dict], player_index: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point: build the player index for MATCH_SEASONS, scrape up to
+    --pages pages, and save matched rows. When the scrape returns nothing the
+    existing nil_valuations.json is left untouched rather than emptied.
+    """
     parser = argparse.ArgumentParser(description="On3 NIL valuations -> data/raw/nil_valuations.json")
     parser.add_argument("--pages", type=int, default=MAX_PAGES, help="Max pages to scrape (default 20)")
     args = parser.parse_args()

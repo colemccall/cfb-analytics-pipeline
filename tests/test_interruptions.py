@@ -17,10 +17,14 @@ has to do it without reading the future.
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.class_year import derive_class_year          # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "_s15", Path(__file__).parent.parent / "scripts" / "15_predict_trajectories.py")
@@ -28,7 +32,6 @@ _s15 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_s15)
 
 flag_interruptions = _s15.flag_interruptions
-derive_class_year  = _s15.derive_class_year
 _describe_path     = _s15._describe_path
 AVAIL_INTERRUPTED  = _s15.AVAIL_INTERRUPTED
 AVAIL_PRIOR_FLOOR  = _s15.AVAIL_PRIOR_FLOOR
@@ -79,44 +82,96 @@ class TestInterruptionDetection:
 
 class TestClassYearDerivation:
     """`player_seasons.year` is not a class year. It is constant across the whole
-    career for 84% of players with 3+ seasons and never increments, and it holds
-    an outright calendar year for 114,612 of 269,552 rows. Cohort cells keyed on
-    it were mixing a player's freshman, sophomore and junior seasons together.
+    career for 84.0% of players with 3+ seasons that carry a plausible value,
+    never increments, and holds an outright calendar year for 114,612 of 269,552
+    rows. Cohort cells keyed on it were mixing a player's freshman, sophomore and
+    junior seasons together.
+
+    The derivation moved to `utils/class_year.py` in v4.6 so scripts 07, 12, 15
+    and 16 read one value, and its contract changed in one deliberate way: it
+    now returns **NaN for a class year it cannot determine**, and the anchor that
+    produced each value beside it. It used to clip the floor anchor into [1, 6]
+    unconditionally, which handed every left-censored career a class year of 1 —
+    the true-freshman cell, and the one with the largest recruiting prior.
     """
 
     def test_recruit_year_anchors_a_real_progression(self):
         """Jaden Mickey: recruited 2022, played 2022-2025, stored as a junior in
         every one of them. He is a fourth-year senior in 2025."""
-        got = derive_class_year([2022, 2023, 2024, 2025], [2022] * 4, [2022] * 4)
-        assert list(got) == [1, 2, 3, 4]
+        cy, basis = derive_class_year([2022, 2023, 2024, 2025], [2022] * 4, [2022] * 4)
+        assert list(cy) == [1, 2, 3, 4]
+        assert list(basis) == ["recruiting"] * 4
 
     def test_whit_weeks_was_a_true_freshman_in_2023(self):
-        got = derive_class_year([2023, 2024, 2025], [2023] * 3, [2023] * 3)
-        assert list(got) == [1, 2, 3]
+        cy, _ = derive_class_year([2023, 2024, 2025], [2023] * 3, [2023] * 3)
+        assert list(cy) == [1, 2, 3]
 
-    def test_first_observed_season_is_the_fallback(self):
-        got = derive_class_year([2019, 2020, 2021], [None] * 3, [2019] * 3)
-        assert list(got) == [1, 2, 3]
+    def test_first_observed_season_is_the_fallback_and_says_so(self):
+        """A floor, not a truth — so it is labelled, not silently mixed in with
+        the anchored values. Where both anchors apply they agree exactly 74.0% of
+        the time, and the floor is too YOUNG 23.9% of the time against too old
+        2.1%."""
+        cy, basis = derive_class_year([2019, 2020, 2021], [None] * 3, [2019] * 3)
+        assert list(cy) == [1, 2, 3]
+        assert list(basis) == ["first_fbs"] * 3
 
     def test_an_implausible_recruit_year_falls_back(self):
         """A recruit year 12 seasons before the season is a bad join, not a
         12th-year senior."""
-        got = derive_class_year([2020], [2008], [2019])
-        assert list(got) == [2]
+        cy, basis = derive_class_year([2020], [2008], [2019])
+        assert list(cy) == [2]
+        assert list(basis) == ["first_fbs"]
 
     def test_the_stored_value_is_never_consulted(self):
-        """It carries no per-season information, so nothing should depend on it."""
-        a = derive_class_year([2022, 2023], [2022, 2022], [2022, 2022])
-        b = derive_class_year([2022, 2023], [2022, 2022], [2022, 2022])
+        """It carries no per-season information, so nothing should depend on it.
+        The signature has no parameter for it."""
+        a, _ = derive_class_year([2022, 2023], [2022, 2022], [2022, 2022])
+        b, _ = derive_class_year([2022, 2023], [2022, 2022], [2022, 2022])
         assert list(a) == list(b) == [1, 2]
 
     def test_it_never_exceeds_a_plausible_class_year(self):
-        got = derive_class_year(list(range(2008, 2017)), [None] * 9, [2008] * 9)
-        assert max(got) <= 6
+        cy, _ = derive_class_year([2019, 2020, 2021], [2016] * 3, [2016] * 3)
+        assert list(cy) == [4, 5, 6]
+        cy, _ = derive_class_year([2022], [2016], [2016])
+        assert np.all(np.isnan(cy)), "a seventh year is a bad join, not a class year"
 
-    def test_it_never_goes_below_one(self):
-        got = derive_class_year([2019], [None], [2020])
-        assert min(got) >= 1
+    # ---- the unknown branch (v4.6) ----------------------------------------
+
+    def test_a_left_censored_career_is_unknown_not_a_freshman(self):
+        """His first observed season is the first season in the archive, so we
+        cannot tell a true freshman from a fifth-year senior who enrolled in 2004.
+        Answering 1 would hand him the full true-freshman recruiting prior."""
+        cy, basis = derive_class_year([2008, 2009], [None, None], [2008, 2008])
+        assert np.all(np.isnan(cy))
+        assert list(basis) == ["unknown", "unknown"]
+
+    def test_a_recruiting_anchor_beats_left_censoring(self):
+        """Censoring only blocks the FLOOR anchor. A real enrolment date still
+        dates him, even at the edge of the archive."""
+        cy, basis = derive_class_year([2008], [2006], [2008])
+        assert list(cy) == [3]
+        assert list(basis) == ["recruiting"]
+
+    def test_a_season_before_the_first_observed_one_is_unknown(self):
+        """A negative class year is a broken join. It used to clip to 1."""
+        cy, basis = derive_class_year([2019], [None], [2020])
+        assert np.all(np.isnan(cy))
+        assert list(basis) == ["unknown"]
+
+    def test_a_career_longer_than_six_years_is_unknown_not_clipped(self):
+        """Clipping produced a sixth-year senior out of a player whose first
+        observed season is nine years back, which is a data problem wearing a
+        plausible number."""
+        cy, basis = derive_class_year([2020], [None], [2010])
+        assert np.all(np.isnan(cy))
+        assert list(basis) == ["unknown"]
+
+    def test_unknown_is_nan_and_never_zero(self):
+        """Missing means unknown, never zero — the rule that outranks the rest of
+        this module. A 0 would sort below every real class year and read as a
+        value."""
+        cy, _ = derive_class_year([2019], [None], [2025])
+        assert np.isnan(cy[0])
 
 
 class TestPathDescription:

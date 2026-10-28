@@ -41,6 +41,12 @@ HEADERS = {
 # ---------------------------------------------------------------------------
 
 def fetch_transfers_api(api_key: str, year: int) -> list[dict]:
+    """Fetch one year of /player/portal into this script's row shape.
+
+    `portal_date` is the first 10 characters of transferDate (ISO date) or
+    None; `transfer_year` falls back to the requested year when the row has
+    no season.
+    """
     raw = fetch_transfer_portal(api_key, year)
     results = []
     for r in raw:
@@ -66,6 +72,11 @@ def fetch_transfers_api(api_key: str, year: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def scrape_on3(year: int) -> list[dict]:
+    """Fallback scraper for On3's portal pages, used only when the API returns nothing.
+
+    Pages until a 403/404, a request error or an empty page. Selectors match
+    On3's markup as last checked; if it changes this returns [] silently.
+    """
     url = ON3_URL.format(year=year)
     print(f"  [On3 fallback] Fetching {url}")
     entries = []
@@ -95,6 +106,10 @@ def scrape_on3(year: int) -> list[dict]:
 
 
 def _parse_on3_row(row, year: int) -> dict | None:
+    """Parse one On3 portal card → transfer dict, or None if it has no name.
+
+    Stars, rating and eligibility are not on the card and are always None.
+    """
     try:
         name_el = row.select_one("[class*='PlayerName']") or row.select_one(".player-name")
         if not name_el:
@@ -126,6 +141,12 @@ def _parse_on3_row(row, year: int) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def build_player_index() -> dict:
+    """Build {lowercased name: [(player_id, school), ...]} from data/raw/.
+
+    A player appears once per school he has a player_season at, so a
+    transfer's name resolves to either school — which is what lets
+    fuzzy_match_player() use the ORIGIN school to disambiguate.
+    """
     players_df = read_raw("players")
     ps_df      = read_raw("player_seasons")
     teams_df   = read_raw("teams")
@@ -169,6 +190,13 @@ def build_team_index() -> dict:
 
 def fuzzy_match_player(name: str, from_school: str | None,
                         player_index: dict, threshold: float = 0.85) -> int | None:
+    """Resolve a portal entry's name to our player_id, or None.
+
+    Strips suffixes, then exact name, then difflib matches at `threshold`.
+    With an origin school given, a candidate at that school wins; an exact
+    name hit with several candidates and no school match returns None rather
+    than guessing. Without an origin school, only an unambiguous name matches.
+    """
     name_l = name.lower().strip()
     for suffix in [" jr.", " jr", " sr.", " sr", " ii", " iii", " iv"]:
         if name_l.endswith(suffix):
@@ -210,6 +238,13 @@ def fuzzy_match_player(name: str, from_school: str | None,
 # ---------------------------------------------------------------------------
 
 def upsert_transfers(entries: list[dict], player_index: dict, team_index: dict) -> None:
+    """Match portal entries to players and merge them into data/raw/transfers.json.
+
+    Unmatched entries are dropped. `portal_entry_count` is the number of rows
+    for that player IN THIS BATCH (one year), not across a career. Duplicates
+    on (player_id, transfer_year, from_team_id) prefer the row that has a
+    portal date. Merge is replace-by-key against the existing file.
+    """
     rows = []
     unmatched = 0
     for e in entries:
@@ -264,6 +299,10 @@ def upsert_transfers(entries: list[dict], player_index: dict, team_index: dict) 
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point. Fetches each portal year (2021–2025 by default, or --year
+    N) from the API, falls back to On3 when the API is empty, and upserts.
+    Portal data does not exist before 2021.
+    """
     parser = argparse.ArgumentParser(description="Fetch transfer portal -> local JSON")
     parser.add_argument("--year", type=int, help="Single year")
     args = parser.parse_args()

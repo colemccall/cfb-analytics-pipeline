@@ -54,6 +54,11 @@ META_KEYS = frozenset({"ppa", "snap_pct", "snap_pct_pass", "snap_pct_rush",
 
 
 def _num(v) -> float:
+    """Parse a box-score cell to float. None, "", "-", "--" and "—" are 0.0 and
+    thousands separators are stripped. A counting-stat reader: an unparseable
+    value becomes 0.0, which is right for summing and wrong anywhere a missing
+    value must stay unknown.
+    """
     if v is None:
         return 0.0
     if isinstance(v, (int, float)):

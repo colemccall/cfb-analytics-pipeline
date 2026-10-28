@@ -78,6 +78,31 @@ STARS_TO_COMPOSITE   = {5: 0.9914, 4: 0.9196, 3: 0.8450, 2: 0.7667, 1: 0.7400, 0
 
 
 def main() -> None:
+    """Build recruiting_roi.json — one row per (committed team, recruit year) of at
+    least MIN_CLASS_SIZE (5) recruits.
+
+      peak OVR       max EARNED rating across a recruit's career (Engine A only —
+                     Engine B is built from recruiting, so counting it would make
+                     every blue-chip a hit by definition)
+      hit            peak OVR ≥ HIT_OVR_THRESHOLD (75)
+      expectation    per recruit, from his composite (STARS_TO_COMPOSITE when the
+                     grade is missing): expected peak OVR from one OLS line, and
+                     expected hit probability from a six-band table
+      development    ovr_over_expected = mean(peak − expected peak) over the
+                     class's RATED recruits; hits_over_expected likewise
+      shrinkage      hit rate shrunk with a 25-recruit prior (ROI_PRIOR_STRENGTH);
+                     the residual shrunk with the fit's per-recruit residual SD as
+                     noise; both with 80% intervals
+
+    Both the raw hit rate and the residual ship; the residual is what the UI
+    leads with. The closing printout checks that the residual decorrelates
+    from class recruiting — that is the claim the metric rests on.
+
+    Caveats: `maturing` is computed from today's calendar year, so the same
+    inputs give different flags in different years; avg_stars and avg_composite
+    divide by ALL recruits including ones with no stars (which add 0), so a
+    class with ungraded recruits reads slightly weaker than it is.
+    """
     print("Loading data...")
     recruiting     = read_raw("recruiting")
     player_seasons = read_raw("player_seasons")

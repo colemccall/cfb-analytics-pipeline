@@ -154,6 +154,12 @@ def _fumble_recoveries(stats: dict) -> float:
 # ---------------------------------------------------------------------------
 
 def _coerce_float(val) -> float:
+    """Coerce an API stat value to float; None, "", and unparseable values become 0.0.
+
+    Fraction strings like "22/31" (completions/attempts) return the numerator.
+    Returning 0.0 for garbage is deliberate here — these are summed counting
+    stats — but it means a malformed stat is indistinguishable from a zero.
+    """
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
@@ -213,6 +219,11 @@ def build_opponent_sp_map(season: int, api_key: str) -> dict:
 
 
 def _season_means(sp_map: dict) -> tuple[float, float, float]:  # (mean_off_sp, mean_def_sp, mean_overall_sp)
+    """Return (mean offensive SP+, mean defensive SP+, mean overall SP+) over `sp_map`.
+
+    Falls back to (25.0, 25.0, 0.0) when the season has no SP+ — the
+    approximate long-run FBS means — so opponent_multiplier() still centres.
+    """
     if not sp_map:
         return (25.0, 25.0, 0.0)
     offs  = [v["offense"] for v in sp_map.values() if isinstance(v, dict)]
@@ -803,6 +814,12 @@ def build_coverage_participation(rows: pd.DataFrame) -> dict:
 
 
 def _compute_season_defensive_means(ctx_map: dict) -> dict:
+    """Return {"pass"|"rush"|"pts": (mean, std)} of what defences allowed per game this season.
+
+    These centre def_context_modifier()'s z-scores. std is floored at 1.0 so
+    a degenerate season cannot divide by ~0; an empty series falls back to
+    (200.0, 60.0).
+    """
     pass_vals = [v["pass_yds"] for v in ctx_map.values() if v["pass_yds"] is not None]
     rush_vals = [v["rush_yds"] for v in ctx_map.values() if v["rush_yds"] is not None]
     pt_vals   = [v["points"]   for v in ctx_map.values() if v["points"]   is not None]
@@ -826,6 +843,17 @@ DEF_CONTEXT_BLEND = 0.35  # weight applied to team defensive context modifier (v
 
 def def_context_modifier(pg: str, game_db_id: int, player_team_db_id: int,
                           ctx_map: dict, ctx_means: dict) -> float:
+    """Per-game multiplier for a defender from what his TEAM's defence allowed that game.
+
+    z = (season mean − allowed) / std for pass yards, rush yards and points
+    (positive = the defence did better than average), weighted per position by
+    DEF_CONTEXT_WEIGHTS and clipped to ±1.5. raw = 1 + 0.20·z, so raw ∈ [0.70,
+    1.30]; the return value blends it at DEF_CONTEXT_BLEND = 0.35:
+
+        1 − 0.35 + 0.35·raw   ∈ [0.895, 1.105]
+
+    1.0 when there is no context row for (game, team) or no weights for `pg`.
+    """
     ctx = ctx_map.get((game_db_id, player_team_db_id))
     if not ctx:
         return 1.0
@@ -853,6 +881,36 @@ def def_context_modifier(pg: str, game_db_id: int, player_team_db_id: int,
 # ---------------------------------------------------------------------------
 # Load per-game stats from local raw JSON
 # ---------------------------------------------------------------------------
+
+# Set from --through-week in main(); None means "every game on file".
+_THROUGH_WEEK = None
+
+
+def team_pace(season: int) -> dict:
+    """Per-team pace of a season that is still being played: {team_id: (r, last_week)}.
+
+    r = regular-season games scheduled / regular-season games completed. EDGE is
+    sum(composite * opp_mult) / sqrt(games_played), so for the SAME per-game output
+    a team's players score lower the fewer games they have played. Measured on 2025
+    cut at week 8: the final EDGE is 1.27x the week-8 EDGE at the median, and
+    week-8 EDGE x sqrt(r) lands at 0.96x. That sqrt(r) is the correction
+    --in-progress applies (validate_pace.py reproduces the measurement).
+
+    Teams with no completed game are absent. Honours --through-week, so a back-test
+    sees only what was known at the cut.
+    """
+    g = read_raw("games")
+    g = g[(g["season"] == season) & (g["season_type"] == "regular")]
+    if g.empty:
+        return {}
+    done = g[g["home_score"].notna() & g["away_score"].notna()]
+    if _THROUGH_WEEK is not None:
+        done = done[done["week"].fillna(99) <= _THROUGH_WEEK]
+    sched = pd.concat([g["home_team_id"], g["away_team_id"]]).value_counts()
+    comp = pd.concat([done["home_team_id"], done["away_team_id"]]).value_counts()
+    last = int(done["week"].max()) if len(done) else 0
+    return {int(t): (float(sched[t]) / float(comp[t]), last) for t in comp.index if t in sched.index}
+
 
 def _load_game_stats(season: int, positions: set) -> pd.DataFrame:
     """Load game_aggregate stat rows from data/raw/stats.json for given positions."""
@@ -898,8 +956,13 @@ def _load_game_stats(season: int, positions: set) -> pd.DataFrame:
     merged = merged.rename(columns={"player_id": "player_id", "team_id": "player_team_id"})
 
     # Join games for home/away team IDs
-    g = games_df[["id", "home_team_id", "away_team_id"]].rename(columns={"id": "game_db_id"})
+    g = games_df[["id", "home_team_id", "away_team_id", "week", "season_type"]].rename(columns={"id": "game_db_id"})
     merged = merged.merge(g, left_on="game_id", right_on="game_db_id", how="left")
+
+    # --through-week N: pretend the season stopped after regular-season week N.
+    # Used to back-test the in-season pace correction on a season we know the end of.
+    if _THROUGH_WEEK is not None:
+        merged = merged[(merged["season_type"] == "regular") & (merged["week"].fillna(99) <= _THROUGH_WEEK)]
 
     return merged[["player_id", "position_group", "player_team_id", "game_id", "data", "home_team_id", "away_team_id"]]
 
@@ -914,6 +977,11 @@ def _off_stat_composite(pg: str, stats: dict) -> float:
 
 
 def _off_stats_measured(pg: str, stats: dict) -> float:
+    """Opportunity volume for one offensive game: QB = pass attempts + carries
+    (attempts read from "C/ATT" when that is the only form present); other
+    positions = the sum of OFFENSE_PRIMARY_STATS. Reported as stats_measured,
+    not used in the score.
+    """
     if pg == "QB":
         catt = stats.get("passingC/ATT") or stats.get("passingATT")
         if catt and "/" in str(catt):
@@ -925,6 +993,18 @@ def _off_stats_measured(pg: str, stats: dict) -> float:
 
 
 def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
+    """Season EDGE for every offensive skill player (QB/RB/WR/TE) → one row per player.
+
+    Per game: composite = Σ stat·OFFENSIVE_COMPOSITE weight; games with a
+    composite ≤ 0 are dropped (they do not count toward games_played). Each
+    kept game is multiplied by opponent_multiplier() on the opponent's
+    DEFENSIVE SP+. Season:
+
+        edge_score = Σ(composite · opp_mult) / √games_played
+
+    edge_score is None under MIN_GAMES (3) games. `opponent_avg_sp` is NOT an
+    SP+ value: it is (mean opp_mult − 1)·60, a rescaled mean multiplier.
+    """
     rows = _load_game_stats(season, OFF_EDGE_POSITIONS)
     if rows.empty:
         return pd.DataFrame()
@@ -983,6 +1063,13 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _def_stat_composite(pg: str, stats: dict, solo_known: bool = False) -> tuple[float, float]:
+    """One defensive game → (box-score composite, event volume).
+
+    composite = tackle credit (solo/assist split when `solo_known`) + Σ
+    sacks, TFL, hurries, PBUs, INTs and fumble recoveries · DEF_STAT_WEIGHTS[pg].
+    Falls back across alternate API key spellings (QB HUR/QBH, PD/PBU,
+    interceptionsINT/defensiveINT). Returns (0, 0) for a position with no weights.
+    """
     weights = DEF_STAT_WEIGHTS.get(pg)
     if not weights:
         return 0.0, 0.0
@@ -1002,6 +1089,27 @@ def _def_stat_composite(pg: str, stats: dict, solo_known: bool = False) -> tuple
 
 
 def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = None) -> pd.DataFrame:
+    """Season EDGE for every defender → one row per player.
+
+    Per game, in order:
+      1. box-score composite (_def_stat_composite)
+      2. secondary (COVERAGE_POSITIONS): the score is REPLACED by three
+         archetypes — ball hawk, run support, coverage — each scaled to 0–10 by
+         ARCHETYPE_SCALE and weighted by SECONDARY_ARCHETYPE_WEIGHTS[pg]. The
+         coverage archetype is COVERAGE_CREDIT · participation · team pass denial,
+         so it needs no box-score line at all.
+      3. the opportunity index (plays faced) scales the box-score parts only
+      4. havoc bonus — computed and carried, but HAVOC_CREDIT is empty, so it
+         adds 0 (ablation failed; see the note on HAVOC_CREDIT)
+      5. × opponent_multiplier on the opponent's OFFENSIVE SP+
+      6. × def_context_modifier (team defence that game), when a context map exists
+
+    A game with no score, no coverage credit and no havoc is dropped; a game
+    with coverage credit is KEPT even with an empty stat line, so suppression
+    does not shrink the √games denominator. Season edge = Σ / √games, None
+    under MIN_GAMES. Also returns coverage_share (fraction of the score that is
+    coverage credit), havoc_share, and per-archetype 0–10 scores (clipped to 20).
+    """
     rows = _load_game_stats(season, DEF_EDGE_POSITIONS)
     if rows.empty:
         return pd.DataFrame()
@@ -1150,10 +1258,21 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
 # Write results to data/raw/player_edge.json (upsert by player_season_id)
 # ---------------------------------------------------------------------------
 
-def save_edge(agg: pd.DataFrame, season: int) -> None:
+def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None:
+    """Write one season's EDGE rows into data/raw/player_edge.json.
+
+    Joins player_id → player_season_id for the season (players with no
+    player_season are skipped and counted), replaces every existing row for
+    `season`, and keeps other seasons untouched. Defensive backs also get
+    `archetypes` (rounded 0–10 scores) and `archetype` (the largest one).
+    """
     ps_df = read_raw("player_seasons")
-    ps_season = ps_df[ps_df["season"] == season][["id", "player_id"]].copy()
+    ps_season = ps_df[ps_df["season"] == season][["id", "player_id", "team_id"]].copy()
     ps_map = {int(r["player_id"]): int(r["id"]) for _, r in ps_season.iterrows()}
+    # in_progress: each row is rescaled to full-season pace by its team's r, and the
+    # raw values are kept beside it so nothing is lost. See team_pace().
+    pace = team_pace(season) if in_progress else {}
+    team_of = {int(r["player_id"]): r["team_id"] for _, r in ps_season.iterrows() if pd.notna(r["team_id"])}
 
     new_rows = {}
     skipped = 0
@@ -1163,24 +1282,32 @@ def save_edge(agg: pd.DataFrame, season: int) -> None:
         if not ps_id:
             skipped += 1
             continue
+        edge_raw = float(r["edge_score"]) if pd.notna(r.get("edge_score")) else None
+        meas_raw = int(r["stats_measured"]) if pd.notna(r.get("stats_measured")) else 0
+        r_team, last_week = pace.get(int(team_of.get(player_id, -1)), (None, None))
+        scale_e = float(np.sqrt(r_team)) if r_team else 1.0
         new_rows[ps_id] = {
             "player_season_id": ps_id,
             "player_id":        player_id,
             "season":           season,
-            "edge_score":       float(r["edge_score"]) if pd.notna(r.get("edge_score")) else None,
-            "stats_measured":   int(r["stats_measured"]) if pd.notna(r.get("stats_measured")) else 0,
+            "edge_score":       edge_raw * scale_e if edge_raw is not None else None,
+            "stats_measured":   int(round(meas_raw * (r_team or 1.0))),
             "games_played":     int(r["games_played"]) if pd.notna(r.get("games_played")) else 0,
             "opponent_avg_sp":  float(r["opponent_avg_sp"]) if pd.notna(r.get("opponent_avg_sp")) else None,
             "coverage_share":   float(r["coverage_share"]) if pd.notna(r.get("coverage_share")) else 0.0,
             "havoc_share":      float(r["havoc_share"]) if pd.notna(r.get("havoc_share")) else 0.0,
             "model_version":    MODEL_VERSION,
         }
+        if in_progress:
+            new_rows[ps_id].update({"edge_raw": edge_raw, "stats_measured_raw": meas_raw,
+                                    "pace_factor": round(r_team, 4) if r_team else None,
+                                    "through_week": last_week})
         # Archetype sub-scores, and which job this player actually does. Only
         # defensive backs carry them.
         arch = {k: float(r[f"arch_{k}"]) for k in ARCHETYPE_SCALE
                 if f"arch_{k}" in r.index and pd.notna(r.get(f"arch_{k}"))}
         if arch and max(arch.values()) > 0:
-            new_rows[ps_id]["archetypes"] = {k: round(v, 2) for k, v in arch.items()}
+            new_rows[ps_id]["archetypes"] = {k: round(min(v * scale_e, 20.0), 2) for k, v in arch.items()}
             new_rows[ps_id]["archetype"]  = max(arch, key=arch.get)
 
     if skipped:
@@ -1207,7 +1334,12 @@ def save_edge(agg: pd.DataFrame, season: int) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def run_season(season: int, api_key: str) -> None:
+def run_season(season: int, api_key: str, in_progress: bool = False) -> None:
+    """Compute and save EDGE for one season: SP+ map → offensive EDGE → team
+    defensive context (skipped with a warning if the API call fails) →
+    defensive EDGE → save_edge(). Prints p50/p90/max per position as a sanity
+    readout. No defensive rows before 2016 is expected, not an error.
+    """
     print(f"\n{'='*60}")
     print(f"Computing EDGE — Season {season}")
     print(f"{'='*60}")
@@ -1256,20 +1388,27 @@ def run_season(season: int, api_key: str) -> None:
         return
 
     agg = pd.concat(frames, ignore_index=True)
-    save_edge(agg, season)
+    save_edge(agg, season, in_progress=in_progress)
     print(f"Season {season} EDGE complete.")
 
 
 def main():
+    """CLI entry point: --season N (default 2025) or --all-seasons (2008–2026)."""
     parser = argparse.ArgumentParser(description="Compute EDGE scores from local JSON stats")
     parser.add_argument("--season", type=int, default=2025)
     parser.add_argument("--all-seasons", action="store_true", help="Run 2008-2026")
+    parser.add_argument("--in-progress", action="store_true",
+                        help="the season is still being played: rescale each team's EDGE to full-season pace")
+    parser.add_argument("--through-week", type=int, default=None,
+                        help="back-test: use only regular-season games up to this week")
     args = parser.parse_args()
+    global _THROUGH_WEEK
+    _THROUGH_WEEK = args.through_week
 
     api_key = load_api_key()
     seasons = list(range(2008, 2027)) if args.all_seasons else [args.season]
     for s in seasons:
-        run_season(s, api_key)
+        run_season(s, api_key, in_progress=args.in_progress)
     print("\nDone.")
 
 

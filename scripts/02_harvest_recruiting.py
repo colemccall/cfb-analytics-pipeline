@@ -40,6 +40,11 @@ HEADERS = {
 # ---------------------------------------------------------------------------
 
 def fetch_recruiting_api(api_key: str, year: int) -> list[dict]:
+    """Fetch one recruiting class from /recruiting/players into this script's row shape.
+
+    `rating` becomes composite_score and `ranking` becomes national_rank. The
+    API has no position or state rank, so both are None.
+    """
     raw = fetch_recruiting(api_key, year)
     results = []
     for r in raw:
@@ -62,6 +67,13 @@ def fetch_recruiting_api(api_key: str, year: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def scrape_247_class(year: int, max_pages: int = 35, slow: bool = False) -> list[dict]:
+    """Fallback scraper for a 247Sports class page, used only when the API returns nothing.
+
+    Walks up to `max_pages` pages, stopping at the first 403, request error or
+    empty page, sleeping 4 s (8 s with slow=True) between pages. The CSS
+    selectors target 247's markup as of the last time it was checked and will
+    silently return [] if that markup changes.
+    """
     recruits = []
     delay = 8.0 if slow else 4.0
     for page in range(1, max_pages + 1):
@@ -91,6 +103,12 @@ def scrape_247_class(year: int, max_pages: int = 35, slow: bool = False) -> list
 
 
 def _parse_247_row(row, year: int) -> dict | None:
+    """Parse one 247Sports ranking row → recruit dict, or None if it has no name.
+
+    Stars are counted from the filled-star icons. Any field whose element is
+    missing or unparseable is None rather than a default. Exceptions are
+    caught and logged so one malformed row cannot abort a page.
+    """
     try:
         name_el = row.select_one(".ri-page__name-block a") or row.select_one(".rankings-page__name-block a")
         if not name_el:
@@ -183,6 +201,17 @@ def build_team_name_index() -> dict:
 
 def fuzzy_match_player(name: str, committed_team: str | None,
                         player_index: dict, threshold: float = 0.85) -> int | None:
+    """Resolve a recruit's name to our player_id, or None.
+
+    Strips Jr./Sr./II–IV, then tries an exact lowercased name hit, then
+    difflib close matches at `threshold` (0.85). Among candidates with the same
+    name, the one whose team matches `committed_team` wins.
+
+    Known weakness: on an EXACT name hit with several candidates and no team
+    match, this returns the first candidate rather than None — so two players
+    sharing a name can have one's recruiting grade attached to the other.
+    Script 03's matcher returns None in the same situation.
+    """
     name_l = name.lower().strip()
     for suffix in [" jr.", " jr", " sr.", " sr", " ii", " iii", " iv"]:
         if name_l.endswith(suffix):
@@ -217,6 +246,15 @@ def fuzzy_match_player(name: str, committed_team: str | None,
 # ---------------------------------------------------------------------------
 
 def upsert_recruiting(recruits: list[dict], player_index: dict, team_index: dict) -> None:
+    """Match recruits to players and merge them into data/raw/recruiting.json.
+
+    Unmatched recruits are dropped (counted, not stored). Duplicates on
+    (player_id, recruit_year) keep the best national rank. Merge is
+    replace-by-key against the existing file, so re-running a year is safe.
+
+    Every row is labelled source="247sports", including rows that came from
+    the CFBD API — the field records the ranking service, not the fetch path.
+    """
     rows = []
     unmatched = 0
     for r in recruits:
@@ -274,6 +312,10 @@ def upsert_recruiting(recruits: list[dict], player_index: dict, team_index: dict
 # ---------------------------------------------------------------------------
 
 def main():
+    """CLI entry point. Fetches each class (2005–2025 by default, or --year N)
+    from the API, falls back to scraping 247Sports when the API is empty, and
+    upserts. Player and team name indexes are built once from data/raw/.
+    """
     parser = argparse.ArgumentParser(description="Fetch recruiting data -> local JSON")
     parser.add_argument("--year", type=int, help="Single year to fetch")
     args = parser.parse_args()

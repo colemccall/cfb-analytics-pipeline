@@ -52,9 +52,10 @@ MODEL_VERSION = "v2.0-team"
 # Weight constants
 # ---------------------------------------------------------------------------
 
-W_SP        = 0.45
-W_ROSTER    = 0.30
-W_RAW       = 0.25
+# The headline blend is W_SP_BLEND / W_ROSTER_BLEND / W_STATS_BLEND, below. The
+# W_SP = 0.45 / W_ROSTER = 0.30 / W_RAW = 0.25 that used to sit here were never
+# read by anything, and disagreed with the live 0.50 / 0.30 / 0.20 — removed
+# 2026-09-23 so the first weights a reader finds are the ones that run.
 
 # Split weights within roster signal
 W_QB   = 0.45;  W_WR_TE = 0.35;  W_OL = 0.20   # pass_off
@@ -234,6 +235,7 @@ def _clip(val: float) -> float:
 # ---------------------------------------------------------------------------
 
 def _fuzzy_match(name: str, candidates: list, threshold: float = FUZZY_THRESHOLD):
+    """Return the candidate with the highest SequenceMatcher ratio to `name`, or None if the best is under `threshold`."""
     best_score = 0.0
     best_match = None
     for c in candidates:
@@ -667,6 +669,9 @@ def load_recruiting_scores(season: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def load_coaching_changes(season: int) -> set:
+    """Team ids with an HC, OC or DC whose tenure STARTS in `season`. Used only
+    to set the `coaching_change` flag on a team row; it does not move a rating.
+    """
     df = read_raw("coaching_changes")
     if df.empty:
         return set()
@@ -794,6 +799,27 @@ def compute_team_splits(
 # ---------------------------------------------------------------------------
 
 def run_season(season: int, api_key: str) -> None:
+    """Compute and write earned team ratings for one played season.
+
+    Loads SP+ (and its season means), starter-tier player ratings by position,
+    raw team stats, per-game team season stats, the offensive-line unit
+    ratings, a RECRUITING_WINDOW-year recruiting score and coaching changes;
+    then compute_team_splits() per team → overall / offense / defense plus five
+    sub-ratings, the line unit and its inputs. A team with no SP+, no roster
+    and no stats gets no row.
+
+    Write: every non-projected row for `season` is dropped from
+    data/computed/team_ratings.json before the new rows are added, so a team
+    that no longer qualifies disappears instead of lingering as a stale row.
+    Projected rows (engine="projected") are left alone.
+
+    Ordering defect, found 2026-09-23 and not yet fixed: `tss_map` is read
+    from data/computed/team_season_stats BEFORE store_team_season_stats()
+    refreshes it for this season (the inline comment says "above"; the call is
+    below). Each run therefore blends the previous run's per-game stats, and a
+    season's first run blends none. Fixing it moves team ratings, so it needs
+    its own measured pass rather than a drive-by edit.
+    """
     print(f"\n{'='*60}")
     print(f"Computing Team Ratings v2 - Season {season}")
     print(f"{'='*60}")
@@ -1047,6 +1073,11 @@ def run_projected_season(season: int) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """CLI entry point. --engine edge (default) rates played seasons from SP+,
+    rosters and stats (--season N or --all-seasons 2008–2026). --engine
+    projected rates an unplayed season from projected player ratings with no
+    API calls — run it after script 16, per the documented order.
+    """
     parser = argparse.ArgumentParser(
         description="Compute v2 team ratings with position-weighted splits per season."
     )
