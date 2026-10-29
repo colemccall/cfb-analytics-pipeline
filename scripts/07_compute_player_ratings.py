@@ -982,6 +982,8 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         cols = ["player_season_id", "edge_score", "stats_measured", "games_played", "opponent_avg_sp"]
         if "coverage_share" in edge_df.columns:
             cols.append("coverage_share")
+        if "edge_all" in edge_df.columns:
+            cols.append("edge_all")
         edge_df = edge_df[cols].copy()
         ps_df = ps_df.merge(edge_df, left_on="id", right_on="player_season_id",
                             how="left", suffixes=("", "_edge"))
@@ -1063,6 +1065,7 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         feats["name"]              = name
         feats["player_season_id"]  = ps_id
         feats["edge_score"]        = row.get("edge_score")
+        feats["edge_all"]          = row.get("edge_all")
         feats["stats_measured"]    = _si(row.get("stats_measured"))
         feats["games_played"]      = _si(row.get("games_played"))
         feats["opp_avg_sp"]        = _sf(row.get("opponent_avg_sp"))
@@ -1780,8 +1783,21 @@ def _position_pool(pg: str) -> dict:
     if eff_col and eff_col in all_starter_df.columns:
         starter_eff_vals = all_starter_df[eff_col].fillna(0).values
 
+    # Mean R_edge of the low-game players at this position, by game count: the level a stretch is measured against.
+    low_mean = {}
+    if pg in EDGE_POSITIONS and "edge_all" in all_backup_df.columns:
+        lg = all_backup_df[all_backup_df["edge_all"].notna() & all_backup_df["games_played"].between(1, LOW_GAME_MAX)]
+        for g_, grp in lg.groupby("games_played"):
+            low_mean[int(g_)] = float(np.mean([edge_to_ovr(float(e), pg) for e in grp["edge_all"]]))
+
     for rkey, row in all_backup_df.iterrows():
         base = fallback_rating(int(row.get("stars", 0)), pos_avg)
+        if low_mean:
+            lgr = low_game_rating(row.get("edge_all"), row.get("games_played"), row.get("stats_measured"), pg, base,
+                                  low_mean.get(int(row.get("games_played") or 0), 0.0))
+            if lgr is not None:
+                ratings_map[rkey], contrib_map[rkey], basis_map[rkey] = lgr[0], lgr[1], "low_games"
+                continue
         # For players with meaningful efficiency (>= 50th pct of starters),
         # blend 30% efficiency-implied rating with 70% recruiting fallback.
         # This prevents 7.8 YPC players from rating the same as 3.0 YPC backups.
@@ -1809,6 +1825,51 @@ def _position_pool(pg: str) -> dict:
     return _POOL[pg]
 
 
+# ---------------------------------------------------------------------------
+# Players under the 3-game line (v4.19)
+# ---------------------------------------------------------------------------
+# A rating needs MIN_GAMES (3) productive games, so a player with one or two (a rotation player, or one who was hurt) was
+# rated from his recruiting grade alone and a good stretch counted for nothing. Script 06 now keeps his EDGE score beside
+# the withheld one (edge_all), and this rates him as
+#
+#     rating = recruiting prior + weight x (R_edge - mean R_edge of low-game players at his position and games), capped
+#
+# R_edge is edge_to_ovr(edge_all): the full-season anchors applied to sum / sqrt(games), so the game count is already in the
+# number. The WEIGHT is what a short stretch earns, fitted on the next season: for the 5,621 low-game players of 2016-2025 who
+# earned a rating the next year, the slope of that rating on R_edge (both against position-and-games means) is 0.139 with one game
+# and 0.197 with two, rising from 0.085 to 0.194 across event-volume quartiles; a placebo that shuffles R_edge gives 0.011
+# (scripts/validate_low_game_weights.py).
+# The four cells below are those slopes by games and by a busy/quiet split at 4 counted events (stats_measured). Cross-validated
+# the cells do no better than one weight of 0.17 (margin error 8.443 against 8.444 and 8.550 with no stretch information), so
+# they are a monotone summary, not extra precision. The recruiting prior is kept as the level: a typical low-game player stays
+# where he was and a stretch moves him by at most weight x deviation (a 20-point deviation is 3-4 rating points). LOW_GAME_CEILING
+# is a hard cap: nobody is rated above it on one or two games.
+LOW_GAME_MAX = 2
+LOW_GAME_BUSY_EVENTS = 4
+LOW_GAME_WEIGHT = {(1, False): 0.115, (1, True): 0.175, (2, False): 0.173, (2, True): 0.209}
+LOW_GAME_CEILING = 72.0
+
+
+def low_game_rating(edge_all, games, events, pg: str, prior: float, mean_r_edge: float) -> tuple[float, dict] | None:
+    """Rating and its contribution record for a player with one or two productive games, or None when he has no score.
+
+    `prior` is his recruiting-based rating, `mean_r_edge` the mean R_edge of low-game players at his position and game count.
+    """
+    try:
+        g = int(games)
+        ea = float(edge_all)
+    except (TypeError, ValueError):
+        return None
+    if ea != ea or ea <= 0 or not 1 <= g <= LOW_GAME_MAX:
+        return None
+    busy = float(events or 0) >= LOW_GAME_BUSY_EVENTS
+    w = LOW_GAME_WEIGHT[(g, busy)]
+    r_edge = edge_to_ovr(ea, pg)
+    rating = float(np.clip(prior + w * (r_edge - mean_r_edge), 30.0, LOW_GAME_CEILING))
+    return round(rating, 2), {"games_played": g, "edge_all": round(ea, 4), "low_game_weight": w,
+                              "stats_measured": int(float(events or 0)), "recruit_composite": 0.35}
+
+
 def rating_basis_for(rkey: str, tier: str, basis_map: dict) -> str:
     """What the published number is actually built from.
 
@@ -1823,6 +1884,8 @@ def rating_basis_for(rkey: str, tier: str, basis_map: dict) -> str:
     produced = basis_map.get(rkey)
     if produced is None:
         return "default"
+    if produced == "low_games":      # production over one or two games blended with the recruiting prior, whatever the tier
+        return "blended"
     if produced == "production":
         return TIER_RATING_BASIS.get(tier, "production")
     if tier == "bench":
@@ -1898,7 +1961,9 @@ def rate_position(season: int, pg: str) -> list[dict]:
 
     rows = []
     tiers = []
+    rkeys = []
     for rkey, row in season_df.iterrows():
+        rkeys.append(rkey)
         pid    = int(row["player_id"])
         ps_id  = int(row["player_season_id"])
         ovr    = float(ratings_map.get(rkey, 50.0))
@@ -1930,8 +1995,11 @@ def rate_position(season: int, pg: str) -> list[dict]:
 
     # Update rows with adjusted ratings
     for i, r in enumerate(rows):
-        r["overall_rating"] = float(adjusted_ratings[i])
-        r["position_rating"] = float(adjusted_ratings[i])
+        # A low-game rating is already the blend of his stretch and the recruiting prior; the tier blend would take the
+        # stretch out again (a bench-tier player would go back to recruiting alone).
+        keep = basis_map.get(rkeys[i]) == "low_games"
+        r["overall_rating"] = float(ratings_arr[i] if keep else adjusted_ratings[i])
+        r["position_rating"] = r["overall_rating"]
 
     edge_info = f", EDGE: {edge_count}" if pg in EDGE_POSITIONS else ""
     print(f"{len(rows)} players this season (starters: {starters_this_season}{edge_info}, total pool: {len(all_starter_df)} starters across all seasons)")

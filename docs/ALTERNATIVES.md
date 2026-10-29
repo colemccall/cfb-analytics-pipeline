@@ -296,3 +296,14 @@ projections only — labelled through `projection_source`.
 | Shrink part-season readings toward the league mean by games played (0.78 at 7 games) | Shipped | Early mean predicts the rest of the season with slope 0.47-0.50; finished seasons untouched; costs 1.2 points of Power-4 over Group-of-6 gap in 2026 (7.13 to 5.98) |
 | Shrink every season by games, finished ones included | Rejected | Moved the 2020 season's 110 ratings by up to 4.8 points; finished seasons keep their validated ratings |
 | Drop the weighted roster half or its line unit | Rejected | Finals fit 0.806 / 0.801 against 0.817 with both; placebo 0.782 |
+
+## v4.19 - players with one or two games
+
+| Option | Status | Why |
+|---|---|---|
+| Recruiting grade alone (before) | Replaced | A good stretch counted for nothing; stretch predicts next season with slope 0.14-0.20 against a placebo's 0.011 |
+| The full-season formula alone on one or two games | Rejected | R_edge averages 39.6 against a prior of 48.2; sqrt(games) already shrinks it |
+| Publish the next-season prediction as the rating | Rejected | Survivors average 64; a typical bench player would get a starter's number |
+| Four weights by games and events instead of one (0.167) | Shipped, no better | Cross-validated error 8.443 against 8.444; kept because the owner asked for game and snap adjustment and the cells are monotone |
+| Ceiling at 72 | Shipped | Top 5% by estimate later rate 67.6 on average (90th percentile 80.8); rarely binds |
+| Label the rating provisional | Rejected | The owner asked that it not be; the card states the game count |

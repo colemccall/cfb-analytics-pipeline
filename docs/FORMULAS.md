@@ -638,3 +638,10 @@ sub_ratings now carries roster_half, stats_half (as shipped), stats_half_raw and
 Part-season shrink (season in progress only; script 10 partial_weight, season_in_progress): stats half and line unit = mean + w x (reading - mean), mean = the season's league mean of that reading,
 w = [g / (g + 8)] / [12 / (12 + 8)] capped at 1 (0.78 at 7 games, 0.56 at 4, 1.0 from 12); g = the team's games in team_season_stats. A season is in progress when 20 or more regular-season games dated
 after the last scored one are unscored. Calibrated on scripts/validate_early_reliability.py: the first 7 games predict the rest of the season with a slope of 0.47 (efficiency and line measures) and 0.50 (points).
+
+## v4.19 - players with one or two games (mirrors METHODS `low-game-players`)
+
+R_edge = edge_to_ovr(edge_all), edge_all = sum of opponent-adjusted game scores / sqrt(games), kept by script 06 where edge_score is withheld (under 3 games).
+rating = prior + w x (R_edge - mean R_edge of low-game players at his position and games), clipped to 30..72; prior = position average + step for stars (unchanged); basis blended.
+w = 0.115 (1 game, under 4 counted events), 0.175 (1 game, 4+), 0.173 (2 games, under 4), 0.209 (2 games, 4+) (script 07 LOW_GAME_WEIGHT). Fitted by scripts/validate_low_game_weights.py as the slope of the next season's earned rating on R_edge.
+The tier blend is skipped for these players. Players with no productive game keep the recruiting-only rating.

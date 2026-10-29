@@ -1102,6 +1102,9 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
         })
 
     result = df.groupby("player_id").apply(agg, include_groups=False).reset_index()
+    # The same score for the players under the minimum, kept apart: edge_score stays None for them (every rating
+    # built on edge_score is unchanged) and script 07 rates them from edge_all with its own shrink (v4.19).
+    result["edge_all"] = result["edge_score"].where(result["games_played"] < MIN_GAMES)
     result.loc[result["games_played"] < MIN_GAMES, "edge_score"] = None
     return result
 
@@ -1298,6 +1301,9 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
         return pd.Series(out)
 
     result = df.groupby("player_id").apply(agg, include_groups=False).reset_index()
+    # The same score for the players under the minimum, kept apart: edge_score stays None for them (every rating
+    # built on edge_score is unchanged) and script 07 rates them from edge_all with its own shrink (v4.19).
+    result["edge_all"] = result["edge_score"].where(result["games_played"] < MIN_GAMES)
     result.loc[result["games_played"] < MIN_GAMES, "edge_score"] = None
     return result
 
@@ -1397,6 +1403,7 @@ def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None
             "edge_score":       edge_new,
             "stats_measured":   int(round(meas_raw * (r_team or 1.0))),
             "games_played":     int(r["games_played"]) if pd.notna(r.get("games_played")) else 0,
+            "edge_all":         float(r["edge_all"]) if pd.notna(r.get("edge_all")) else None,
             "opponent_avg_sp":  float(r["opponent_avg_sp"]) if pd.notna(r.get("opponent_avg_sp")) else None,
             "coverage_share":   float(r["coverage_share"]) if pd.notna(r.get("coverage_share")) else 0.0,
             "havoc_share":      float(r["havoc_share"]) if pd.notna(r.get("havoc_share")) else 0.0,
