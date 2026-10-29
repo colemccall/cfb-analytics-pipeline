@@ -136,6 +136,21 @@ def sp_defense_to_ovr(sp: float) -> float:
     return _interp_anchors(sp, SP_DEFENSE_ANCHORS)
 
 
+def results_to_ovr(points: float) -> float:
+    """A team's results reading on the OVR scale: points per game above an average FBS team, through the absolute overall anchors."""
+    return _interp_anchors(points, SP_OVERALL_ANCHORS)
+
+
+def results_offense_to_ovr(off: float) -> float:
+    """Points per game scored above an average FBS offense, through the offense anchors (an average offense scores 27)."""
+    return _interp_anchors(27.0 + off, SP_OFFENSE_ANCHORS)
+
+
+def results_defense_to_ovr(dfn: float) -> float:
+    """Points per game prevented below an average FBS defense, through the defense anchors (an average defense allows 27)."""
+    return _interp_anchors(27.0 - dfn, SP_DEFENSE_ANCHORS)
+
+
 # Roster-talent fallback anchors — mean of a team's top-22 starter OVRs → team OVR.
 # Used to blend with SP+ (and as the sole signal when SP+ is missing, e.g. FCS).
 ROSTER_OVR_ANCHORS = [
@@ -147,16 +162,29 @@ def roster_to_ovr(mean_top: float) -> float:
     return _interp_anchors(mean_top, ROSTER_OVR_ANCHORS)
 
 
-# Headline OVR blend. Three independent readings of the same team:
-#   SP+     — schedule-adjusted, external, the single best predictor
-#   roster  — our own player ratings, which is the thing this site actually builds
-#   stats   — what the team did on the field, adjusted since v4.18 for the schedule it faced (SCHED_COEF)
-#
-# The third was missing entirely: team stats were harvested into
-# team_season_stats.json by this very script and then never read, while
-# W_SP/W_ROSTER/W_RAW sat declared and unused. Sum must equal 1.0.
-W_ROSTER_BLEND = 0.60
-W_STATS_BLEND  = 0.40
+# Headline OVR blend (v4.20). Three readings of the same team, each on the OVR scale:
+#   roster  - our own player ratings (the slot score, below), which is the thing this site actually builds
+#   stats   - what the team did on the field (yards, third downs, havoc, turnovers), adjusted for the schedule it faced
+#             (SCHED_COEF) and, in a season in progress, shrunk by the games played
+#   results - the points it has scored and allowed against the opponents it played, opponent-adjusted (our own strengths,
+#             utils/opponent_strength.team_strength), through SP_OVERALL_ANCHORS: absolute anchors, not a percentile of the season
+# Until v4.20 the headline was 0.60 roster + 0.40 stats and used no result at all: a team's box score and its roster are not what
+# it did on the scoreboard. Measured on 1,306 team-seasons 2016-2025 (scripts/validate_team_overall.py), each reading's Spearman with
+# the NEXT season's points strength: roster 0.623, stats 0.686, results 0.731; the old 60/40 blend 0.670. In a season in progress the
+# points so far predict the games after week 8 at R2 0.50 against 0.31 for last season's roster, and carry 0.52 to 0.64 of the weight
+# of [results, last season's roster, last season's strength] from the cut after week 4 to the cut after week 10. The best blend on a
+# grid is nearly all results (0.731), which would stop saying what the roster and the box score show, so the rule is stated:
+# every reading keeps at least a fifth, results get the most, and the blend stays within 0.02 of the best. 0.30 / 0.20 / 0.50 scores
+# 0.716 (0.015 below the best, 0.046 above the old blend). The cost: a rating that leans on results describes what a team has done
+# more than what it is made of, and the stats half is 0.94 correlated with the results reading, so the two are partly the same
+# information. No ramp by games is added: the strengths come from a ridge, which already holds a thin sample near its conference.
+# Sum must equal 1.0. W_*_PLAY is the old two-reading blend, kept as the "rating part" that power (attach_power) adds results to,
+# so power does not count the results twice.
+W_ROSTER_BLEND = 0.30
+W_STATS_BLEND = 0.20
+W_RESULTS_BLEND = 0.50
+W_ROSTER_PLAY = 0.60
+W_STATS_PLAY = 0.40
 
 # Team-stat anchors. Absolute values, not percentiles of the season, so a weak
 # year does not manufacture a great defense — the same rule the player anchors
@@ -172,48 +200,67 @@ HAVOC_ANCHORS      = [(3.5, 45), (5.0, 58), (6.5, 72), (8.0, 85), (9.5, 95)]   #
 TO_MARGIN_ANCHORS  = [(-15, -4.0), (-6, -2.0), (0, 0.0), (6, 2.0), (15, 4.0)]  # OVR points
 
 # Within the roster signal: a slot score (below) vs a position-weighted composite. Until v4.16 the
-# first half was a flat mean of the 22 best ratings of any position.
-W_ROSTER_SLOTS, W_ROSTER_WEIGHTED = 0.60, 0.40
+# first half was a flat mean of the 22 best ratings of any position. From v4.20 the roster reading is the slot score alone: the line
+# unit is now one of its groups, so the position-weighted composite counted it (and special teams) a second time, and on the v4.20
+# ratings, 1,309 team-seasons 2016-2025 (scripts/validate_team_roster.py), the slot score alone scores 0.827 against 0.811 for the
+# 60/40 mix with it (Spearman with the same season's points strength) and 0.620 against 0.606 on the next season's. The composite
+# is still computed: it drives the pass/run offence and defence bars and the special-teams number.
+W_ROSTER_SLOTS, W_ROSTER_WEIGHTED = 1.00, 0.00
 
-# THE SLOT SCORE. Each position group is scored from its starters with some depth behind them, and the
-# groups are weighted. SLOT_STARTERS is how many starters a group has (DL includes EDGE, DB includes CB and S,
-# K and P are one group); the next SLOT_DEPTH_N players are the depth; a group scores
-# STARTER_SHARE x (mean of its starters) + (1 - STARTER_SHARE) x (mean of its depth), or its starters alone
-# when it has no depth. A group nobody is rated in drops out and the weights renormalise (never a default).
-# SLOT_WEIGHTS are 0.75 x the weights fitted by non-negative least squares of season scoring margin on the
-# group scores (2016-2025, leave-one-season-out, 1,261 team-seasons) + 0.25 x a football prior
-# (QB .21 RB .07 WR .14 TE .06 DL .21 LB .11 DB .18 K/P .02), because the pure fit gives WR and TE zero
-# (their ratings overlap the QB's) and a team rating should not say receivers do not matter. Fitted, then
-# shrunk: roster alone Spearman 0.764 against 0.735 for the top-22 mean; blended with team stats 0.879
-# against 0.872 (pure fit 0.882). OL is NOT a slot: it enters only through the line unit inside the
-# position-weighted half, as before.
-SLOT_STARTERS = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "DL": 4, "LB": 3, "DB": 5, "KP": 2}
-SLOT_DEPTH_N = 3
-STARTER_SHARE = 0.80
-SLOT_WEIGHTS = {"QB": 0.194, "RB": 0.189, "WR": 0.036, "TE": 0.016, "DL": 0.150, "LB": 0.123, "DB": 0.286, "KP": 0.008}
+# THE SLOT SCORE (v4.20 layout). Each position group is scored from its starters with depth behind them, and the groups are
+# weighted. Starters: QB 1, RB 2, WR 5, TE 1, DL 4 (DL and EDGE pooled by rating, in any mix), LB 4, DB 6 (CB, S and DB pooled,
+# in any mix); the offensive line is the line unit (utils/line_unit.py), one number, not a slot of five; K and P are one player
+# each. Depth, counted after the starters: QB 2, RB 3-4, WR 6-8, TE 2-4, DL 5-7, LB 5-7, DB 7-10. A group scores
+# STARTER_SHARE x (mean of its starters) + (1 - STARTER_SHARE) x (mean of its depth), or its starters alone when it has no depth,
+# and a missing player is skipped (a short list averages what is there). A group nobody is rated in drops out and the weights
+# renormalise (never a default). Every rated player counts, not only those at 55 or more: a floor cut the depth of weaker rosters
+# (the fit is the same, 0.863 and 0.864) and made a thin list look like a strong one.
+# SLOT_WEIGHTS are half the weights fitted by non-negative least squares of the team's points strength on the group scores
+# (2016-2025, leave-one-season-out) and half one weight per starter slot (scripts/validate_team_roster.py prints both, and the
+# alternatives measured: fitted, the previous weights, a football prior, equal per starter, and mixes). The fit alone gives the
+# defensive backs 0.32 and the receivers zero: their ratings carry the most (and the least) team-quality information per point,
+# which is not how much a position matters. Equal-per-starter is explainable and fits worse; the half-and-half is the stated cost.
+SLOT_STARTERS = {"QB": 1, "RB": 2, "WR": 5, "TE": 1, "DL": 4, "LB": 4, "DB": 6}
+SLOT_DEPTH = {"QB": 1, "RB": 2, "WR": 3, "TE": 3, "DL": 3, "LB": 3, "DB": 4}
+STARTER_SHARE = 0.85
+SLOT_WEIGHTS = {"QB": 0.139, "RB": 0.091, "WR": 0.087, "TE": 0.029, "OL": 0.101, "DL": 0.131, "LB": 0.144, "DB": 0.252,
+                "K": 0.012, "P": 0.015}
 
 
-def slot_score(by_pos: dict) -> float | None:
-    """The slot score of a roster: weighted mean of its position groups' starter-plus-depth scores.
+def group_scores(by_pos: dict, line_rating: float | None = None) -> dict:
+    """Each slot group's starter-plus-depth score: {group: score} for the groups that have anyone rated.
 
-    `by_pos` is {position_group: [ratings]}. None when no group has a rated player.
+    `by_pos` is {position_group: [ratings]}. DL pools DL and EDGE, DB pools DB, CB and S, K and P are one player each, and OL is the
+    line unit passed in `line_rating` (absent when none is known).
     """
-    groups = {
+    pools = {
         "QB": by_pos.get("QB", []), "RB": by_pos.get("RB", []), "WR": by_pos.get("WR", []), "TE": by_pos.get("TE", []),
         "DL": by_pos.get("DL", []) + by_pos.get("EDGE", []), "LB": by_pos.get("LB", []),
         "DB": by_pos.get("DB", []) + by_pos.get("CB", []) + by_pos.get("S", []),
-        "KP": by_pos.get("K", []) + by_pos.get("P", []),
     }
-    parts = []
+    out = {}
     for g, n in SLOT_STARTERS.items():
-        xs = sorted(groups[g], reverse=True)
+        xs = sorted(pools[g], reverse=True)
         if not xs:
             continue
         start = float(np.mean(xs[:n]))
-        depth = xs[n:n + SLOT_DEPTH_N]
-        score = start if not depth else STARTER_SHARE * start + (1 - STARTER_SHARE) * float(np.mean(depth))
-        parts.append((score, SLOT_WEIGHTS[g]))
-    return blend(parts)
+        depth = xs[n:n + SLOT_DEPTH[g]]
+        out[g] = start if not depth else STARTER_SHARE * start + (1 - STARTER_SHARE) * float(np.mean(depth))
+    for g in ("K", "P"):
+        if by_pos.get(g):
+            out[g] = float(max(by_pos[g]))
+    if line_rating is not None:
+        out["OL"] = float(line_rating)
+    return out
+
+
+def slot_score(by_pos: dict, line_rating: float | None = None) -> float | None:
+    """The slot score of a roster: weighted mean of its position groups' starter-plus-depth scores.
+
+    `by_pos` is {position_group: [ratings]}; `line_rating` is the line unit. None when no group has a rating.
+    """
+    return blend([(v, SLOT_WEIGHTS[g]) for g, v in group_scores(by_pos, line_rating).items()])
+
 
 W_STAT_OFF, W_STAT_DEF = 0.50, 0.50
 W_YDS, W_THIRD = 0.65, 0.35          # within offense
@@ -503,12 +550,13 @@ def build_line_unit_ratings(season: int, stat_table: dict, teams: list) -> dict:
     return out
 
 
-def load_starter_ratings_by_position(season: int, engine: str = "edge") -> dict:
-    """Return {team_id: {QB: [r1,r2,...], RB: [...], ...}} for starter-tier players.
+def load_starter_ratings_by_position(season: int, engine: str = "edge", min_rating: float = 55.0) -> dict:
+    """Return {team_id: {QB: [r1,r2,...], RB: [...], ...}} for players rated at least `min_rating`.
 
     `engine` selects which ratings to read: "edge" for played seasons, "projected"
     for an upcoming one. Reading unfiltered would mix engines and double-count
-    every player who has rows in more than one.
+    every player who has rows in more than one. The position-weighted splits keep their 55 floor; the slot score
+    reads everyone rated (min_rating 0) so depth is real on every roster.
     """
     rat_df = read_computed("ratings")
     ps_df  = read_raw("player_seasons")[["id", "team_id", "position_group"]].rename(columns={"id": "ps_id"})
@@ -519,7 +567,7 @@ def load_starter_ratings_by_position(season: int, engine: str = "edge") -> dict:
     rat_df = rat_df[
         (rat_df["season"] == season) &
         (rat_df["engine"] == engine) &
-        (rat_df["overall_rating"] >= 55) &
+        (rat_df["overall_rating"] >= min_rating) &
         rat_df["overall_rating"].notna()
     ]
     merged = rat_df.merge(ps_df, left_on="player_season_id", right_on="ps_id", how="left")
@@ -825,13 +873,17 @@ def compute_team_splits(
     line_rating: float | None = None,
     sched: tuple | None = None,
     shrink: tuple | None = None,
+    slot_by_pos: dict | None = None,
+    results: dict | None = None,
 ) -> dict | None:
-    """Overall/offense/defense (0-99) from the season's own player ratings and team stats.
+    """Overall/offense/defense (0-99) from the season's own player ratings, team stats and results.
 
-    Headline = 0.60 roster talent + 0.40 the team's own stats, adjusted for the schedule it faced
-    (`sched`, see SCHED_COEF); offense and defense are the same blend over the offensive and defensive halves. `sp` (SP+) is accepted but no longer
+    Headline = W_ROSTER_BLEND roster talent + W_STATS_BLEND the team's own stats (adjusted for the schedule it faced, `sched`, see
+    SCHED_COEF) + W_RESULTS_BLEND the points it has scored and allowed against its opponents (`results` = {"off", "dfn"} from
+    utils/opponent_strength.team_strength); offense and defense are the same blend over the offensive and defensive halves. A
+    reading that is absent drops out and the weights renormalise. `sp` (SP+) is accepted but no longer
     an input: it is published beside the rating as a reference. The same function rates a
-    played season, a season in progress and, with no stats, a projected one.
+    played season, a season in progress and, with no stats or results, a projected one.
 
     sub_ratings (pass_off/run_off/pass_def/run_def) come from position-weighted
     roster splits — these drive the detail bars, not the headline OVR.
@@ -845,29 +897,33 @@ def compute_team_splits(
     # position-weighted composite below knows a quarterback outweighs a fourth safety and carries the
     # offensive line (as the line unit). Blending both keeps a star-driven roster and a uniformly solid one
     # distinguishable.
-    slots = slot_score(roster_by_pos)
+    slots = slot_score(slot_by_pos if slot_by_pos is not None else roster_by_pos, line_rating)
     ros = compute_roster_splits(roster_by_pos, line_rating)
     # Every split can now be None — a position group with nobody rated no longer
     # contributes a fabricated 50 — so the rollup renormalises the same way.
     weighted = blend([(ros["pass_off"], W_PASS_OFF), (ros["run_off"], W_RUN_OFF),
                       (ros["pass_def"], W_PASS_DEF), (ros["run_def"], W_RUN_DEF),
                       (ros["special"],  W_SPEC)])
-    if weighted is None:
-        slots = None
 
-    if slots is not None:
+    if slots is None:
+        roster_ovr = None
+    elif weighted is None or W_ROSTER_WEIGHTED == 0:
+        roster_ovr = roster_to_ovr(slots)
+    else:
         roster_ovr = (roster_to_ovr(slots) * W_ROSTER_SLOTS
                       + roster_to_ovr(weighted) * W_ROSTER_WEIGHTED)
-    else:
-        roster_ovr = None
     stats_ovr = team_stats_to_ovr(team_stats, sched, shrink)
+    results_ovr = results_to_ovr(results["off"] + results["dfn"]) if results else None
 
     def _mix(pairs):
         pairs = [(v, w) for v, w in pairs if v is not None]
         return sum(v * w for v, w in pairs) / sum(w for _, w in pairs) if pairs else None
 
-    overall = _mix([(roster_ovr, W_ROSTER_BLEND), (stats_ovr, W_STATS_BLEND)])
-    if overall is None:
+    overall = _mix([(roster_ovr, W_ROSTER_BLEND), (stats_ovr, W_STATS_BLEND), (results_ovr, W_RESULTS_BLEND)])
+    play = _mix([(roster_ovr, W_ROSTER_PLAY), (stats_ovr, W_STATS_PLAY)])
+    if overall is None or (roster_ovr is None and stats_ovr is None):
+        # Results alone do not rate a team: a team that has played but has no roster rating and no team stats (an FCS team
+        # on a schedule) would get a number from a handful of games against a pooled opponent, which is a claim we cannot support.
         # No roster rating and no team stats: nothing of THIS season to rate. SP+ is not a
         # substitute any more, and 50.0 would be a placeholder indistinguishable from a
         # real average team.
@@ -879,8 +935,10 @@ def compute_team_splits(
     st_off, st_def, _ = team_stats_split(team_stats, sched, shrink)
     r_off = blend([(ros["pass_off"], W_PASS_OFF), (ros["run_off"], W_RUN_OFF)])
     r_def = blend([(ros["pass_def"], W_PASS_DEF), (ros["run_def"], W_RUN_DEF)])
-    off = _mix([(roster_to_ovr(r_off) if r_off is not None else None, W_ROSTER_BLEND), (st_off, W_STATS_BLEND)])
-    def_rating = _mix([(roster_to_ovr(r_def) if r_def is not None else None, W_ROSTER_BLEND), (st_def, W_STATS_BLEND)])
+    res_off = results_offense_to_ovr(results["off"]) if results else None
+    res_def = results_defense_to_ovr(results["dfn"]) if results else None
+    off = _mix([(roster_to_ovr(r_off) if r_off is not None else None, W_ROSTER_BLEND), (st_off, W_STATS_BLEND), (res_off, W_RESULTS_BLEND)])
+    def_rating = _mix([(roster_to_ovr(r_def) if r_def is not None else None, W_ROSTER_BLEND), (st_def, W_STATS_BLEND), (res_def, W_RESULTS_BLEND)])
     off = overall if off is None else off
     def_rating = overall if def_rating is None else def_rating
 
@@ -916,6 +974,9 @@ def compute_team_splits(
         "roster_half":    r2(roster_ovr) if roster_ovr is not None else None,
         "stats_half":     r2(stats_ovr) if stats_ovr is not None else None,
         "stats_half_raw": r2(team_stats_to_ovr(team_stats)) if stats_ovr is not None else None,
+        "results_half":   r2(results_ovr) if results_ovr is not None else None,
+        "results_points": round(float(results["off"] + results["dfn"]), 2) if results else None,
+        "play_rating":    r2(play) if play is not None else None,
         "partial_weight": round(float(shrink[0]), 3) if shrink is not None else 1.0,
         "sched_faced":    [round(float(sched[0]), 2), round(float(sched[1]), 2)] if sched is not None else None,
     }
@@ -925,8 +986,11 @@ def compute_team_splits(
 # Main per-season computation
 # ---------------------------------------------------------------------------
 
-def attach_power(rows: list, season: int, teams, with_results: bool = True) -> None:
+def attach_power(rows: list, season: int, teams, with_results: bool = True, quality: dict | None = None) -> None:
     """Adds the power rating and its parts to each team row, in place.
+
+    `quality` is {team_id: rating} for the rating part; by default the row's overall_rating. From v4.20 the headline contains the
+    results, so run_season passes the roster-and-stats "play" rating here instead and power does not count them twice.
 
     power = rating part + conference part + results part (utils/results_rating.py), in points per
     game above an average FBS team. `teams` is load_teams()'s (id, school, conference) list; a team's
@@ -941,7 +1005,8 @@ def attach_power(rows: list, season: int, teams, with_results: bool = True) -> N
         for r in recs[recs["season"] == season].dropna(subset=["team_id", "conference"]).itertuples():
             season_conf[int(r.team_id)] = r.conference
     conf_of = lambda t: season_conf.get(int(t)) or cur_conf.get(int(t))   # noqa: E731
-    quality = {int(r["team_id"]): r["overall_rating"] for r in rows if r["overall_rating"] is not None}
+    if quality is None:
+        quality = {int(r["team_id"]): r["overall_rating"] for r in rows if r["overall_rating"] is not None}
     games = []
     if with_results:
         g = read_raw("games")
@@ -960,13 +1025,10 @@ def attach_power(rows: list, season: int, teams, with_results: bool = True) -> N
         r["home_edge"] = round(info["home_edge"], 2)
 
 
-def build_schedule_map(season: int, teams) -> dict:
-    """{team_id: (defenses faced, offenses faced)} in points per game, centred, for the stats half's schedule adjustment.
+def _season_solve_inputs(season: int, teams):
+    """(opponent_strength module, scored games of the season as records, conference lookup) or None when there are no games.
 
-    Strengths are solved from every scored game of the season on file (the regular season, the postseason
-    once it exists, only the games played for a season in progress), by the same solver that adjusts the
-    player ratings. A team's conference for the season comes from the harvested records, falling back to
-    its current one, as in attach_power().
+    A team's conference for the season comes from the harvested records, falling back to its current one, as in attach_power().
     """
     from utils import opponent_strength as ostr
     cur_conf = {int(t[0]): t[2] for t in teams}
@@ -978,11 +1040,36 @@ def build_schedule_map(season: int, teams) -> dict:
     conf = lambda t: (season_conf.get(int(t)) or cur_conf.get(int(t))) if t != ostr.FCS else None   # noqa: E731
     g = read_raw("games")
     if g.empty:
-        return {}
+        return None
     g = g[(g["season"] == season) & g["home_score"].notna() & g["away_score"].notna()]
     if g.empty:
+        return None
+    return ostr, g.to_dict("records"), conf
+
+
+def build_schedule_map(season: int, teams) -> dict:
+    """{team_id: (defenses faced, offenses faced)} in points per game, centred, for the stats half's schedule adjustment.
+
+    Strengths are solved from every scored game of the season on file (the regular season, the postseason
+    once it exists, only the games played for a season in progress), by the same solver that adjusts the
+    player ratings.
+    """
+    inputs = _season_solve_inputs(season, teams)
+    if inputs is None:
         return {}
-    return ostr.schedule_faced(g.to_dict("records"), conf, [int(t[0]) for t in teams])
+    ostr, games, conf = inputs
+    return ostr.schedule_faced(games, conf, [int(t[0]) for t in teams])
+
+
+def build_strength_map(season: int, teams) -> dict:
+    """{team_id: {"off", "dfn"}}: the points each team has scored and prevented against the opponents it played, per game above an
+    average FBS team, for the results reading of the headline. Same games and solver as build_schedule_map; a team with no scored
+    game is absent."""
+    inputs = _season_solve_inputs(season, teams)
+    if inputs is None:
+        return {}
+    ostr, games, conf = inputs
+    return ostr.team_strength(games, conf, [int(t[0]) for t in teams])
 
 
 def run_season(season: int, api_key: str) -> None:
@@ -1015,7 +1102,8 @@ def run_season(season: int, api_key: str) -> None:
 
     print("Loading position-weighted roster ratings...")
     roster_map = load_starter_ratings_by_position(season)
-    print(f"  {len(roster_map)} teams have starter-tier player ratings")
+    slot_map = load_starter_ratings_by_position(season, min_rating=0.0)
+    print(f"  {len(roster_map)} teams have starter-tier player ratings; {len(slot_map)} have a slot roster (every rated player)")
 
     print("Loading raw team stats...")
     perf_raw = build_perf_scores(season, api_key)
@@ -1043,6 +1131,9 @@ def run_season(season: int, api_key: str) -> None:
               f"(sd {float(np.std(fd)):.1f}), moving the stats half by up to {SCHED_COEF * max(abs(x) for x in fd):.1f} OVR")
     else:
         print("  no games on file: the stats half is the raw box score")
+
+    strength_map = build_strength_map(season, teams)
+    print(f"  {len(strength_map)} teams have results (points scored and allowed, opponent-adjusted)")
 
     print("Rating offensive lines as units...")
     line_map = build_line_unit_ratings(season, build_team_stat_table(season, api_key), teams)
@@ -1091,7 +1182,8 @@ def run_season(season: int, api_key: str) -> None:
 
         splits = compute_team_splits(team_id, sp, by_pos, tstats, sp_means,
                                      recruiting_scaled, line_rating, sched_map.get(team_id),
-                                     (w_part, m_off, m_def) if w_part < 1.0 else None)
+                                     (w_part, m_off, m_def) if w_part < 1.0 else None,
+                                     slot_by_pos=dict(slot_map.get(team_id, {})), results=strength_map.get(team_id))
         if splits is None:
             skipped.append(school)
             continue
@@ -1111,6 +1203,9 @@ def run_season(season: int, api_key: str) -> None:
             "roster_half":        splits["roster_half"],
             "stats_half":         splits["stats_half"],
             "stats_half_raw":     splits["stats_half_raw"],
+            "results_half":       splits["results_half"],
+            "results_points":     splits["results_points"],
+            "play_rating":        splits["play_rating"],
             "partial_weight":     splits["partial_weight"],
             "sched_faced":        splits["sched_faced"],
             "sp_offense_scaled":  round(sp_scaled(sp["offense"] if sp else None, sp_means[1]), 2),
@@ -1145,7 +1240,13 @@ def run_season(season: int, api_key: str) -> None:
     for r in rows:
         seen[(r["team_id"], r["season"])] = r
     rows = list(seen.values())
-    attach_power(rows, season, teams)
+    play_quality = {}
+    for r in rows:
+        sr = json.loads(r["sub_ratings"]) if isinstance(r["sub_ratings"], str) else r["sub_ratings"]
+        v = sr.get("play_rating") if sr.get("play_rating") is not None else r["overall_rating"]
+        if v is not None:
+            play_quality[int(r["team_id"])] = v
+    attach_power(rows, season, teams, quality=play_quality)
 
     new_df = pd.DataFrame(rows)
     existing = read_computed("team_ratings")
@@ -1208,6 +1309,7 @@ def run_projected_season(season: int) -> None:
 
     teams = load_teams()
     roster_map = load_starter_ratings_by_position(season, engine="projected")
+    slot_map = load_starter_ratings_by_position(season, engine="projected", min_rating=0.0)
     print(f"  {len(roster_map)} teams have projected starter ratings")
     if not roster_map:
         print(f"  ERROR: no projected player ratings for {season} — run script 16 first")
@@ -1223,7 +1325,7 @@ def run_projected_season(season: int) -> None:
         if not by_pos:
             continue
         splits = compute_team_splits(team_id, None, by_pos, None, sp_means,
-                                     recruiting_map.get(team_id))
+                                     recruiting_map.get(team_id), slot_by_pos=dict(slot_map.get(team_id, {})))
         rec = recruiting_map.get(team_id)
         sub_ratings = {
             "pass_off":          splits["pass_off"],

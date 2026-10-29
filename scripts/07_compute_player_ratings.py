@@ -984,6 +984,8 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
             cols.append("coverage_share")
         if "edge_all" in edge_df.columns:
             cols.append("edge_all")
+        if "team_games" in edge_df.columns:       # written by 06 --in-progress only
+            cols.append("team_games")
         edge_df = edge_df[cols].copy()
         ps_df = ps_df.merge(edge_df, left_on="id", right_on="player_season_id",
                             how="left", suffixes=("", "_edge"))
@@ -1068,6 +1070,7 @@ def _load_seasons(seasons: list[int], pg: str) -> pd.DataFrame:
         feats["edge_all"]          = row.get("edge_all")
         feats["stats_measured"]    = _si(row.get("stats_measured"))
         feats["games_played"]      = _si(row.get("games_played"))
+        feats["team_games"]        = _sf(row.get("team_games"), 0.0)
         feats["opp_avg_sp"]        = _sf(row.get("opponent_avg_sp"))
         # How much of a secondary player's EDGE came from coverage denial rather
         # than counting stats. This dict is rebuilt per row rather than carried
@@ -1521,6 +1524,9 @@ def apply_multi_tier_treatment(scores: np.ndarray, df: pd.DataFrame, pg: str,
     return result
 
 
+GAMES_CONF_SEASON = 12.0     # the season length the 8-game full-confidence rule was written on
+
+
 def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame, pg: str = "") -> np.ndarray:
     """Damp ratings toward position average only for low-game-count players.
 
@@ -1530,6 +1536,14 @@ def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame, pg: str = "") -
     Zero values (no EDGE data) are skipped entirely — they get fallback_rating later.
     Pre-2016 defensive players skip the penalty: they use season totals (CLASSIC system)
     and have games_played=0 by construction (no player_edge row).
+
+    In a season in progress (v4.20) the rows carry `team_games`, the games his team has played so far, and
+    the count is converted to the share of those games he played, on the 12-game scale the 8-game rule was
+    written on: a quarterback who has started all 7 of his team's games is a full-timer (12), not a 7-game
+    part-timer. Before this a player stood at 7/8 = 0.875 of his deviation at week 8 and at 1.0 a week later, and a
+    team with a bye was damped more than one without. A finished season has no `team_games`, so its ratings are
+    unchanged (measured: for 3-7-game players 2016-2024 the damp helps below a rating of 55 and over-penalises
+    70+, a separate question left alone).
     """
     valid = scaled[scaled > 0]
     avg = float(np.mean(valid)) if len(valid) > 0 else 65.0
@@ -1541,6 +1555,9 @@ def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame, pg: str = "") -
         if pg in DEFENSIVE_POSITIONS and row_season < 2016:
             continue  # CLASSIC system: season totals, no per-game confidence check
         games = float(row.get("games_played", 0) or 0)
+        team_games = float(row.get("team_games", 0) or 0)
+        if team_games > 0:       # a season in progress: his share of his team's games so far, on a 12-game season
+            games = min(games / team_games, 1.0) * GAMES_CONF_SEASON
         if games >= 8:
             continue  # full-season starters: no change
         # linear from 0.25 confidence at 1 game to 1.0 at 8 games

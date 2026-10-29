@@ -147,6 +147,27 @@ def schedule_faced(games, conf_of, team_ids, **solve_kw):
     return {t: (d - cd, o - co) for t, (d, o) in mean.items()}
 
 
+def team_strength(games, conf_of, team_ids, **solve_kw):
+    """How good each team has been so far, from the same solve() the player adjustment uses.
+
+    Returns {team_id: {"off": x, "dfn": y}}: points per game scored above an average FBS team and points per game prevented, the
+    sum being the team's overall strength. A season in progress is solved on the games played, so the ridge keeps a thin sample
+    near its conference. Only teams with at least one scored game appear; a team with none has no results and none are invented.
+    """
+    ids = [int(t) for t in team_ids]
+    played = set()
+    for g in games:
+        hs, as_ = g.get("home_score"), g.get("away_score")
+        if hs is None or as_ is None or hs != hs or as_ != as_:
+            continue
+        for k in ("home_team_id", "away_team_id"):
+            t = g.get(k)
+            if t is not None and t == t:
+                played.add(int(t))
+    sol = solve(games, conf_of, ids, **solve_kw)
+    return {t: {"off": float(sol[t]["off"]), "dfn": float(sol[t]["dfn"])} for t in ids if t in played and t in sol}
+
+
 def strength_gap(out, home_id, away_id):
     """Expected margin of the home side from the two teams' strengths alone (points): (off_h + dfn_h) - (off_a + dfn_a)."""
     h, a = out.get(home_id), out.get(away_id)

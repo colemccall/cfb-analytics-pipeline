@@ -645,3 +645,16 @@ R_edge = edge_to_ovr(edge_all), edge_all = sum of opponent-adjusted game scores 
 rating = prior + w x (R_edge - mean R_edge of low-game players at his position and games), clipped to 30..72; prior = position average + step for stars (unchanged); basis blended.
 w = 0.115 (1 game, under 4 counted events), 0.175 (1 game, 4+), 0.173 (2 games, under 4), 0.209 (2 games, 4+) (script 07 LOW_GAME_WEIGHT). Fitted by scripts/validate_low_game_weights.py as the slope of the next season's earned rating on R_edge.
 The tier blend is skipped for these players. Players with no productive game keep the recruiting-only rating.
+
+## v4.20 - live adjustment, FCS, QB score, roster layout, three-reading headline (mirrors METHODS `team-ratings`, `opponent-strength`, `live-season`, `qb-composite`)
+
+Opponent map: a season with no `team_records` rows (one in progress) takes each team's conference from the teams table; before v4.20 the map was empty and every live game had a multiplier of 1.0.
+FCS: a game against a non-FBS opponent counts at a fixed OPP_FCS_MULT = 0.85, every position, both sides of the ball.
+QB game score: 0.5 V + 0.5 V / max(attempts, 10) x 28, V the volume score (yards + 0.7 rush yards + 25 TD + 20 rush TD - 20 INT), only when V > 0 (QB_EFFICIENCY_BLEND, QB_ATT_REF, QB_ATT_FLOOR).
+Pace scale (season in progress): EDGE_live = EDGE_raw x sqrt(scheduled / completed) x k(share), share = his games / his team's completed games, k = 0.8927 / 0.9541 / 0.9900 / 1.0057 for share <= 0.5 / <= 0.75 / <= 0.9 / above. No pull toward a mean.
+Games damp (script 07): confidence = max(0.25, g_eff / 8) toward the position average; g_eff = min(games / team_games, 1) x 12 in a season in progress, games in a finished one; 1.0 from g_eff = 8.
+
+Roster reading = roster_to_ovr(slot score); slot score = sum over groups of weight x (0.85 x mean(starters) + 0.15 x mean(depth)).
+Starters / depth: QB 1 / 1, RB 2 / 2, WR 5 / 3, TE 1 / 3, DL (+EDGE) 4 / 3, LB 4 / 3, DB (+CB, S) 6 / 4, K 1, P 1, OL = the line unit. A missing player is skipped; a group nobody is rated in drops out and the weights renormalise.
+Weights (half the non-negative-least-squares fit, half one per starter slot): QB .139 RB .091 WR .087 TE .029 OL .101 DL .131 LB .144 DB .252 K .012 P .015, which is 4.2 / 2.7 / 2.6 / 0.9 / 3.0 / 3.9 / 4.3 / 7.6 / 0.4 / 0.5 % of the final score.
+Headline = 0.30 roster + 0.20 team stats + 0.50 results; results = SP_OVERALL_ANCHORS(opponent-adjusted points scored + prevented per game against an average FBS team); offense and defense are the same blend over the offensive and defensive halves (results through SP_OFFENSE_ANCHORS / SP_DEFENSE_ANCHORS). Power's rating part = 0.60 roster + 0.40 stats (the "play" rating).

@@ -203,14 +203,37 @@ def _parse_stat_value(d: dict, key: str) -> float | None:
 # faced: the opposing DEFENSE for an offensive player, the opposing OFFENSE for a defender. Until v4.17 that was
 # SP+ (an outside number, soft on weak opponents, and it treated an FCS opponent as average). It is now our own
 # offense and defense ratings per team, solved from the season's results with a conference level underneath
-# (utils/opponent_strength.py; scripts/validate_opponent_strength.py chose its settings), with one pooled FCS
-# team for every non-FBS opponent. The strengths are put on the scale the multiplier already reads (z-scores:
+# (utils/opponent_strength.py; scripts/validate_opponent_strength.py chose its settings); the pooled FCS team is still
+# solved (it keeps the strengths of the FBS teams honest) but a non-FBS opponent's game now counts at the fixed
+# OPP_FCS_MULT below. The strengths are put on the scale the multiplier already reads (z-scores:
 # 1 + OPP_K_HI x z above average, 1 + OPP_K_LO x z below, z clipped to +-2), so the frozen anchors still apply.
 # CFB_OPP_SOURCE=sp restores the SP+ adjustment for comparison runs; the K values can be overridden the same way.
 OPP_SOURCE = os.environ.get("CFB_OPP_SOURCE", "own")
 OPP_K_HI = float(os.environ.get("CFB_OPP_K_HI", "0.35"))
 OPP_K_LO = float(os.environ.get("CFB_OPP_K_LO", "0.12"))
 OPP_FCS_KEY = -1
+# THE FCS WEIGHT (v4.20). A game against a non-FBS opponent counts at one fixed multiplier, for every position and
+# both sides of the ball, instead of the pooled FCS team's strength read through the FBS curve (about 0.76 in a
+# finished season, and 1.0 in a season in progress until the live map was fixed). Measured on the same players
+# (scripts/validate_fcs_weight.py): offensive production against FCS opponents is 1.13x that against FBS ones
+# (QB 1.10, RB 1.24, WR 1.10, TE 1.07), so the multiplier that equalises them is 0.88; the owner set 0.85 across the board.
+OPP_FCS_MULT = float(os.environ.get("CFB_OPP_FCS_MULT", "0.85"))
+
+
+def current_conferences() -> dict:
+    """{team_id: conference} from the teams table: the conference map for a season that has no records yet.
+
+    A season in progress has games and no `team_records` rows (the records are harvested after the season), so
+    until v4.20 `build_opponent_map` returned {} for it and every live game was adjusted by a multiplier of 1.0:
+    no credit for a hard schedule and full credit for an FCS opponent. Script 10's build_schedule_map has always
+    fallen back this way. Used ONLY when the season has no records at all, so a finished season (where a team that
+    was FCS then is correctly not an FBS opponent) is untouched.
+    """
+    teams = read_raw("teams")
+    if teams.empty or "conference" not in teams.columns:
+        return {}
+    teams = teams.dropna(subset=["id", "conference"])
+    return {int(r.id): r.conference for r in teams.itertuples()}
 
 
 def build_opponent_map(season: int) -> dict:
@@ -230,6 +253,8 @@ def build_opponent_map(season: int) -> dict:
     recs = read_raw("team_records")
     recs = recs[(recs["season"] == season)].dropna(subset=["team_id", "conference"])
     conf = {int(r.team_id): r.conference for r in recs.itertuples()}
+    if not conf:
+        conf = current_conferences()
     if not conf or games.empty:
         return {}
     out = ostr.solve(games.to_dict("records"), lambda t: conf.get(int(t)) if t != ostr.FCS else None, list(conf))
@@ -289,11 +314,11 @@ def opponent_multiplier(opp_team_id, sp_map: dict, side: str, season_means: tupl
     Penalty (weak opponent): down to 0.76 (z * 0.12)
     """
     if not opp_team_id or opp_team_id not in sp_map:
-        # An opponent that is not an FBS team of ours: with our own strengths it is the pooled FCS team (not
-        # an average one); with SP+ there is nothing to read, so 1.0 as before.
+        # An opponent that is not an FBS team of ours: one fixed multiplier (OPP_FCS_MULT) with our own
+        # strengths; with SP+ there is nothing to read, so 1.0 as before.
         if OPP_FCS_KEY not in sp_map:
             return 1.0
-        opp_team_id = OPP_FCS_KEY
+        return OPP_FCS_MULT
     sp_entry = sp_map[opp_team_id]
     mean_off, mean_def, mean_ovr = season_means
 
@@ -1019,9 +1044,38 @@ def _load_game_stats(season: int, positions: set) -> pd.DataFrame:
 # Offensive EDGE
 # ---------------------------------------------------------------------------
 
+# THE QB EFFICIENCY BLEND (v4.20). A quarterback's game score was volume plus touchdowns (yards 1.0, TD 25, INT -20), so a
+# 400-yard game from 55 attempts outscored a 280-yard game from 25 that moved the ball better. The score is now half that
+# volume score and half the same score restated at a standard QB_ATT_REF attempts (score / attempts x QB_ATT_REF, the
+# attempts floored at QB_ATT_FLOOR so a three-throw relief game is not multiplied into a star turn). Chosen on held-out
+# data (scripts/validate_qb_composite.py): his offense's points over expectation after week 8, previous-season team
+# offense as the control, leave-one-season-out, 824 QB-seasons 2017-2025: R2 0.3766 today, 0.3905 at a quarter efficiency,
+# 0.3970 at half, 0.3916 at three quarters, 0.3776 all efficiency; a placebo that shuffles attempts across games gives 0.3608
+# (worse than today), so the gain is the attempts, not the arithmetic. Doubling the interception weight changed nothing
+# (0.3970 -> 0.3985) and is left alone. The reference is the median attempts per QB game, so a typical QB's score does not move
+# and the frozen EDGE_OVR_ANCHORS still apply. Team results are NOT an input: points scored while he played predict the later
+# offense best of all (R2 0.468 alone) but that is the team's offense, and a player's rating stays his own production.
+QB_EFFICIENCY_BLEND = 0.5
+QB_ATT_REF = 28.0
+QB_ATT_FLOOR = 10.0
+
+
+def _qb_attempts(stats: dict) -> float:
+    """Pass attempts in one game, read from "C/ATT" ("12/20") when that is the form present, else passingATT."""
+    catt = stats.get("passingC/ATT") or stats.get("passingATT")
+    if catt and "/" in str(catt):
+        return float(_coerce_int(str(catt).split("/")[-1]))
+    return float(_coerce_int(catt))
+
+
 def _off_stat_composite(pg: str, stats: dict) -> float:
+    """One offensive game's score: sum of stat x weight; a QB's is blended with the same score at a standard attempt count."""
     weights = OFFENSIVE_COMPOSITE.get(pg, {})
-    return sum(_coerce_float(stats.get(k)) * w for k, w in weights.items())
+    base = sum(_coerce_float(stats.get(k)) * w for k, w in weights.items())
+    if pg == "QB" and base > 0:
+        att = max(_qb_attempts(stats), QB_ATT_FLOOR)
+        return (1.0 - QB_EFFICIENCY_BLEND) * base + QB_EFFICIENCY_BLEND * base / att * QB_ATT_REF
+    return base
 
 
 def _off_stats_measured(pg: str, stats: dict) -> float:
@@ -1312,55 +1366,35 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
 # Write results to data/raw/player_edge.json (upsert by player_season_id)
 # ---------------------------------------------------------------------------
 
-# THE IN-SEASON PACE CORRECTION (v4.16). A part-season EDGE (sum of game scores / sqrt(games)) is carried to a
-# full-season figure in three steps, each fitted on 2022-2025 cut after weeks 4, 6, 8 and 10 against the
-# final EDGE of the same players (leave-one-season-out, 69,948 player-seasons, scripts/validate_pace.py):
-#   1. paced = raw x sqrt(r), r = team games scheduled / completed  (the old rule, kept as the base);
-#   2. a light shrink toward his position's mean final EDGE last season:
-#        w = g / (g + PACE_SHRINK_GAMES), g his games, so a player with few games moves most;
-#   3. a calibration by the share of his team's games he played, because the old rule ran about 6% high
-#      overall and 14% high for players who had played under half of them.
-# The old rule alone had median |error| 6.02 / 4.46 / 3.36 / 2.43 EDGE points at the four cuts and ran 6% high;
-# this one 5.48 / 4.07 / 2.96 / 2.10, with the share measured against the games the team has COMPLETED (byes
-# count), calibrated leave-one-season-out. The four share buckets are the whole calibration: 0.707 for a player
-# who played at most half his team's games, 0.849 up to three quarters, 0.953 up to 90%, 0.979 above.
-PACE_SHRINK_GAMES = 0.5
+# THE IN-SEASON PACE SCALE (v4.16, refit v4.20). A part-season EDGE (sum of game scores / sqrt(games)) is carried to a
+# full-season figure in two steps, both a SCALE, neither a pull toward a mean:
+#   1. paced = raw x sqrt(r), r = team games scheduled / completed: the same per-game output scores what a full season of it would;
+#   2. a calibration by the share of his team's games he played (measured against the games the team has COMPLETED, byes count),
+#      because the rule alone ran about 12% high for a player who had played under half of them.
+# Until v4.20 a third step shrank the paced value toward his position's mean (w = g / (g + 0.5)) and the calibration constants
+# (0.707 / 0.849 / 0.953 / 0.979) were fitted together with it; the owner asked for a scale that adjusts for the games played, not a
+# shrink, so the shrink is gone and the four constants are refit without it. Fitted on 2021-2025 cut after weeks 4, 6, 8 and 10,
+# 86,707 player-cuts, against the final EDGE of the same players (scripts/validate_pace_scale.py; leave-one-season-out), error measured
+# in rating points through the frozen anchors: MAE 4.789 (the shrink version 4.866; sqrt(r) alone 4.838), average miss +1.31
+# (final above the scaled value; shrink version +1.93). THE COST, stated: without the shrink a 7-game player rated 85 or more
+# finishes on average 1.60 rating points lower than the scale says (the shrink version 0.59), because the best part-season
+# performers regress toward the mean; below 60 the scale is 4.65 too low (4.21). Position family and cut week add under 0.02 of
+# MAE and are not in the scale. The four share buckets are the whole calibration: 0.893 for a player who played at most half his
+# team's games, 0.954 up to three quarters, 0.990 up to 90%, 1.006 above.
 PACE_SHARE_EDGES = (0.5, 0.75, 0.9)           # share of team games played: <=0.5, <=0.75, <=0.9, above
-PACE_SHARE_K = (0.7070, 0.8489, 0.9529, 0.9793)
+PACE_SHARE_K = (0.8927, 0.9541, 0.9900, 1.0057)
 
 
-def pace_factor_for(raw: float, r_team: float, games: int, comp: int, prior_mean) -> float:
-    """The full-season EDGE for a part-season one: shrink, then calibrate by share of games played.
+def pace_factor_for(raw: float, r_team: float, games: int, comp: int) -> float:
+    """The full-season EDGE for a part-season one: scale to a full season, then calibrate by share of games played.
 
     `raw` is the part-season EDGE, `r_team` the team's scheduled/completed ratio, `games` the player's games,
-    `comp` the team's completed games, `prior_mean` the position's mean final EDGE last season (None = no shrink).
+    `comp` the team's completed games.
     """
     paced = raw * float(np.sqrt(r_team))
-    wt = games / (games + PACE_SHRINK_GAMES) if games else 1.0
-    base = wt * paced + (1 - wt) * prior_mean if prior_mean is not None else paced
     share = min(1.0, games / comp) if comp else 1.0
     k = PACE_SHARE_K[sum(share > e for e in PACE_SHARE_EDGES)]
-    return k * base
-
-
-def prior_position_means(season: int) -> dict:
-    """{position_group: mean final EDGE} for the most recent completed season before `season`, from
-    player_edge.json; {} when there is none."""
-    path = RAW_DIR / "player_edge.json"
-    if not path.exists():
-        return {}
-    rows = pd.DataFrame(json.loads(path.read_text(encoding="utf-8")))
-    if rows.empty or "edge_score" not in rows.columns:
-        return {}
-    ps = read_raw("player_seasons")[["id", "position_group"]].rename(columns={"id": "player_season_id"})
-    for s in range(season - 1, season - 4, -1):
-        d = rows[(rows["season"] == s) & rows["edge_score"].notna() & (rows["edge_score"] > 0)]
-        if "edge_raw" in d.columns:
-            d = d[d["edge_raw"].isna()]                       # a completed season, not a part-season run
-        d = d.merge(ps, on="player_season_id")
-        if len(d) > 500:
-            return d.groupby("position_group")["edge_score"].mean().to_dict()
-    return {}
+    return k * paced
 
 
 def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None:
@@ -1377,7 +1411,6 @@ def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None
     # in_progress: each row is rescaled to full-season pace by its team's r, and the
     # raw values are kept beside it so nothing is lost. See team_pace().
     pace = team_pace(season) if in_progress else {}
-    prior_mean = prior_position_means(season) if in_progress else {}
     team_of = {int(r["player_id"]): r["team_id"] for _, r in ps_season.iterrows() if pd.notna(r["team_id"])}
 
     new_rows = {}
@@ -1392,7 +1425,7 @@ def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None
         meas_raw = int(r["stats_measured"]) if pd.notna(r.get("stats_measured")) else 0
         r_team, last_week, comp = pace.get(int(team_of.get(player_id, -1)), (None, None, 0))
         games = int(r["games_played"]) if pd.notna(r.get("games_played")) else 0
-        edge_new = (pace_factor_for(edge_raw, r_team, games, comp, prior_mean.get(r.get("position_group")))
+        edge_new = (pace_factor_for(edge_raw, r_team, games, comp)
                     if (r_team and edge_raw is not None) else edge_raw)
         # one factor for everything scaled with the EDGE (the archetype scores follow it)
         scale_e = (edge_new / edge_raw) if (r_team and edge_raw) else (float(np.sqrt(r_team)) if r_team else 1.0)
@@ -1412,6 +1445,7 @@ def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None
         if in_progress:
             new_rows[ps_id].update({"edge_raw": edge_raw, "stats_measured_raw": meas_raw,
                                     "pace_factor": round(r_team, 4) if r_team else None,
+                                    "team_games": int(comp) if comp else None,
                                     "through_week": last_week})
         # Archetype sub-scores, and which job this player actually does. Only
         # defensive backs carry them.

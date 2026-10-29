@@ -114,8 +114,11 @@ class TestPublishedHalves:
 
     def test_the_halves_add_up_to_the_headline(self):
         s = self._splits((1.5, -0.5))
-        want = 0.6 * s["roster_half"] + 0.4 * s["stats_half"]
+        # no results are passed, so the roster and stats readings carry the headline with their weights renormalised
+        wr, ws = _s10.W_ROSTER_BLEND, _s10.W_STATS_BLEND
+        want = (wr * s["roster_half"] + ws * s["stats_half"]) / (wr + ws)
         assert s["overall_rating"] == pytest.approx(want, abs=0.02)
+        assert s["play_rating"] == pytest.approx(0.6 * s["roster_half"] + 0.4 * s["stats_half"], abs=0.02)
 
     def test_the_raw_half_is_kept_beside_the_adjusted_one(self):
         s = self._splits((2.0, 2.0))

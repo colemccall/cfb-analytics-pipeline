@@ -307,3 +307,24 @@ projections only — labelled through `projection_source`.
 | Four weights by games and events instead of one (0.167) | Shipped, no better | Cross-validated error 8.443 against 8.444; kept because the owner asked for game and snap adjustment and the cells are monotone |
 | Ceiling at 72 | Shipped | Top 5% by estimate later rate 67.6 on average (90th percentile 80.8); rarely binds |
 | Label the rating provisional | Rejected | The owner asked that it not be; the card states the game count |
+
+## v4.20 - live adjustment, FCS, QB score, roster layout, headline
+
+| Option | Status | Why |
+|---|---|---|
+| Leave the live opponent map empty (multiplier 1.0 for every game) | Replaced | It was a defect: a hard schedule got no credit and an FCS game full credit; Minchey 80.2 -> 84.8 once fixed |
+| FCS at the pooled FCS team's strength (about 0.76) or at 1.0 | Replaced by a flat 0.85 | Paired production against FCS is 1.13x FBS (equalising 0.88; 0.95 after FBS adjustment); 0.85 is the owner's setting and harsher than the data |
+| Pace step with a pull toward the position mean (v4.16) | Replaced | The owner asked for a scale, not a shrink; MAE 4.866 -> 4.789, but a 7-game player rated 85+ is 1.60 high on average (0.59 before) |
+| Per-position and per-cut-week pace constants | Rejected | MAE 4.827 / 4.786 / 4.775 against 4.789 for the share of games alone |
+| Delete the games damp in script 07 | Rejected | For 19,364 finished-season 3-7-game player-seasons it helps below 55 and over-penalises 70+ (MAE 9.74 against 7.12 at 70-80); it reads the share of team games in a season in progress instead |
+| A uniform games ramp toward the league mean for the team stats | Rejected | Lowers every rating, reorders nothing |
+| A preseason or last-season prior as the shrink target | Rejected | Would make live ratings depend on preseason numbers, which the owner is testing |
+| QB score: volume only | Replaced | Held-out R2 0.3766; the half-and-half blend 0.3970 (placebo 0.3608) |
+| QB score: add points scored while he played | Rejected | Best predictor (0.4687) but it is his offense, not him |
+| QB score: heavier interception weight | Rejected | 0.3985 at x2, no better |
+| Roster: layout and weights through v4.19 | Replaced | 0.876 / 0.646 (same / next season) against 0.834 / 0.624 for the explainable half-and-half; the new layout fitted alone is 0.881 / 0.657 |
+| Roster weights: football prior alone, equal per starter alone | Rejected | 0.745 and 0.742 same season |
+| Roster: keep the position-weighted half at 40% | Rejected | The line unit is now a group of its own and was counted twice: 0.815 against 0.834 |
+| Headline: 0.60 roster + 0.40 stats | Replaced | Used no result; next-season Spearman 0.670 against 0.716 |
+| Headline: results alone | Rejected | Best (0.731) but drops the roster and the box score and duplicates power |
+| Headline weights typed by hand | Replaced by a stated rule | Every reading at least 0.2, results the most, within 0.02 of the best blend |

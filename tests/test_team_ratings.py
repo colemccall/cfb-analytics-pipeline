@@ -24,6 +24,7 @@ compute_team_splits = _s10.compute_team_splits
 team_stats_to_ovr   = _s10.team_stats_to_ovr
 W_ROSTER_BLEND      = _s10.W_ROSTER_BLEND
 W_STATS_BLEND       = _s10.W_STATS_BLEND
+W_RESULTS_BLEND     = _s10.W_RESULTS_BLEND
 
 SP_MEANS = (0.0, 5.0, 5.0)
 
@@ -48,8 +49,12 @@ def _stats(good=True):
 
 
 class TestBlendWeights:
-    def test_the_two_weights_are_a_whole(self):
-        assert W_ROSTER_BLEND + W_STATS_BLEND == pytest.approx(1.0)
+    def test_the_three_weights_are_a_whole(self):
+        assert W_ROSTER_BLEND + W_STATS_BLEND + W_RESULTS_BLEND == pytest.approx(1.0)
+        assert min(W_ROSTER_BLEND, W_STATS_BLEND, W_RESULTS_BLEND) > 0
+
+    def test_the_play_rating_is_the_old_two_reading_blend(self):
+        assert _s10.W_ROSTER_PLAY + _s10.W_STATS_PLAY == pytest.approx(1.0)
 
     def test_sp_plus_does_not_move_the_rating(self):
         """The rating is built from the season's own players and stats. A wildly different
@@ -136,3 +141,45 @@ class TestBounds:
         weak = compute_team_splits(1, sp, _roster(60), _stats(), SP_MEANS, 0.5)
         strong = compute_team_splits(1, sp, _roster(90), _stats(), SP_MEANS, 0.5)
         assert strong["overall_rating"] >= weak["overall_rating"]
+
+
+class TestResultsReading:
+    """v4.20: the points a team has scored and allowed against the opponents it played are the third reading of the headline."""
+    GOOD = {"off": 10.0, "dfn": 8.0}        # 18 points per game better than an average FBS team
+    BAD = {"off": -10.0, "dfn": -8.0}
+
+    def test_results_reach_the_rating(self):
+        good = compute_team_splits(1, None, _roster(), _stats(), SP_MEANS, 0.9, results=self.GOOD)
+        bad = compute_team_splits(1, None, _roster(), _stats(), SP_MEANS, 0.9, results=self.BAD)
+        assert good["overall_rating"] > bad["overall_rating"] + 3
+
+    def test_no_results_is_the_roster_and_stats_blend_renormalised(self):
+        none = compute_team_splits(1, None, _roster(), _stats(), SP_MEANS, 0.9)
+        assert none["results_half"] is None and none["results_points"] is None
+        assert none["overall_rating"] == pytest.approx(none["play_rating"], abs=0.02)
+
+    def test_results_alone_do_not_rate_a_team(self):
+        # a team with games but no roster rating and no team stats (an FCS team on a schedule) gets no row, as before
+        assert compute_team_splits(1, None, {}, None, SP_MEANS, None, results=self.GOOD) is None
+
+    def test_results_with_stats_alone_are_enough(self):
+        out = compute_team_splits(1, None, {}, _stats(), SP_MEANS, None, results=self.GOOD)
+        assert out is not None and out["results_half"] is not None
+
+    def test_the_play_rating_ignores_results(self):
+        a = compute_team_splits(1, None, _roster(), _stats(), SP_MEANS, 0.9, results=self.GOOD)
+        b = compute_team_splits(1, None, _roster(), _stats(), SP_MEANS, 0.9, results=self.BAD)
+        assert a["play_rating"] == b["play_rating"]
+
+    def test_results_go_through_fixed_absolute_anchors(self):
+        assert _s10.results_to_ovr(0.0) == pytest.approx(_s10.SP_OVERALL_ANCHORS[3][1] + (_s10.SP_OVERALL_ANCHORS[4][1] - _s10.SP_OVERALL_ANCHORS[3][1]) * 3 / 5)
+        assert _s10.results_to_ovr(-100) == _s10.SP_OVERALL_ANCHORS[0][1] and _s10.results_to_ovr(100) == _s10.SP_OVERALL_ANCHORS[-1][1]
+
+    def test_offense_and_defense_read_their_own_side_of_the_results(self):
+        o = compute_team_splits(1, None, _roster(), _stats(), SP_MEANS, 0.9, results={"off": 15.0, "dfn": -15.0})
+        assert o["offense_rating"] > o["defense_rating"] + 5
+
+    def test_the_reading_is_the_same_scale_whatever_the_season_length(self):
+        # points per game against an average team, not a total: nothing here knows how many games were played
+        a = compute_team_splits(1, None, _roster(), _stats(), SP_MEANS, 0.9, results={"off": 4.0, "dfn": 3.0})
+        assert 50 < a["results_half"] < 90
