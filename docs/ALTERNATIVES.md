@@ -293,3 +293,6 @@ projections only — labelled through `projection_source`.
 | Separate coefficients for offense (1.56) and defense (1.68) | Not done | One value, 1.57, 3% below the pooled 1.62; the difference is inside the leave-one-season-out range |
 | Shrink the in-season stats half like the roster half | Not done | Cannot be backtested at week 8: no per-game yards on file |
 | Cross-conference weight 1.0 instead of 1.5 | Not done | Scored 70.0% vs 69.6%, inside noise; changing it is a player-rating recompute |
+| Shrink part-season readings toward the league mean by games played (0.78 at 7 games) | Shipped | Early mean predicts the rest of the season with slope 0.47-0.50; finished seasons untouched; costs 1.2 points of Power-4 over Group-of-6 gap in 2026 (7.13 to 5.98) |
+| Shrink every season by games, finished ones included | Rejected | Moved the 2020 season's 110 ratings by up to 4.8 points; finished seasons keep their validated ratings |
+| Drop the weighted roster half or its line unit | Rejected | Finals fit 0.806 / 0.801 against 0.817 with both; placebo 0.782 |

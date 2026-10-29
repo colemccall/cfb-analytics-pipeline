@@ -135,3 +135,52 @@ class TestPublishedHalves:
 
     def test_the_roster_half_is_untouched_by_the_schedule(self):
         assert self._splits((3.0, 3.0))["roster_half"] == self._splits((-3.0, -3.0))["roster_half"]
+
+
+class TestPartSeasonShrink:
+    def test_a_completed_season_is_untouched(self):
+        assert _s10.partial_weight(12) == 1.0 and _s10.partial_weight(14) == 1.0
+        assert _s10.partial_weight(None) == 1.0
+
+    def test_the_weight_grows_with_games_and_is_below_one_in_season(self):
+        ws = [_s10.partial_weight(g) for g in range(1, 12)]
+        assert ws == sorted(ws) and all(0 < w < 1 for w in ws)
+
+    def test_seven_games_keeps_about_three_quarters_relative_to_a_full_season(self):
+        assert 0.7 < _s10.partial_weight(7) < 0.85
+
+    def test_shrink_moves_each_half_toward_the_league_mean(self):
+        off0, def0, _ = _s10.team_stats_split(STATS)
+        off, dfn, _ = _s10.team_stats_split(STATS, None, (0.5, 70.0, 70.0))
+        assert off == pytest.approx(70.0 + 0.5 * (off0 - 70.0))
+        assert dfn == pytest.approx(70.0 + 0.5 * (def0 - 70.0))
+
+    def test_no_shrink_is_the_unshrunk_reading(self):
+        assert _s10.team_stats_split(STATS, (1.0, 1.0), None) == _s10.team_stats_split(STATS, (1.0, 1.0))
+
+    def test_a_shrunk_team_rates_closer_to_the_league_mean_than_an_unshrunk_one(self):
+        full = _s10.compute_team_splits(1, None, dict(ROSTER), dict(STATS), SP_MEANS, None, 75.0, None, None)
+        part = _s10.compute_team_splits(1, None, dict(ROSTER), dict(STATS), SP_MEANS, None, 75.0, None, (0.5, 70.0, 70.0))
+        assert abs(part["stats_half"] - 70.0) < abs(full["stats_half"] - 70.0)
+        assert part["partial_weight"] == 0.5 and full["partial_weight"] == 1.0
+
+
+class TestSeasonInProgress:
+    def _games(self, unscored_after, unscored_before=0, season=2026):
+        import pandas as pd
+        rows = [dict(season=season, season_type="regular", game_date=f"{season}-09-{d:02d}T18:00:00Z", home_score=30, away_score=20) for d in range(1, 11)]
+        rows += [dict(season=season, season_type="regular", game_date=f"{season}-11-{1 + i % 25:02d}T18:00:00Z", home_score=None, away_score=None) for i in range(unscored_after)]
+        rows += [dict(season=season, season_type="regular", game_date=f"{season}-08-30T18:00:00Z", home_score=None, away_score=None) for _ in range(unscored_before)]
+        return pd.DataFrame(rows)
+
+    def test_a_season_with_many_games_still_to_come_is_in_progress(self):
+        assert _s10.season_in_progress(self._games(unscored_after=400), 2026)
+
+    def test_a_played_season_with_a_few_cancelled_games_is_not(self):
+        assert not _s10.season_in_progress(self._games(unscored_after=0, unscored_before=14), 2024)
+
+    def test_one_or_two_postponed_finales_are_not_a_season_in_progress(self):
+        assert not _s10.season_in_progress(self._games(unscored_after=3), 2025)
+
+    def test_no_games_is_not_in_progress(self):
+        assert not _s10.season_in_progress(self._games(unscored_after=0).iloc[0:0], 2026)

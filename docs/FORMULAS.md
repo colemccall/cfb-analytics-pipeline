@@ -634,3 +634,7 @@ SCHED_COEF = 1.57 OVR points per point per game, the strengths and the pooled FC
 centred on the season's teams so an average schedule moves nothing; a team with no scored game is not adjusted (script 10 build_schedule_map).
 Fitted (scripts/validate_stats_schedule.py, 1,310 team-seasons 2015-2025): offense 1.56, defense 1.68, leaving each season out 1.52-1.71, pooled 1.62.
 sub_ratings now carries roster_half, stats_half (as shipped), stats_half_raw and sched_faced [defenses, offenses].
+
+Part-season shrink (season in progress only; script 10 partial_weight, season_in_progress): stats half and line unit = mean + w x (reading - mean), mean = the season's league mean of that reading,
+w = [g / (g + 8)] / [12 / (12 + 8)] capped at 1 (0.78 at 7 games, 0.56 at 4, 1.0 from 12); g = the team's games in team_season_stats. A season is in progress when 20 or more regular-season games dated
+after the last scored one are unscored. Calibrated on scripts/validate_early_reliability.py: the first 7 games predict the rest of the season with a slope of 0.47 (efficiency and line measures) and 0.50 (points).

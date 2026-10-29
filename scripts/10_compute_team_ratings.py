@@ -234,14 +234,56 @@ W_YDS_D, W_THIRD_D, W_HAVOC_D = 0.50, 0.25, 0.25   # within defense
 # worse than the real adjustment; Power-4 minus Group-of-6 3.63 -> 7.09 rating points (the games imply 7.55).
 SCHED_COEF = 1.57
 
+# THE PART-SEASON SHRINK. Through week 8 a team has played about 7 games, and its season-to-date box score and line
+# unit are means over those 7. Over 2016-2025 the first 7 games' mean predicted the rest of the season with a slope of
+# only 0.47 (success rate, PPA and line yards, offense and defense; 0.39-0.53 across the measures) and 0.50 for points: about
+# half of an early deviation from the league persists. The player ratings were already shrunk for part seasons (script 06);
+# these readings were not, so in a season in progress they ran twice as far from the mean as the evidence allows
+# (through week 8 of 2026 the stats half's spread across teams was 8.5 while the roster half's was 3.6 against 5.1 in finished
+# seasons; the line unit's spread is 15 points where every player-based term has 2-5).
+# A reading from g games therefore keeps partial_weight(g) of its distance from the league mean, in a season still being played
+# (season_in_progress; a short or odd finished season such as 2020 keeps the ratings it was validated at). The weight is
+# [g / (g + SHRINK_GAMES_K)] relative to the same expression at SEASON_GAMES, so a team that has played 12 games or more is untouched. K = 8 gives 0.47 at g = 7 before the rescaling. Calibrated on
+# per-game efficiency, line-yard and points data (scripts/validate_early_reliability.py): per-game yards and
+# third downs are not on file, so the shrink is not backtested on the published stats half itself.
+SHRINK_GAMES_K = 8.0
+SEASON_GAMES = 12
 
-def team_stats_split(stats: dict | None, sched: tuple | None = None):
+
+def season_in_progress(games: "pd.DataFrame", season: int) -> bool:
+    """True when the season still has regular-season games to play: unscored games dated after the last scored one.
+
+    A few unscored games before that date are cancellations (2020 has none left over, 2024 has 14, 2025 has 6) and a played season
+    has none after it; 2026 through week 8 has 1,144. At least 20 are required so a postponed finale is not mistaken for a season.
+    """
+    g = games[(games["season"] == season) & (games["season_type"] == "regular")]
+    if g.empty:
+        return False
+    d = pd.to_datetime(g["game_date"], errors="coerce", utc=True)
+    scored = g["home_score"].notna() & g["away_score"].notna()
+    if not scored.any():
+        return False
+    return int(((~scored) & (d > d[scored].max())).sum()) >= 20
+
+
+def partial_weight(games) -> float:
+    """Share of its distance from the league mean that a reading over `games` games keeps; 1.0 for a full season or no count."""
+    if games is None or games != games or games >= SEASON_GAMES:
+        return 1.0
+    if games <= 0:
+        return 0.0
+    return min(1.0, (games / (games + SHRINK_GAMES_K)) / (SEASON_GAMES / (SEASON_GAMES + SHRINK_GAMES_K)))
+
+
+def team_stats_split(stats: dict | None, sched: tuple | None = None, shrink: tuple | None = None):
     """A team's own box score as (offense OVR, defense OVR, turnover adjustment).
 
     Each is None when its inputs are missing, and the adjustment is 0.0 without a turnover
     margin. `sched` is the team's (defenses faced, offenses faced) from schedule_faced(), centred, in
     points per game; with it each half is moved by SCHED_COEF per point of schedule, and without it (no
-    schedule known, or a projected season) the halves are the raw box score. team_stats_to_ovr()
+    schedule known, or a projected season) the halves are the raw box score. `shrink` is (weight, league mean
+    offense half, league mean defense half) for a season in progress: each half keeps `weight` of its distance from
+    the mean (see partial_weight). team_stats_to_ovr()
     averages the two halves and adds the adjustment; the offense and defense ratings read the halves directly.
     """
     if not stats:
@@ -277,18 +319,22 @@ def team_stats_split(stats: dict | None, sched: tuple | None = None):
     if sched is not None:
         if off is not None: off += SCHED_COEF * sched[0]
         if dfn is not None: dfn += SCHED_COEF * sched[1]
+    if shrink is not None:
+        w, m_off, m_def = shrink
+        if off is not None and m_off is not None: off = m_off + w * (off - m_off)
+        if dfn is not None and m_def is not None: dfn = m_def + w * (dfn - m_def)
     tm = val("turnover_margin")
     adj = _interp_anchors(tm, TO_MARGIN_ANCHORS) if tm is not None else 0.0
     return off, dfn, adj
 
 
-def team_stats_to_ovr(stats: dict | None, sched: tuple | None = None) -> float | None:
+def team_stats_to_ovr(stats: dict | None, sched: tuple | None = None, shrink: tuple | None = None) -> float | None:
     """What a team's own box score says about it, on the OVR scale, adjusted for the schedule it faced.
 
     Without `sched` it is the raw box score, opponent-blind, which is how it read until v4.18 and why
     the Group-of-6 sat too close to the Power 4.
     """
-    off, dfn, adj = team_stats_split(stats, sched)
+    off, dfn, adj = team_stats_split(stats, sched, shrink)
     parts, weights = [], []
     if off is not None: parts.append(off); weights.append(W_STAT_OFF)
     if dfn is not None: parts.append(dfn); weights.append(W_STAT_DEF)
@@ -778,6 +824,7 @@ def compute_team_splits(
     recruiting_scaledcaled: float | None,
     line_rating: float | None = None,
     sched: tuple | None = None,
+    shrink: tuple | None = None,
 ) -> dict | None:
     """Overall/offense/defense (0-99) from the season's own player ratings and team stats.
 
@@ -813,7 +860,7 @@ def compute_team_splits(
                       + roster_to_ovr(weighted) * W_ROSTER_WEIGHTED)
     else:
         roster_ovr = None
-    stats_ovr = team_stats_to_ovr(team_stats, sched)
+    stats_ovr = team_stats_to_ovr(team_stats, sched, shrink)
 
     def _mix(pairs):
         pairs = [(v, w) for v, w in pairs if v is not None]
@@ -829,7 +876,7 @@ def compute_team_splits(
     # Offense and defense are the same two readings, split: the roster's offensive and
     # defensive position groups (through the roster scale) and the team's own offensive
     # and defensive stats. When one side has no input the headline stands in for it.
-    st_off, st_def, _ = team_stats_split(team_stats, sched)
+    st_off, st_def, _ = team_stats_split(team_stats, sched, shrink)
     r_off = blend([(ros["pass_off"], W_PASS_OFF), (ros["run_off"], W_RUN_OFF)])
     r_def = blend([(ros["pass_def"], W_PASS_DEF), (ros["run_def"], W_RUN_DEF)])
     off = _mix([(roster_to_ovr(r_off) if r_off is not None else None, W_ROSTER_BLEND), (st_off, W_STATS_BLEND)])
@@ -869,6 +916,7 @@ def compute_team_splits(
         "roster_half":    r2(roster_ovr) if roster_ovr is not None else None,
         "stats_half":     r2(stats_ovr) if stats_ovr is not None else None,
         "stats_half_raw": r2(team_stats_to_ovr(team_stats)) if stats_ovr is not None else None,
+        "partial_weight": round(float(shrink[0]), 3) if shrink is not None else 1.0,
         "sched_faced":    [round(float(sched[0]), 2), round(float(sched[1]), 2)] if sched is not None else None,
     }
 
@@ -1014,6 +1062,17 @@ def run_season(season: int, api_key: str) -> None:
     coaching_change_teams = load_coaching_changes(season)
     print(f"  {len(coaching_change_teams)} teams with HC/OC/DC changes")
 
+    # A season in progress: shrink the part-season readings toward their league mean (partial_weight). The means are of
+    # the schedule-adjusted halves and of the line unit over the teams that have them; a played season has weight 1.
+    halves = [team_stats_split(tss_map[t], sched_map.get(t)) for t in tss_map]
+    m_off = float(np.mean([h[0] for h in halves if h[0] is not None])) if any(h[0] is not None for h in halves) else None
+    m_def = float(np.mean([h[1] for h in halves if h[1] is not None])) if any(h[1] is not None for h in halves) else None
+    m_line = float(np.mean([v[0] for v in line_map.values() if v[0] is not None])) if line_map else None
+    in_progress = season_in_progress(read_raw("games"), season)
+    pw = {t: partial_weight(tss_map[t].get("games")) if in_progress else 1.0 for t in tss_map}
+    if any(w < 1.0 for w in pw.values()):
+        print(f"  Season in progress: part-season readings keep {min(pw.values()):.2f}-{max(pw.values()):.2f} of their distance from the league mean")
+
     rows = []
     skipped: list[str] = []
     school_map = {t[0]: t[1] for t in teams}
@@ -1026,9 +1085,13 @@ def run_season(season: int, api_key: str) -> None:
         recruiting_scaled   = recruiting_map.get(team_id)
 
         line_rating, line_parts = line_map.get(team_id, (None, {}))
+        w_part = pw.get(team_id, 1.0)
+        if line_rating is not None and m_line is not None and w_part < 1.0:
+            line_rating = m_line + w_part * (line_rating - m_line)
 
         splits = compute_team_splits(team_id, sp, by_pos, tstats, sp_means,
-                                     recruiting_scaled, line_rating, sched_map.get(team_id))
+                                     recruiting_scaled, line_rating, sched_map.get(team_id),
+                                     (w_part, m_off, m_def) if w_part < 1.0 else None)
         if splits is None:
             skipped.append(school)
             continue
@@ -1048,6 +1111,7 @@ def run_season(season: int, api_key: str) -> None:
             "roster_half":        splits["roster_half"],
             "stats_half":         splits["stats_half"],
             "stats_half_raw":     splits["stats_half_raw"],
+            "partial_weight":     splits["partial_weight"],
             "sched_faced":        splits["sched_faced"],
             "sp_offense_scaled":  round(sp_scaled(sp["offense"] if sp else None, sp_means[1]), 2),
             "sp_defense_scaled":  round(sp_scaled(sp["defense"] if sp else None, sp_means[2]), 2),
