@@ -58,7 +58,28 @@ def _load_json(path: Path) -> list[dict]:
 def read_raw(table: str) -> pd.DataFrame:
     """Load data/raw/{table}.json → DataFrame. Empty DataFrame if file missing."""
     rows = _load_json(RAW_DIR / f"{table}.json")
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    return fill_shutouts(df) if table == "games" else df
+
+
+def fill_shutouts(games: pd.DataFrame) -> pd.DataFrame:
+    """A game with exactly one score recorded is a shutout: the missing score is 0, not unknown.
+
+    The harvest stores a team's 0 points as a missing value, so a played game with one score and one gap is
+    a game the shut-out team scored nothing in. Measured 2026-10-29: 725 FBS games 2008-2025 (about 40 a
+    season), and where the betting-lines table also has the game it records 0 for the gap in every case
+    checked. Left as a gap the game had no result for the team that was shut out (it vanished from its
+    record, its schedule result, its standings and every rating built on results). A game with BOTH scores
+    missing is not played yet and is untouched.
+    """
+    if games.empty or "home_score" not in games.columns:
+        return games
+    one = games["home_score"].isna() != games["away_score"].isna()
+    if one.any():
+        games = games.copy()
+        games.loc[one, "home_score"] = games.loc[one, "home_score"].fillna(0.0)
+        games.loc[one, "away_score"] = games.loc[one, "away_score"].fillna(0.0)
+    return games
 
 
 def read_computed(table: str) -> pd.DataFrame:

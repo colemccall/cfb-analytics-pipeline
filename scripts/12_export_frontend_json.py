@@ -1190,6 +1190,9 @@ def export_transfers(T: dict, output_dir: Path, season: int) -> None:
         pid     = _i(row["player_id"])
         from_id = _i(row.get("from_team_id"))
         to_id   = _i(row.get("to_team_id"))
+        # A portal entry that ended at the same school is not a move (157 of them, 2021-2026): it is dropped.
+        if from_id is not None and from_id == to_id:
+            continue
         # Current-season rating at to_team; previous-season rating at from_team
         ovr_current  = _lookup_ovr(pid, season,     to_id)
         ovr_previous = _lookup_ovr(pid, season - 1, from_id)

@@ -171,8 +171,49 @@ THIRD_DEF_ANCHORS  = [(28, 95), (34, 84), (39, 70), (44, 56), (50, 42)]
 HAVOC_ANCHORS      = [(3.5, 45), (5.0, 58), (6.5, 72), (8.0, 85), (9.5, 95)]   # sacks+TFL per game
 TO_MARGIN_ANCHORS  = [(-15, -4.0), (-6, -2.0), (0, 0.0), (6, 2.0), (15, 4.0)]  # OVR points
 
-# Within the roster signal: a flat top-22 mean vs a position-weighted composite.
-W_ROSTER_TOP22, W_ROSTER_WEIGHTED = 0.60, 0.40
+# Within the roster signal: a slot score (below) vs a position-weighted composite. Until v4.16 the
+# first half was a flat mean of the 22 best ratings of any position.
+W_ROSTER_SLOTS, W_ROSTER_WEIGHTED = 0.60, 0.40
+
+# THE SLOT SCORE. Each position group is scored from its starters with some depth behind them, and the
+# groups are weighted. SLOT_STARTERS is how many starters a group has (DL includes EDGE, DB includes CB and S,
+# K and P are one group); the next SLOT_DEPTH_N players are the depth; a group scores
+# STARTER_SHARE x (mean of its starters) + (1 - STARTER_SHARE) x (mean of its depth), or its starters alone
+# when it has no depth. A group nobody is rated in drops out and the weights renormalise (never a default).
+# SLOT_WEIGHTS are 0.75 x the weights fitted by non-negative least squares of season scoring margin on the
+# group scores (2016-2025, leave-one-season-out, 1,261 team-seasons) + 0.25 x a football prior
+# (QB .21 RB .07 WR .14 TE .06 DL .21 LB .11 DB .18 K/P .02), because the pure fit gives WR and TE zero
+# (their ratings overlap the QB's) and a team rating should not say receivers do not matter. Fitted, then
+# shrunk: roster alone Spearman 0.764 against 0.735 for the top-22 mean; blended with team stats 0.879
+# against 0.872 (pure fit 0.882). OL is NOT a slot: it enters only through the line unit inside the
+# position-weighted half, as before.
+SLOT_STARTERS = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "DL": 4, "LB": 3, "DB": 5, "KP": 2}
+SLOT_DEPTH_N = 3
+STARTER_SHARE = 0.80
+SLOT_WEIGHTS = {"QB": 0.194, "RB": 0.189, "WR": 0.036, "TE": 0.016, "DL": 0.150, "LB": 0.123, "DB": 0.286, "KP": 0.008}
+
+
+def slot_score(by_pos: dict) -> float | None:
+    """The slot score of a roster: weighted mean of its position groups' starter-plus-depth scores.
+
+    `by_pos` is {position_group: [ratings]}. None when no group has a rated player.
+    """
+    groups = {
+        "QB": by_pos.get("QB", []), "RB": by_pos.get("RB", []), "WR": by_pos.get("WR", []), "TE": by_pos.get("TE", []),
+        "DL": by_pos.get("DL", []) + by_pos.get("EDGE", []), "LB": by_pos.get("LB", []),
+        "DB": by_pos.get("DB", []) + by_pos.get("CB", []) + by_pos.get("S", []),
+        "KP": by_pos.get("K", []) + by_pos.get("P", []),
+    }
+    parts = []
+    for g, n in SLOT_STARTERS.items():
+        xs = sorted(groups[g], reverse=True)
+        if not xs:
+            continue
+        start = float(np.mean(xs[:n]))
+        depth = xs[n:n + SLOT_DEPTH_N]
+        score = start if not depth else STARTER_SHARE * start + (1 - STARTER_SHARE) * float(np.mean(depth))
+        parts.append((score, SLOT_WEIGHTS[g]))
+    return blend(parts)
 
 W_STAT_OFF, W_STAT_DEF = 0.50, 0.50
 W_YDS, W_THIRD = 0.65, 0.35          # within offense
@@ -731,15 +772,12 @@ def compute_team_splits(
     no rating to give, and saying 50.0 is a claim we cannot support.
     """
     # --- Headline ratings: two readings of the same season, blended ---
-    # Roster talent = mean of the team's top-22 starter OVRs across all positions.
-    all_starter_ovrs = [r for ratings in roster_by_pos.values() for r in ratings]
-    mean_top22 = (float(np.mean(sorted(all_starter_ovrs, reverse=True)[:22]))
-                  if all_starter_ovrs else None)
-
-    # Two views of the same roster. The top-22 mean treats every starter as
-    # equally important, which a football team is not; the position-weighted
-    # composite knows a quarterback outweighs a fourth safety. Blending both
-    # keeps a star-driven roster and a uniformly solid one distinguishable.
+    # Roster talent, two views of the same roster. The slot score takes the starters of every position
+    # group with some depth behind them, weighted by what each group has been worth (see SLOT_WEIGHTS); the
+    # position-weighted composite below knows a quarterback outweighs a fourth safety and carries the
+    # offensive line (as the line unit). Blending both keeps a star-driven roster and a uniformly solid one
+    # distinguishable.
+    slots = slot_score(roster_by_pos)
     ros = compute_roster_splits(roster_by_pos, line_rating)
     # Every split can now be None — a position group with nobody rated no longer
     # contributes a fabricated 50 — so the rollup renormalises the same way.
@@ -747,10 +785,10 @@ def compute_team_splits(
                       (ros["pass_def"], W_PASS_DEF), (ros["run_def"], W_RUN_DEF),
                       (ros["special"],  W_SPEC)])
     if weighted is None:
-        mean_top22 = None
+        slots = None
 
-    if mean_top22 is not None:
-        roster_ovr = (roster_to_ovr(mean_top22) * W_ROSTER_TOP22
+    if slots is not None:
+        roster_ovr = (roster_to_ovr(slots) * W_ROSTER_SLOTS
                       + roster_to_ovr(weighted) * W_ROSTER_WEIGHTED)
     else:
         roster_ovr = None

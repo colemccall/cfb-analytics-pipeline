@@ -259,3 +259,25 @@ projections only — labelled through `projection_source`.
 | Count the postseason as evidence for next season's strength | Measured, no gain | Season s power predicting s+1: winner 66.3% / MAE 14.06 without bowls and playoff, 65.8% / 14.03 with (2016-2024, 4,971 games). The postseason is 5.2% of FBS-vs-FBS games and 16.7% of cross-conference ones |
 | Predict bowl games from regular-season results | Measured, worse than the rating | 485 games: rating alone 66.0% / 12.82, power 59.8% / 13.11 |
 | A results-leaning power (cap 7, bonus 16) | Measured, not adopted | 69.3% / 13.51 against 70.7% / 13.12; across 60 settings 67.6-70.7%. Puts Kentucky 6th over LSU 11th in 2026 through week 8. The owner's call: what the ranking is for |
+
+## v4.16 - slot team rating and in-season pace
+
+| Option | Status | Why |
+|---|---|---|
+| Hand-picked slot weights | Rejected | 0.710 vs 0.735 for the top-22 mean (roster alone, Spearman with margin) |
+| Slot weights fitted with no prior | Shrunk 25% toward a football prior | WR and TE get zero weight; the shrink costs 0.003 |
+| Depth and rotation terms | Kept small | +0.001 in the fit |
+| OL as a slot | Not done, on request | The line unit stays inside the position-weighted half |
+| Pace: shrink toward last season's EDGE | Rejected | Equal to a placebo; position mean is as good (3.10 vs 2.97 at week 8) |
+| Pace: per-position constants | Rejected | 2.97 vs 2.99; share of games played explains the bias |
+| Pace: sqrt(r) alone (before) | Replaced | Ran 6% high (14% for players under half his team's games) |
+
+## v4.17 - own opponent strength
+
+| Option | Status | Why |
+|---|---|---|
+| SP+ as the opponent factor | Replaced | Equal in prediction (0.441 vs 0.440); outside number; FCS opponents at 1.00 |
+| Harsher weak-opponent penalty (k_lo 0.25-0.35) | Rejected | Gap 4.4-5.5 vs 3.7 points but next-season fit 0.424-0.401 vs 0.440 |
+| Cross-conference weight above 1 | Rejected | 70.0% at 1.0, 68.8% at 2.5 |
+| Postseason weight | Set to 1.0 | Next-season 66.3% (0) to 66.6% (2) |
+| Leave shutouts as gaps | Fixed | 725 FBS games had no result for the shut-out team |

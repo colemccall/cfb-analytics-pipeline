@@ -38,6 +38,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -198,6 +199,51 @@ def _parse_stat_value(d: dict, key: str) -> float | None:
 # SP+ opponent quality map — built from API (cached) + local teams.json
 # ---------------------------------------------------------------------------
 
+# THE OPPONENT ADJUSTMENT (v4.17). Each game of a player is scaled by how good the opponent was on the side he
+# faced: the opposing DEFENSE for an offensive player, the opposing OFFENSE for a defender. Until v4.17 that was
+# SP+ (an outside number, soft on weak opponents, and it treated an FCS opponent as average). It is now our own
+# offense and defense ratings per team, solved from the season's results with a conference level underneath
+# (utils/opponent_strength.py; scripts/validate_opponent_strength.py chose its settings), with one pooled FCS
+# team for every non-FBS opponent. The strengths are put on the scale the multiplier already reads (z-scores:
+# 1 + OPP_K_HI x z above average, 1 + OPP_K_LO x z below, z clipped to +-2), so the frozen anchors still apply.
+# CFB_OPP_SOURCE=sp restores the SP+ adjustment for comparison runs; the K values can be overridden the same way.
+OPP_SOURCE = os.environ.get("CFB_OPP_SOURCE", "own")
+OPP_K_HI = float(os.environ.get("CFB_OPP_K_HI", "0.35"))
+OPP_K_LO = float(os.environ.get("CFB_OPP_K_LO", "0.12"))
+OPP_FCS_KEY = -1
+
+
+def build_opponent_map(season: int) -> dict:
+    """{team_id: {"offense", "defense", "overall"}} on the SP+-like scale the multiplier reads, from our own strengths.
+
+    Solved from every game of the season so far (regular season, plus the postseason once it exists; with
+    --through-week only games to that week). The pooled FCS team is under OPP_FCS_KEY. Offense is mean 27 and
+    defense (lower is better) mean 27, one standard deviation = 0.26 x 27 = 7.02, exactly what
+    opponent_multiplier() turns into a z-score.
+    """
+    from utils import opponent_strength as ostr
+    games = read_raw("games")
+    games = games[(games["season"] == season) & games["home_score"].notna() & games["away_score"].notna()]
+    if _THROUGH_WEEK is not None:
+        games = games[(games["season_type"] != "regular") | (games["week"].fillna(99) <= _THROUGH_WEEK)]
+        games = games[games["season_type"] == "regular"]
+    recs = read_raw("team_records")
+    recs = recs[(recs["season"] == season)].dropna(subset=["team_id", "conference"])
+    conf = {int(r.team_id): r.conference for r in recs.itertuples()}
+    if not conf or games.empty:
+        return {}
+    out = ostr.solve(games.to_dict("records"), lambda t: conf.get(int(t)) if t != ostr.FCS else None, list(conf))
+    ids = [t for t in out if t != ostr.FCS]
+    sd_o = float(np.std([out[t]["off"] for t in ids])) or 1.0
+    sd_d = float(np.std([out[t]["dfn"] for t in ids])) or 1.0
+    unit = 0.26 * 27.0
+    m = {}
+    for t, v in out.items():
+        zo, zd = v["off"] / sd_o, v["dfn"] / sd_d
+        m[int(t)] = {"offense": 27.0 + unit * zo, "defense": 27.0 - unit * zd, "overall": unit * (zo + zd)}
+    return m
+
+
 def build_opponent_sp_map(season: int, api_key: str) -> dict:
     """Return {team_db_id: {"overall", "offense", "defense"}} for a season."""
     sp_by_name = fetch_sp_ratings_breakdown(api_key, season)
@@ -243,7 +289,11 @@ def opponent_multiplier(opp_team_id, sp_map: dict, side: str, season_means: tupl
     Penalty (weak opponent): down to 0.76 (z * 0.12)
     """
     if not opp_team_id or opp_team_id not in sp_map:
-        return 1.0
+        # An opponent that is not an FBS team of ours: with our own strengths it is the pooled FCS team (not
+        # an average one); with SP+ there is nothing to read, so 1.0 as before.
+        if OPP_FCS_KEY not in sp_map:
+            return 1.0
+        opp_team_id = OPP_FCS_KEY
     sp_entry = sp_map[opp_team_id]
     mean_off, mean_def, mean_ovr = season_means
 
@@ -261,10 +311,8 @@ def opponent_multiplier(opp_team_id, sp_map: dict, side: str, season_means: tupl
         z = (sp - mean_ovr) / 30.0
 
     z = max(-2.0, min(2.0, z))
-    if z >= 0:
-        return 1.0 + z * 0.35
-    else:
-        return 1.0 + z * 0.12
+    k_hi, k_lo = (OPP_K_HI, OPP_K_LO) if OPP_FCS_KEY in sp_map else (0.35, 0.12)
+    return 1.0 + z * (k_hi if z >= 0 else k_lo)
 
 
 # ---------------------------------------------------------------------------
@@ -887,7 +935,7 @@ _THROUGH_WEEK = None
 
 
 def team_pace(season: int) -> dict:
-    """Per-team pace of a season that is still being played: {team_id: (r, last_week)}.
+    """Per-team pace of a season that is still being played: {team_id: (r, last_week, games_completed)}.
 
     r = regular-season games scheduled / regular-season games completed. EDGE is
     sum(composite * opp_mult) / sqrt(games_played), so for the SAME per-game output
@@ -909,7 +957,7 @@ def team_pace(season: int) -> dict:
     sched = pd.concat([g["home_team_id"], g["away_team_id"]]).value_counts()
     comp = pd.concat([done["home_team_id"], done["away_team_id"]]).value_counts()
     last = int(done["week"].max()) if len(done) else 0
-    return {int(t): (float(sched[t]) / float(comp[t]), last) for t in comp.index if t in sched.index}
+    return {int(t): (float(sched[t]) / float(comp[t]), last, int(comp[t])) for t in comp.index if t in sched.index}
 
 
 def _load_game_stats(season: int, positions: set) -> pd.DataFrame:
@@ -1258,6 +1306,57 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
 # Write results to data/raw/player_edge.json (upsert by player_season_id)
 # ---------------------------------------------------------------------------
 
+# THE IN-SEASON PACE CORRECTION (v4.16). A part-season EDGE (sum of game scores / sqrt(games)) is carried to a
+# full-season figure in three steps, each fitted on 2022-2025 cut after weeks 4, 6, 8 and 10 against the
+# final EDGE of the same players (leave-one-season-out, 69,948 player-seasons, scripts/validate_pace.py):
+#   1. paced = raw x sqrt(r), r = team games scheduled / completed  (the old rule, kept as the base);
+#   2. a light shrink toward his position's mean final EDGE last season:
+#        w = g / (g + PACE_SHRINK_GAMES), g his games, so a player with few games moves most;
+#   3. a calibration by the share of his team's games he played, because the old rule ran about 6% high
+#      overall and 14% high for players who had played under half of them.
+# The old rule alone had median |error| 6.02 / 4.46 / 3.36 / 2.43 EDGE points at the four cuts and ran 6% high;
+# this one 5.48 / 4.07 / 2.96 / 2.10, with the share measured against the games the team has COMPLETED (byes
+# count), calibrated leave-one-season-out. The four share buckets are the whole calibration: 0.707 for a player
+# who played at most half his team's games, 0.849 up to three quarters, 0.953 up to 90%, 0.979 above.
+PACE_SHRINK_GAMES = 0.5
+PACE_SHARE_EDGES = (0.5, 0.75, 0.9)           # share of team games played: <=0.5, <=0.75, <=0.9, above
+PACE_SHARE_K = (0.7070, 0.8489, 0.9529, 0.9793)
+
+
+def pace_factor_for(raw: float, r_team: float, games: int, comp: int, prior_mean) -> float:
+    """The full-season EDGE for a part-season one: shrink, then calibrate by share of games played.
+
+    `raw` is the part-season EDGE, `r_team` the team's scheduled/completed ratio, `games` the player's games,
+    `comp` the team's completed games, `prior_mean` the position's mean final EDGE last season (None = no shrink).
+    """
+    paced = raw * float(np.sqrt(r_team))
+    wt = games / (games + PACE_SHRINK_GAMES) if games else 1.0
+    base = wt * paced + (1 - wt) * prior_mean if prior_mean is not None else paced
+    share = min(1.0, games / comp) if comp else 1.0
+    k = PACE_SHARE_K[sum(share > e for e in PACE_SHARE_EDGES)]
+    return k * base
+
+
+def prior_position_means(season: int) -> dict:
+    """{position_group: mean final EDGE} for the most recent completed season before `season`, from
+    player_edge.json; {} when there is none."""
+    path = RAW_DIR / "player_edge.json"
+    if not path.exists():
+        return {}
+    rows = pd.DataFrame(json.loads(path.read_text(encoding="utf-8")))
+    if rows.empty or "edge_score" not in rows.columns:
+        return {}
+    ps = read_raw("player_seasons")[["id", "position_group"]].rename(columns={"id": "player_season_id"})
+    for s in range(season - 1, season - 4, -1):
+        d = rows[(rows["season"] == s) & rows["edge_score"].notna() & (rows["edge_score"] > 0)]
+        if "edge_raw" in d.columns:
+            d = d[d["edge_raw"].isna()]                       # a completed season, not a part-season run
+        d = d.merge(ps, on="player_season_id")
+        if len(d) > 500:
+            return d.groupby("position_group")["edge_score"].mean().to_dict()
+    return {}
+
+
 def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None:
     """Write one season's EDGE rows into data/raw/player_edge.json.
 
@@ -1272,6 +1371,7 @@ def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None
     # in_progress: each row is rescaled to full-season pace by its team's r, and the
     # raw values are kept beside it so nothing is lost. See team_pace().
     pace = team_pace(season) if in_progress else {}
+    prior_mean = prior_position_means(season) if in_progress else {}
     team_of = {int(r["player_id"]): r["team_id"] for _, r in ps_season.iterrows() if pd.notna(r["team_id"])}
 
     new_rows = {}
@@ -1284,13 +1384,17 @@ def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None
             continue
         edge_raw = float(r["edge_score"]) if pd.notna(r.get("edge_score")) else None
         meas_raw = int(r["stats_measured"]) if pd.notna(r.get("stats_measured")) else 0
-        r_team, last_week = pace.get(int(team_of.get(player_id, -1)), (None, None))
-        scale_e = float(np.sqrt(r_team)) if r_team else 1.0
+        r_team, last_week, comp = pace.get(int(team_of.get(player_id, -1)), (None, None, 0))
+        games = int(r["games_played"]) if pd.notna(r.get("games_played")) else 0
+        edge_new = (pace_factor_for(edge_raw, r_team, games, comp, prior_mean.get(r.get("position_group")))
+                    if (r_team and edge_raw is not None) else edge_raw)
+        # one factor for everything scaled with the EDGE (the archetype scores follow it)
+        scale_e = (edge_new / edge_raw) if (r_team and edge_raw) else (float(np.sqrt(r_team)) if r_team else 1.0)
         new_rows[ps_id] = {
             "player_season_id": ps_id,
             "player_id":        player_id,
             "season":           season,
-            "edge_score":       edge_raw * scale_e if edge_raw is not None else None,
+            "edge_score":       edge_new,
             "stats_measured":   int(round(meas_raw * (r_team or 1.0))),
             "games_played":     int(r["games_played"]) if pd.notna(r.get("games_played")) else 0,
             "opponent_avg_sp":  float(r["opponent_avg_sp"]) if pd.notna(r.get("opponent_avg_sp")) else None,
@@ -1344,9 +1448,14 @@ def run_season(season: int, api_key: str, in_progress: bool = False) -> None:
     print(f"Computing EDGE — Season {season}")
     print(f"{'='*60}")
 
-    print("Loading SP+ ratings...")
-    sp_map = build_opponent_sp_map(season, api_key)
-    print(f"  {len(sp_map)} teams with SP+ ratings")
+    if OPP_SOURCE == "sp":
+        print("Loading SP+ ratings (comparison run: CFB_OPP_SOURCE=sp)...")
+        sp_map = build_opponent_sp_map(season, api_key)
+        print(f"  {len(sp_map)} teams with SP+ ratings")
+    else:
+        print("Solving our own opponent strengths (utils/opponent_strength.py)...")
+        sp_map = build_opponent_map(season)
+        print(f"  {len(sp_map)} teams (FCS pooled)")
 
     print("Computing offensive EDGE...")
     off_agg = compute_offensive_edge(season, sp_map)

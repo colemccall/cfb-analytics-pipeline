@@ -610,3 +610,18 @@ Reproduce: `python scripts/validate_rankings.py`.
 - **Cards.** `cards/NNNN.json` (script 12 `export_player_cards`): `NNNN = player_id % 1024`; the grid's rows unchanged,
   `logo_url` dropped, oldest season first. `CONFIG.CARD_SHARDS` must equal the script's `CARD_SHARDS`.
 - **Headshots.** `scripts/19_harvest_headshots.py` matches by school and normalised name; see the Build Log entry for the rate.
+
+## v4.16 - team roster slot score and the pace rule
+
+roster = 0.60 roster_to_ovr(slot) + 0.40 roster_to_ovr(position-weighted composite);
+slot = weighted mean over QB, RB, WR, TE, DL(+EDGE), LB, DB(+CB,S), K/P of (0.8 x starters' mean + 0.2 x mean of the next three);
+starters 1/2/3/1/4/3/5/2, weights .194/.189/.036/.016/.150/.123/.286/.008 (script 10 SLOT_*).
+
+Part-season EDGE to full-season: base = w x raw x sqrt(r) + (1 - w) x mu_pos, w = g/(g+0.5), mu_pos = last season's mean final EDGE for the position;
+EDGE = k x base with k = 0.707 / 0.849 / 0.953 / 0.979 for share of the team's completed games played <=0.5 / <=0.75 / <=0.9 / above (script 06 PACE_*).
+
+## v4.17 - opponent strength
+
+points(i vs j) = mu + off_i + dfn_j + home; off_i = conference level + team deviation (ridge: team 3, conference 0.5); postseason weight 1.0, cross-conference weight 1.0;
+one pooled FCS team for every non-FBS opponent. z = strength / sd per side; multiplier = 1 + 0.35 z (z >= 0) or 1 + 0.12 z (z < 0), z clipped to +-2 (script 06 build_opponent_map,
+utils/opponent_strength.py). A game with one score missing is a shutout: the gap is 0 (utils/store.fill_shutouts).
