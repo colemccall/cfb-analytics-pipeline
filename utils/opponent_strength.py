@@ -116,6 +116,37 @@ def solve(games, conf_of, team_ids, lam_team=LAM_TEAM, lam_conf=LAM_CONF, post_w
     return out
 
 
+def schedule_faced(games, conf_of, team_ids, **solve_kw):
+    """How hard each team's schedule was, from the same strengths solve() gives, in points per game.
+
+    Returns {team_id: (defenses, offenses)}: the mean `dfn` of the defenses a team faced and the mean `off` of the
+    offenses it faced, each CENTRED on the average of `team_ids` that played a game, so 0 is an average schedule and
+    +3 is three points per game tougher. A non-FBS opponent (a missing or unknown id) is the pooled FCS team, the
+    same as in solve(). A team with no scored game is absent: no schedule is known, and none is invented.
+    """
+    ids = [int(t) for t in team_ids]
+    sol = solve(games, conf_of, ids, **solve_kw)
+    faced = {t: ([], []) for t in ids}
+    for g in games:
+        hs, as_ = g.get("home_score"), g.get("away_score")
+        if hs is None or as_ is None or hs != hs or as_ != as_:
+            continue
+        h, a = g.get("home_team_id"), g.get("away_team_id")
+        h = int(h) if h is not None and h == h else FCS
+        a = int(a) if a is not None and a == a else FCS
+        for me, opp in ((h, a), (a, h)):
+            if me in faced:
+                v = sol[opp] if opp != FCS and conf_of(opp) and opp in sol else sol[FCS]
+                faced[me][0].append(v["dfn"])
+                faced[me][1].append(v["off"])
+    mean = {t: (float(np.mean(d)), float(np.mean(o))) for t, (d, o) in faced.items() if d}
+    if not mean:
+        return {}
+    cd = float(np.mean([v[0] for v in mean.values()]))
+    co = float(np.mean([v[1] for v in mean.values()]))
+    return {t: (d - cd, o - co) for t, (d, o) in mean.items()}
+
+
 def strength_gap(out, home_id, away_id):
     """Expected margin of the home side from the two teams' strengths alone (points): (off_h + dfn_h) - (off_a + dfn_a)."""
     h, a = out.get(home_id), out.get(away_id)

@@ -281,3 +281,15 @@ projections only — labelled through `projection_source`.
 | Cross-conference weight above 1 | Rejected | 70.0% at 1.0, 68.8% at 2.5 |
 | Postseason weight | Set to 1.0 | Next-season 66.3% (0) to 66.6% (2) |
 | Leave shutouts as gaps | Fixed | 725 FBS games had no result for the shut-out team |
+
+## v4.18 - schedule-adjusted stats half
+
+| Option | Status | Why |
+|---|---|---|
+| Raw box-score stats half (before) | Replaced | Schedule coefficient -0.51 / -0.52 (t = -32 / -29); Power-4 minus Group-of-6 3.63 vs 7.09 points |
+| Stats half := our own points strength | Rejected | Best accuracy (63.5% / 14.89, gap 6.46) but results enter the rating and power adds them again |
+| Adjusted stats half at weight 0.5 or 0.6 | Rejected | 62.8% / 14.98 and 63.3% / 14.97, gaps 7.87 and 8.65: inside noise; the 60/40 weights are not tuned to the outcome used to judge them |
+| Schedules dealt to the wrong teams (placebo) | Control | 62.5% / 15.22, gap 3.70: worse than the real adjustment |
+| Separate coefficients for offense (1.56) and defense (1.68) | Not done | One value, 1.57, 3% below the pooled 1.62; the difference is inside the leave-one-season-out range |
+| Shrink the in-season stats half like the roster half | Not done | Cannot be backtested at week 8: no per-game yards on file |
+| Cross-conference weight 1.0 instead of 1.5 | Not done | Scored 70.0% vs 69.6%, inside noise; changing it is a player-rating recompute |

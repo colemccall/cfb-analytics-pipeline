@@ -150,7 +150,7 @@ def roster_to_ovr(mean_top: float) -> float:
 # Headline OVR blend. Three independent readings of the same team:
 #   SP+     — schedule-adjusted, external, the single best predictor
 #   roster  — our own player ratings, which is the thing this site actually builds
-#   stats   — what the team did on the field, unadjusted for opponent
+#   stats   — what the team did on the field, adjusted since v4.18 for the schedule it faced (SCHED_COEF)
 #
 # The third was missing entirely: team stats were harvested into
 # team_season_stats.json by this very script and then never read, while
@@ -219,13 +219,30 @@ W_STAT_OFF, W_STAT_DEF = 0.50, 0.50
 W_YDS, W_THIRD = 0.65, 0.35          # within offense
 W_YDS_D, W_THIRD_D, W_HAVOC_D = 0.50, 0.25, 0.25   # within defense
 
+# THE SCHEDULE ADJUSTMENT. A box score is what a team did against the opponents it happened to play, so
+# the stats half carried the schedule: with a team's own points strength held fixed, one standard deviation
+# of tougher schedule lowered the offense half by 0.51 standard deviations (t = -32) and the defense half by
+# 0.52 (t = -29) over 1,310 team-seasons 2015-2025, and a Power-4 team averaged 5.6 points per game of
+# tougher defenses than a Group-of-6 team. Each half is therefore moved by SCHED_COEF OVR points per point
+# per game of schedule faced: the offense half by the mean defense of the opponents faced, the defense half
+# by the mean offense of the offenses faced, both from our own opponent strengths
+# (utils/opponent_strength.schedule_faced), centred so an average schedule moves nothing. SCHED_COEF 1.57 is
+# the offense fit; the defense fit is 1.68, leaving each season out gives 1.52-1.71, and the pooled value is
+# 1.62 (3% above the constant); one value serves both. Measured on prior-season quality predicting later
+# games (scripts/validate_stats_schedule.py): winner 62.7% either way, margin error 15.13 -> 15.02 (power
+# 71.6 -> 71.5%, 13.24 -> 13.22); a placebo that deals the schedules to the wrong teams scores 62.5% / 15.22,
+# worse than the real adjustment; Power-4 minus Group-of-6 3.63 -> 7.09 rating points (the games imply 7.55).
+SCHED_COEF = 1.57
 
-def team_stats_split(stats: dict | None):
+
+def team_stats_split(stats: dict | None, sched: tuple | None = None):
     """A team's own box score as (offense OVR, defense OVR, turnover adjustment).
 
     Each is None when its inputs are missing, and the adjustment is 0.0 without a turnover
-    margin. Opponent-blind by construction. team_stats_to_ovr() averages the two halves
-    and adds the adjustment; the offense and defense ratings read the halves directly.
+    margin. `sched` is the team's (defenses faced, offenses faced) from schedule_faced(), centred, in
+    points per game; with it each half is moved by SCHED_COEF per point of schedule, and without it (no
+    schedule known, or a projected season) the halves are the raw box score. team_stats_to_ovr()
+    averages the two halves and adds the adjustment; the offense and defense ratings read the halves directly.
     """
     if not stats:
         return None, None, 0.0
@@ -257,18 +274,21 @@ def team_stats_split(stats: dict | None):
             tot += _interp_anchors((sk or 0) + (tf or 0), HAVOC_ANCHORS) * W_HAVOC_D
             w += W_HAVOC_D
         if w > 0: dfn = tot / w
+    if sched is not None:
+        if off is not None: off += SCHED_COEF * sched[0]
+        if dfn is not None: dfn += SCHED_COEF * sched[1]
     tm = val("turnover_margin")
     adj = _interp_anchors(tm, TO_MARGIN_ANCHORS) if tm is not None else 0.0
     return off, dfn, adj
 
 
-def team_stats_to_ovr(stats: dict | None) -> float | None:
-    """What a team's own box score says about it, on the OVR scale.
+def team_stats_to_ovr(stats: dict | None, sched: tuple | None = None) -> float | None:
+    """What a team's own box score says about it, on the OVR scale, adjusted for the schedule it faced.
 
-    Opponent-blind by construction, which is why it is one input among several and the
-    roster's opponent-adjusted player ratings carry the schedule.
+    Without `sched` it is the raw box score, opponent-blind, which is how it read until v4.18 and why
+    the Group-of-6 sat too close to the Power 4.
     """
-    off, dfn, adj = team_stats_split(stats)
+    off, dfn, adj = team_stats_split(stats, sched)
     parts, weights = [], []
     if off is not None: parts.append(off); weights.append(W_STAT_OFF)
     if dfn is not None: parts.append(dfn); weights.append(W_STAT_DEF)
@@ -757,11 +777,12 @@ def compute_team_splits(
     sp_means: tuple,
     recruiting_scaledcaled: float | None,
     line_rating: float | None = None,
+    sched: tuple | None = None,
 ) -> dict | None:
     """Overall/offense/defense (0-99) from the season's own player ratings and team stats.
 
-    Headline = 0.60 roster talent + 0.40 the team's own stats; offense and defense are the
-    same blend over the offensive and defensive halves. `sp` (SP+) is accepted but no longer
+    Headline = 0.60 roster talent + 0.40 the team's own stats, adjusted for the schedule it faced
+    (`sched`, see SCHED_COEF); offense and defense are the same blend over the offensive and defensive halves. `sp` (SP+) is accepted but no longer
     an input: it is published beside the rating as a reference. The same function rates a
     played season, a season in progress and, with no stats, a projected one.
 
@@ -792,7 +813,7 @@ def compute_team_splits(
                       + roster_to_ovr(weighted) * W_ROSTER_WEIGHTED)
     else:
         roster_ovr = None
-    stats_ovr = team_stats_to_ovr(team_stats)
+    stats_ovr = team_stats_to_ovr(team_stats, sched)
 
     def _mix(pairs):
         pairs = [(v, w) for v, w in pairs if v is not None]
@@ -808,7 +829,7 @@ def compute_team_splits(
     # Offense and defense are the same two readings, split: the roster's offensive and
     # defensive position groups (through the roster scale) and the team's own offensive
     # and defensive stats. When one side has no input the headline stands in for it.
-    st_off, st_def, _ = team_stats_split(team_stats)
+    st_off, st_def, _ = team_stats_split(team_stats, sched)
     r_off = blend([(ros["pass_off"], W_PASS_OFF), (ros["run_off"], W_RUN_OFF)])
     r_def = blend([(ros["pass_def"], W_PASS_DEF), (ros["run_def"], W_RUN_DEF)])
     off = _mix([(roster_to_ovr(r_off) if r_off is not None else None, W_ROSTER_BLEND), (st_off, W_STATS_BLEND)])
@@ -842,6 +863,13 @@ def compute_team_splits(
         "offense_rating": r2(_clip(off)),
         "defense_rating": r2(_clip(def_rating)),
         "composite":      r2(overall),
+        # The two halves of the headline, published so the rating can show its evidence: the roster
+        # reading, the stats reading as shipped (schedule-adjusted), the same stats unadjusted, and
+        # the schedule (defenses faced, offenses faced, points per game vs an average schedule).
+        "roster_half":    r2(roster_ovr) if roster_ovr is not None else None,
+        "stats_half":     r2(stats_ovr) if stats_ovr is not None else None,
+        "stats_half_raw": r2(team_stats_to_ovr(team_stats)) if stats_ovr is not None else None,
+        "sched_faced":    [round(float(sched[0]), 2), round(float(sched[1]), 2)] if sched is not None else None,
     }
 
 
@@ -882,6 +910,31 @@ def attach_power(rows: list, season: int, teams, with_results: bool = True) -> N
         r["results_wins"] = int(p["wins"]) if p else 0
         r["results_losses"] = int(p["losses"]) if p else 0
         r["home_edge"] = round(info["home_edge"], 2)
+
+
+def build_schedule_map(season: int, teams) -> dict:
+    """{team_id: (defenses faced, offenses faced)} in points per game, centred, for the stats half's schedule adjustment.
+
+    Strengths are solved from every scored game of the season on file (the regular season, the postseason
+    once it exists, only the games played for a season in progress), by the same solver that adjusts the
+    player ratings. A team's conference for the season comes from the harvested records, falling back to
+    its current one, as in attach_power().
+    """
+    from utils import opponent_strength as ostr
+    cur_conf = {int(t[0]): t[2] for t in teams}
+    recs = read_raw("team_records")
+    season_conf = {}
+    if not recs.empty:
+        for r in recs[recs["season"] == season].dropna(subset=["team_id", "conference"]).itertuples():
+            season_conf[int(r.team_id)] = r.conference
+    conf = lambda t: (season_conf.get(int(t)) or cur_conf.get(int(t))) if t != ostr.FCS else None   # noqa: E731
+    g = read_raw("games")
+    if g.empty:
+        return {}
+    g = g[(g["season"] == season) & g["home_score"].notna() & g["away_score"].notna()]
+    if g.empty:
+        return {}
+    return ostr.schedule_faced(g.to_dict("records"), conf, [int(t[0]) for t in teams])
 
 
 def run_season(season: int, api_key: str) -> None:
@@ -934,6 +987,15 @@ def run_season(season: int, api_key: str) -> None:
                if not _tss.empty else {})
     print(f"  {len(tss_map)} teams have per-game season stats")
 
+    print("Measuring each schedule faced (our own opponent strengths)...")
+    sched_map = build_schedule_map(season, teams)
+    if sched_map:
+        fd = [v[0] for v in sched_map.values()]
+        print(f"  {len(sched_map)} schedules; defenses faced {min(fd):+.1f} to {max(fd):+.1f} points per game "
+              f"(sd {float(np.std(fd)):.1f}), moving the stats half by up to {SCHED_COEF * max(abs(x) for x in fd):.1f} OVR")
+    else:
+        print("  no games on file: the stats half is the raw box score")
+
     print("Rating offensive lines as units...")
     line_map = build_line_unit_ratings(season, build_team_stat_table(season, api_key), teams)
     if line_map:
@@ -966,7 +1028,7 @@ def run_season(season: int, api_key: str) -> None:
         line_rating, line_parts = line_map.get(team_id, (None, {}))
 
         splits = compute_team_splits(team_id, sp, by_pos, tstats, sp_means,
-                                     recruiting_scaled, line_rating)
+                                     recruiting_scaled, line_rating, sched_map.get(team_id))
         if splits is None:
             skipped.append(school)
             continue
@@ -983,6 +1045,10 @@ def run_season(season: int, api_key: str) -> None:
             "line_unit":          splits["line_unit"],
             "line_unit_inputs":   line_parts or None,
             "composite":          splits["composite"],
+            "roster_half":        splits["roster_half"],
+            "stats_half":         splits["stats_half"],
+            "stats_half_raw":     splits["stats_half_raw"],
+            "sched_faced":        splits["sched_faced"],
             "sp_offense_scaled":  round(sp_scaled(sp["offense"] if sp else None, sp_means[1]), 2),
             "sp_defense_scaled":  round(sp_scaled(sp["defense"] if sp else None, sp_means[2]), 2),
             "recruiting_scaled":  round(recruiting_scaled, 2) if recruiting_scaled is not None else None,

@@ -622,6 +622,15 @@ EDGE = k x base with k = 0.707 / 0.849 / 0.953 / 0.979 for share of the team's c
 
 ## v4.17 - opponent strength
 
-points(i vs j) = mu + off_i + dfn_j + home; off_i = conference level + team deviation (ridge: team 3, conference 0.5); postseason weight 1.0, cross-conference weight 1.0;
+points(i vs j) = mu + off_i + dfn_j + home; off_i = conference level + team deviation (ridge: team 3, conference 0.5); postseason weight 1.0, cross-conference weight 1.5 (the code's value; the grid scored 1.0 best by 0.4 points, inside noise, and it was left alone);
 one pooled FCS team for every non-FBS opponent. z = strength / sd per side; multiplier = 1 + 0.35 z (z >= 0) or 1 + 0.12 z (z < 0), z clipped to +-2 (script 06 build_opponent_map,
 utils/opponent_strength.py). A game with one score missing is a shutout: the gap is 0 (utils/store.fill_shutouts).
+
+## v4.18 - schedule-adjusted stats half (mirrors METHODS `team-ratings`)
+
+overall = 0.60 roster + 0.40 stats (unchanged). stats = 0.50 offense + 0.50 defense + turnover-margin adjustment, where now
+offense += SCHED_COEF x (mean defense of the opponents faced) and defense += SCHED_COEF x (mean offense of the offenses faced),
+SCHED_COEF = 1.57 OVR points per point per game, the strengths and the pooled FCS team from utils/opponent_strength.py (schedule_faced),
+centred on the season's teams so an average schedule moves nothing; a team with no scored game is not adjusted (script 10 build_schedule_map).
+Fitted (scripts/validate_stats_schedule.py, 1,310 team-seasons 2015-2025): offense 1.56, defense 1.68, leaving each season out 1.52-1.71, pooled 1.62.
+sub_ratings now carries roster_half, stats_half (as shipped), stats_half_raw and sched_faced [defenses, offenses].
