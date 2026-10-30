@@ -16,6 +16,8 @@ are unblocked), and `/stats/season/advanced` carries `lineYards` / `stuffRate` /
 back to 2010 (a real line-unit rating is possible). See `API_INVENTORY.md`, which is generated,
 and `ALTERNATIVES.md`, which turns each into an option with a test attached.
 
+**Updated 2026-10-30 (v4.22).** The 2026 data runs through the games of 10/29; live power ranks on games alone; the team page and player card carry a week-by-week panel (script 17b). Next, in this order: the spec and Build Log audit and the pre-playoff marker test the owner asked for (not started), a 2024 and 2025 weekly backfill if the owner wants somewhere to test the game grades, and the owner's decision on the failing recruiting-basis contract test. Raw `games.json` still stores missing zeros for 2008-2026; `fill_shutouts` in the store must stay.
+
 ---
 
 ## Shipped since this was written: rating v4.3 (2026-08-12)

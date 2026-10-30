@@ -394,6 +394,14 @@ def upsert_players_and_seasons(rosters_by_team: dict, team_id_map: dict, season:
 # Games
 # ---------------------------------------------------------------------------
 
+def _points(game: dict, *keys: str):
+    """A game's points under the first key that is present, 0 included; None when no key has a value."""
+    for k in keys:
+        if game.get(k) is not None:
+            return game[k]
+    return None
+
+
 def save_games(games_raw: list, team_id_map: dict, season: int) -> dict:
     """Upsert games. Returns {cfb_api_id: db_id}."""
     path = RAW_DIR / "games.json"
@@ -424,8 +432,10 @@ def save_games(games_raw: list, team_id_map: dict, season: int) -> dict:
             # well known — Montana State is not an unknown fixture.
             "home_team_name": home_name or None,
             "away_team_name": away_name or None,
-            "home_score":   g.get("homePoints") or g.get("home_points"),
-            "away_score":   g.get("awayPoints") or g.get("away_points"),
+            # `or` would turn a shutout's 0 into None (0 is falsy): 2,330 games across 2008-2026 lost a score that way
+            # before v4.22 (scripts/repair_zero_scores.py recovers them). A missing score stays None.
+            "home_score":   _points(g, "homePoints", "home_points"),
+            "away_score":   _points(g, "awayPoints", "away_points"),
             "neutral_site": g.get("neutralSite", False),
             "game_date":    (g.get("startDate") or g.get("start_date") or "")[:10] or None,
             "venue":        g.get("venue"),

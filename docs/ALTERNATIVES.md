@@ -339,3 +339,14 @@ projections only — labelled through `projection_source`.
 | Results reading with the conference level off, or from power's machinery | Not adopted | Predicts later games equally well (winner 68.8 / 69.0 / 69.2%); would put Boise State 14th-26th and Kentucky 20th-39th; the owner asked for no large changes |
 | QB rushing yard at its held-out value (0.68 of a passing yard) | Rejected | Noisy (0.32-1.35 by season); the owner's small tilt (1.05 / 0.6 / 18) costs no accuracy (R2 0.3983 against 0.3970) |
 | Showing the earned part-season row as the 2026 Preseason list | Replaced | The export read whichever of the earned and projected rows sorted last; a projected season exports its projection only |
+
+## v4.22 - live power, weekly progression
+
+| Option | Status | Why |
+|---|---|---|
+| Live power with last season's rating as the prior (the validated version) | Not used for a season in progress | 71.5% / 13.24 against 71.2% / 13.44 for games alone; breaks the rule that no last-season or preseason number enters a live rating |
+| Slice the final ratings by week | Rejected | Final numbers contain the later games, so a week's number is not what was known then |
+| Rebuild the weekly line unit from per-game advanced rates | Rejected | 2025: correlates 0.98 / 0.98 / 0.98 / 0.78 with the season values, not equal; no 2026 per-game advanced file on disk |
+| Player game grades for everyone who played | Rejected | A walk-on with one counted play gets a grade; only players holding a rating that week have one |
+| Re-grade every game with the latest opponent strengths | Experiment | Fixed and reproducible, but no longer what the model said that week |
+| Repair the zero scores in the 2026 raw file | Reverted | Ratings did not change (the store already restores the zeros on read); the only effect was the live file's records, fixed in the reader |

@@ -71,6 +71,21 @@ def test_live_seasons_match_exported_files():
     )
 
 
+def test_weekly_seasons_match_exported_files():
+    """WEEKLY_SEASONS must list exactly the seasons with both weekly_teams_{season}.json and weekly_players_{season}.json.
+
+    The team page and the player card ask for the week-by-week files only for a listed season. One listed without its files is
+    a 404 on every visit; files not listed are a progression the site never shows.
+    """
+    def seasons(prefix):
+        return {int(m.group(1)) for p in APP_DATA.glob(f"{prefix}_*.json") if (m := re.fullmatch(rf"{prefix}_(\d{{4}})\.json", p.name))}
+    on_disk = sorted(seasons("weekly_teams") & seasons("weekly_players"))
+    assert _js_int_list("WEEKLY_SEASONS") == on_disk, (
+        f"config.js WEEKLY_SEASONS {_js_int_list('WEEKLY_SEASONS')} != exported file pairs {on_disk}"
+    )
+    assert seasons("weekly_teams") == seasons("weekly_players"), "a weekly teams file has no players file (or the reverse)"
+
+
 def test_recruiting_seasons_match_exported_files():
     """RECRUITING_SEASONS must list exactly the class years with a recruiting_{year}.json.
 

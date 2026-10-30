@@ -45,6 +45,8 @@ import pandas as pd
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+from utils.store import fill_shutouts  # noqa: E402
+
 APP_DATA = ROOT.parent / "cfb-analytics-app" / "data"
 EARNED_BASES = ("production", "blended")
 
@@ -237,7 +239,9 @@ def main() -> None:
     ap.add_argument("--keep-sandbox", action="store_true")
     args = ap.parse_args()
 
-    games = _load(ROOT / "data" / "raw" / "games.json")
+    # Through fill_shutouts, as every other reader of games does: the harvest stored a shutout's 0 as missing, and read raw the
+    # live file's records left out every game a team won 40-0 (Oklahoma showed 3-3 for 4-3 before v4.22).
+    games = fill_shutouts(_load(ROOT / "data" / "raw" / "games.json"))
     progress = season_progress(games, args.season)
     if not progress["completed"]:
         sys.exit(f"No completed regular-season games for {args.season} — harvest first (script 01).")

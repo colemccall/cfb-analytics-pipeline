@@ -664,3 +664,10 @@ Headline = 0.30 roster + 0.20 team stats + 0.50 results; results = SP_OVERALL_AN
 Headline = 1/6 roster + 1/6 team stats + 2/3 results (renormalised when one is absent); the group shares of the roster are 1/6 of the weights in the v4.20 table (QB 2.3%, RB 1.5%, WR 1.5%, TE 0.5%, OL 1.7%, DL 2.2%, LB 2.4%, DB 4.2%, K 0.2%, P 0.3%, stats 16.7%, results 66.7% of the final score). Offense and defense use the same weights. Power's rating part is unchanged (0.60 roster + 0.40 stats).
 QB volume score V = 1.05 passing yards + 0.6 rushing yards + 25 passing TD + 18 rushing TD - 20 interceptions (was 1.0, 0.7, 25, 20, -20); the game score is still 0.5 V + 0.5 V / max(attempts, 10) x 28.
 Live teams carry roster_half, stats_half, results_half, results_points and play_rating; a projected season exports its projection row only.
+
+## v4.22 - live power on games alone, weekly progression (mirrors METHODS `power-rating`, `weekly-progression`)
+
+Power for a season being played: power = results part (the rating part is 0 for every team, because script 10 passes one quality value for all teams while `season_in_progress`). A finished season: power = 0.98 x (rating - mean) + results part, unchanged.
+Week-N snapshot: games after week N unscored, script 06 `--in-progress --through-week N`, 07, script 10 `--through-week N` (team stats summed from the box scores of weeks 1..N, `utils/box_scores.py`; no line unit). Team rating = 1/6 roster + 1/6 stats + 2/3 results of that snapshot.
+Team game grade = results_to_ovr( clip(margin, -28, 28) - home_edge (home) or + home_edge (away) + opponent off+dfn after week N ). Player game grade = edge_to_ovr( sqrt(12) x the game's adjusted score, position ), only for a player who holds a rating that week.
+Games are read through `fill_shutouts` everywhere (the harvest had stored a 0 as missing; `scripts/01` now keeps it).

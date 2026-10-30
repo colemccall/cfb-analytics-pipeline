@@ -964,6 +964,34 @@ def def_context_modifier(pg: str, game_db_id: int, player_team_db_id: int,
 # Set from --through-week in main(); None means "every game on file".
 _THROUGH_WEEK = None
 
+# Every counted player-game's adjusted score, kept for the weekly progression (v4.22): save_game_scores() writes it beside
+# player_edge.json for a season in progress, and scripts/17b_weekly_progression.py turns one game's score into a single-game
+# grade. Nothing in the rating reads it.
+_GAME_SCORES: list = []
+
+
+def _note_game_scores(df: pd.DataFrame) -> None:
+    """Remember (player_id, game_id, adj_score) of every kept player-game from one compute_*_edge call."""
+    _GAME_SCORES.append(df[["player_id", "game_id", "adj_score"]].copy())
+
+
+def save_game_scores(season: int) -> None:
+    """Write data/raw/player_game_scores.json: one row per counted player-game of `season` (replacing that season's rows)."""
+    if not _GAME_SCORES:
+        return
+    df = pd.concat(_GAME_SCORES, ignore_index=True)
+    ps_df = read_raw("player_seasons")
+    ps_map = {int(r.player_id): int(r.id) for r in ps_df[ps_df["season"] == season].itertuples()}
+    rows = [{"player_season_id": ps_map[int(r.player_id)], "game_id": int(r.game_id), "season": season,
+             "adj_score": round(float(r.adj_score), 4)}
+            for r in df.itertuples() if int(r.player_id) in ps_map and r.game_id == r.game_id]
+    path = RAW_DIR / "player_game_scores.json"
+    kept = []
+    if path.exists():
+        kept = [x for x in json.loads(path.read_text(encoding="utf-8")) if x.get("season") != season]
+    path.write_text(json.dumps(kept + rows, separators=(",", ":")), encoding="utf-8")
+    print(f"  Saved {len(rows)} player-game scores for {season}")
+
 
 def team_pace(season: int) -> dict:
     """Per-team pace of a season that is still being played: {team_id: (r, last_week, games_completed)}.
@@ -1142,12 +1170,14 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
             "adj_score":      raw * opp_mult,
             "opp_mult":       opp_mult,
             "primary_vol":    _off_stats_measured(pg, stats),
+            "game_id":        r["game_id"],
         })
 
     if not records:
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
+    _note_game_scores(df)
 
     def agg(grp):
         n         = len(grp)
@@ -1313,6 +1343,7 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
             "position_group": pg,
             "adj_score":      score * opp_mult * ctx_mult,
             "opp_mult":       opp_mult,
+            "game_id":        game_id,
             "raw_vol":        vol,
             "havoc_share":    hshare,
             # What the coverage archetype contributes, in the same units as the
@@ -1330,6 +1361,7 @@ def compute_defensive_edge(season: int, sp_map: dict, ctx_map: dict | None = Non
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
+    _note_game_scores(df)
 
     def agg(grp):
         n         = len(grp)
@@ -1545,6 +1577,8 @@ def run_season(season: int, api_key: str, in_progress: bool = False) -> None:
 
     agg = pd.concat(frames, ignore_index=True)
     save_edge(agg, season, in_progress=in_progress)
+    if in_progress:
+        save_game_scores(season)
     print(f"Season {season} EDGE complete.")
 
 

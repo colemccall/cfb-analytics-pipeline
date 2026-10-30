@@ -43,7 +43,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv()
 
 from utils.store import read_raw, read_computed, write_computed
-from utils.api_client import load_api_key, fetch_sp_ratings_breakdown, fetch_team_stats
+from utils.api_client import load_api_key, fetch_sp_ratings_breakdown, fetch_team_stats, fetch_teams, _get_list
+from utils.box_scores import fetch_season_rows
 from utils.line_unit import line_unit_rating
 from utils.results_rating import power_components
 
@@ -626,10 +627,25 @@ def compute_roster_splits(by_pos: dict, line_rating: float | None = None) -> dic
 # and persist display-ready per-game metrics for the frontend stats panel.
 # ---------------------------------------------------------------------------
 
+# Set from --through-week in main(): read the season as it stood after that regular-season week (v4.22). None means every game on
+# file. The team statistics are then summed from the box scores of weeks 1..N instead of read from /stats/season (the sums are
+# the same numbers: utils/box_scores.py), and the line unit is left out, because /stats/season/advanced has no weekly version.
+_THROUGH_WEEK = None
+
+
+def team_season_rows(season: int, api_key: str) -> list:
+    """/stats/season's rows, or the same rows summed from the box scores through _THROUGH_WEEK."""
+    if _THROUGH_WEEK is None:
+        return fetch_team_stats(api_key, season)
+    # The box scores include every FCS opponent; /stats/season lists the season's FBS teams only, so the rebuilt table is cut to them.
+    fbs = {str(t.get("school") or "").lower() for t in fetch_teams(api_key, season)}
+    return [r for r in fetch_season_rows(api_key, season, _THROUGH_WEEK, _get_list) if str(r["team"]).lower() in fbs]
+
+
 def build_team_stat_table(season: int, api_key: str) -> dict:
     """Pivot /stats/season long rows ({team, statName, statValue}) into
     {team_name_lower: {statName: float}}."""
-    raw = fetch_team_stats(api_key, season)
+    raw = team_season_rows(season, api_key)
     if not raw:
         return {}
     table: dict = defaultdict(dict)
@@ -711,7 +727,7 @@ def build_perf_scores(season: int, api_key: str) -> dict:
 
     Returns {team_name_lower: {pass_off, run_off, pass_def, run_def}} — all 0-1.
     """
-    raw = fetch_team_stats(api_key, season)
+    raw = team_season_rows(season, api_key)
     if not raw:
         print(f"  Warning: no team stats returned for {season}")
         return {}
@@ -1141,7 +1157,7 @@ def run_season(season: int, api_key: str) -> None:
     print(f"  {len(strength_map)} teams have results (points scored and allowed, opponent-adjusted)")
 
     print("Rating offensive lines as units...")
-    line_map = build_line_unit_ratings(season, build_team_stat_table(season, api_key), teams)
+    line_map = {} if _THROUGH_WEEK is not None else build_line_unit_ratings(season, build_team_stat_table(season, api_key), teams)
     if line_map:
         vals = sorted((v[0] for v in line_map.values()), reverse=True)
         print(f"  {len(line_map)} lines rated  (top {vals[0]:.1f}, median "
@@ -1251,6 +1267,13 @@ def run_season(season: int, api_key: str) -> None:
         v = sr.get("play_rating") if sr.get("play_rating") is not None else r["overall_rating"]
         if v is not None:
             play_quality[int(r["team_id"])] = v
+    if in_progress:
+        # v4.22: a season being played ranks on its games alone. The rating part would otherwise re-read the same games
+        # (the play rating is built from this season's stats and roster) and add them to the results part, so a 3-3 team
+        # with a strong stat line stayed high. A flat quality gives every team a rating part of 0; a finished season keeps
+        # the validated prior. Backtest at the week-8 cut: 71.2% / MAE 13.44 flat against 71.5% / 13.24 with last season's
+        # rating (scripts/validate_rankings.py machinery), placebo 57.4% / 16.24.
+        play_quality = {t: 70.0 for t in play_quality}
     attach_power(rows, season, teams, quality=play_quality)
 
     new_df = pd.DataFrame(rows)
@@ -1406,7 +1429,12 @@ def main() -> None:
     parser.add_argument("--engine", choices=["edge", "projected"], default="edge",
                         help="'projected' computes from projected player ratings "
                              "with no API calls — for seasons not yet played")
+    parser.add_argument("--through-week", type=int, default=None,
+                        help="read the season as it stood after this regular-season week (weekly progression, v4.22): "
+                             "team stats from the box scores through that week, no line unit")
     args = parser.parse_args()
+    global _THROUGH_WEEK
+    _THROUGH_WEEK = args.through_week
 
     if args.engine == "projected":
         run_projected_season(args.season)
