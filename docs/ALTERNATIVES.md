@@ -328,3 +328,14 @@ projections only — labelled through `projection_source`.
 | Headline: 0.60 roster + 0.40 stats | Replaced | Used no result; next-season Spearman 0.670 against 0.716 |
 | Headline: results alone | Rejected | Best (0.731) but drops the roster and the box score and duplicates power |
 | Headline weights typed by hand | Replaced by a stated rule | Every reading at least 0.2, results the most, within 0.02 of the best blend |
+
+## v4.21 - headline weights, QB tilt, rankings views
+
+| Option | Status | Why |
+|---|---|---|
+| Headline 0.30 / 0.20 / 0.50 with every reading at least 0.2 | Replaced | The owner set results 2/3, roster 1/6, stats 1/6; next-season Spearman 0.716 -> 0.724; roster and stats add 0.000 beyond points so far and last season at weeks 6, 8, 10 |
+| Headline = results alone | Rejected | Best (0.731) but drops the roster and the box score and duplicates power |
+| A stats half rebuilt from per-game box scores, each game opponent-adjusted | Rejected | R2 0.435 against 0.500 at the week-8 cut; Kansas State 15th, Nebraska 3rd, LSU 1st on it |
+| Results reading with the conference level off, or from power's machinery | Not adopted | Predicts later games equally well (winner 68.8 / 69.0 / 69.2%); would put Boise State 14th-26th and Kentucky 20th-39th; the owner asked for no large changes |
+| QB rushing yard at its held-out value (0.68 of a passing yard) | Rejected | Noisy (0.32-1.35 by season); the owner's small tilt (1.05 / 0.6 / 18) costs no accuracy (R2 0.3983 against 0.3970) |
+| Showing the earned part-season row as the 2026 Preseason list | Replaced | The export read whichever of the earned and projected rows sorted last; a projected season exports its projection only |

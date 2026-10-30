@@ -608,6 +608,14 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
         print(f"  team_ratings.json: no data")
         return
 
+    # A season the app treats as projected carries its projection as the team row. The computed file also holds an earned row for it
+    # (script 10 --all-seasons runs 2026 on the games played), and these rows are sorted by rating below, so which of the two the
+    # app read depended on which was lower: the Preseason list showed a mix of projections and part-season numbers (Nevada 65 for a
+    # projected 70). The earned-to-date numbers reach the app through the live file, beside the projection.
+    if "engine" in tr_s.columns:
+        proj = [int(x) for x in tr_s["season"].dropna().unique() if is_projected_season(T, int(x))]
+        tr_s = tr_s[~(tr_s["season"].isin(proj) & (tr_s["engine"].fillna("edge") != "projected"))]
+
     if not tm.empty:
         tr_s = tr_s.merge(tm[["id", "school", "conference", "color", "logo_url"]]
                           .rename(columns={"id": "tm_id"}),

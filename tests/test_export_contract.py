@@ -723,6 +723,44 @@ class TestThreeRatings:
         assert not any("live_status" in r or "rating_prev" in r for r in rows)
 
 
+class TestLiveTeamReadings:
+    """live_{season}.json teams carry the three readings the headline is made of (v4.21), for the Compare screen."""
+
+    KEYS = ("roster_half", "stats_half", "results_half", "results_points", "play_rating")
+
+    def _teams(self):
+        files = sorted(APP_DATA.glob("live_[0-9]*.json"))
+        if not files:
+            pytest.skip("no live_{season}.json exported — run script 17 then 12")
+        return _load(files[-1].name)["teams"]
+
+    def test_every_live_team_has_the_reading_keys(self):
+        missing = [t["team_id"] for t in self._teams() if any(k not in t for k in self.KEYS)]
+        assert not missing, f"{len(missing)} live teams lack a reading field (rerun script 17): {missing[:5]}"
+
+    def test_a_rated_team_has_all_three_readings(self):
+        # a live team is only written when it has a roster or stats reading and results; none of the three may be a default
+        bad = [t["team_id"] for t in self._teams() if t["overall_rating"] is not None
+               and (t["stats_half"] is None or t["results_half"] is None or t["roster_half"] is None)]
+        assert not bad, f"rated live teams with a missing reading: {bad[:5]}"
+
+    def test_a_projected_season_has_one_team_row_per_team(self):
+        """The earned part-season row and the projection both existed, and the app read whichever sorted last (the lower rating)."""
+        manifest = _load("manifest.json")
+        rows = _load("team_ratings.json")
+        for season in manifest.get("projected_seasons", []):
+            ids = [r["team_id"] for r in rows if r["season"] == season]
+            assert len(ids) == len(set(ids)), f"team_ratings.json has duplicate {season} team rows"
+
+    def test_the_headline_is_the_weighted_readings(self):
+        w = {"roster_half": 1 / 6, "stats_half": 1 / 6, "results_half": 2 / 3}
+        for t in self._teams():
+            if t["overall_rating"] is None or any(t[k] is None for k in w):
+                continue
+            want = sum(t[k] * v for k, v in w.items())
+            assert abs(t["overall_rating"] - want) < 0.06, (t["team_id"], t["overall_rating"], want)
+
+
 class TestRecruitingBoard:
     """recruiting_{year}.json (script 18): the menu's prospect board and class ranks."""
 

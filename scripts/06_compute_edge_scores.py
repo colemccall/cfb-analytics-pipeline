@@ -63,8 +63,14 @@ MIN_GAMES = 3
 # Stat composite weights
 # ---------------------------------------------------------------------------
 
+# QB weights: until v4.20 passing yards 1.0, rushing yards 0.7, rushing TD 20. v4.21 is the owner's minor tilt (passing volume was
+# slightly underrated and rushing volume slightly overrated): passing yards 1.05, rushing yards 0.60, rushing TD 18. Held-out data neither
+# ask for nor forbid it: leaving each season out, a rushing yard is worth 0.68 of a passing yard on his offense's later points (0.32 to 1.35
+# across seasons) against 0.70 before and 0.57 now; the touchdown weights cannot be read from a points outcome (a touchdown is points), so
+# they were not fitted. scripts/validate_qb_composite.py reports the held-out R2 with these weights: 0.3983 at the shipped blend (0.3970 before the
+# tilt), 0.3750 for volume only, placebo 0.3597, so the tilt costs no accuracy.
 OFFENSIVE_COMPOSITE = {
-    "QB": {"passingYDS": 1.0, "rushingYDS": 0.7, "passingTD": 25.0, "rushingTD": 20.0, "passingINT": -20.0},
+    "QB": {"passingYDS": 1.05, "rushingYDS": 0.6, "passingTD": 25.0, "rushingTD": 18.0, "passingINT": -20.0},
     "RB": {"rushingYDS": 1.0, "receivingYDS": 0.9, "rushingTD": 20.0, "receivingTD": 20.0},
     "WR": {"receivingYDS": 1.0, "receivingTD": 25.0, "receivingREC": 2.0},
     "TE": {"receivingYDS": 1.0, "receivingTD": 25.0, "receivingREC": 2.5},

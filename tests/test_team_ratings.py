@@ -51,7 +51,8 @@ def _stats(good=True):
 class TestBlendWeights:
     def test_the_three_weights_are_a_whole(self):
         assert W_ROSTER_BLEND + W_STATS_BLEND + W_RESULTS_BLEND == pytest.approx(1.0)
-        assert min(W_ROSTER_BLEND, W_STATS_BLEND, W_RESULTS_BLEND) > 0
+        assert min(W_ROSTER_BLEND, W_STATS_BLEND, W_RESULTS_BLEND) >= 0.1
+        assert W_RESULTS_BLEND == pytest.approx(2 / 3) and W_ROSTER_BLEND == pytest.approx(1 / 6) and W_STATS_BLEND == pytest.approx(1 / 6)
 
     def test_the_play_rating_is_the_old_two_reading_blend(self):
         assert _s10.W_ROSTER_PLAY + _s10.W_STATS_PLAY == pytest.approx(1.0)
@@ -156,7 +157,10 @@ class TestResultsReading:
     def test_no_results_is_the_roster_and_stats_blend_renormalised(self):
         none = compute_team_splits(1, None, _roster(), _stats(), SP_MEANS, 0.9)
         assert none["results_half"] is None and none["results_points"] is None
-        assert none["overall_rating"] == pytest.approx(none["play_rating"], abs=0.02)
+        # with no results the roster and stats weights renormalise (1/6 and 1/6 -> 1/2 each); the play rating keeps the old 0.60 / 0.40
+        want = (W_ROSTER_BLEND * none["roster_half"] + W_STATS_BLEND * none["stats_half"]) / (W_ROSTER_BLEND + W_STATS_BLEND)
+        assert none["overall_rating"] == pytest.approx(want, abs=0.02)
+        assert none["play_rating"] == pytest.approx(0.6 * none["roster_half"] + 0.4 * none["stats_half"], abs=0.02)
 
     def test_results_alone_do_not_rate_a_team(self):
         # a team with games but no roster rating and no team stats (an FCS team on a schedule) gets no row, as before

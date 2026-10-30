@@ -131,7 +131,8 @@ def live_roster(earned: pd.DataFrame, ps_all: pd.DataFrame, edge: pd.DataFrame) 
 def build_export(season: int, sandbox: Path, progress: dict) -> dict:
     """Join the sandbox's earned-to-date results to the real preseason projection.
 
-    Teams: earned overall/offense/defense beside the preseason projected overall.
+    Teams: earned overall/offense/defense beside the preseason projected overall, with the roster, stats and results readings
+    the headline is made of.
     Players: only those with an earned (production or blended) rating, with the
     preseason projection where one exists for the same player-season.
     """
@@ -151,6 +152,9 @@ def build_export(season: int, sandbox: Path, progress: dict) -> dict:
         w, l = progress["records"].get(tid, (0, 0))
         pre = pre_ovr.get(tid)
         ovr = float(t["overall_rating"]) if pd.notna(t["overall_rating"]) else None
+        sub = t.get("sub_ratings")
+        sub = json.loads(sub) if isinstance(sub, str) else (sub or {})
+        reading = lambda k: (float(sub[k]) if sub.get(k) is not None else None)   # noqa: E731
         teams.append({
             "team_id": tid, "school": school.get(tid), "conference": conf.get(tid),
             "wins": int(w), "losses": int(l),
@@ -163,6 +167,11 @@ def build_export(season: int, sandbox: Path, progress: dict) -> dict:
             "results_games": int(t["results_games"]) if "results_games" in t and pd.notna(t["results_games"]) else 0,
             "offense_rating": float(t["offense_rating"]) if pd.notna(t["offense_rating"]) else None,
             "defense_rating": float(t["defense_rating"]) if pd.notna(t["defense_rating"]) else None,
+            # The three readings the headline is made of (and the points strength under the results reading), so the
+            # Compare screen can lay them beside the ranking. None when a reading is absent, never a default.
+            "roster_half": reading("roster_half"), "stats_half": reading("stats_half"),
+            "results_half": reading("results_half"), "results_points": reading("results_points"),
+            "play_rating": reading("play_rating"),
             "preseason_overall": float(pre) if pre is not None and pd.notna(pre) else None,
             "change": round(ovr - float(pre), 1) if ovr is not None and pre is not None and pd.notna(pre) else None,
         })

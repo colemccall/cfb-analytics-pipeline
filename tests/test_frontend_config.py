@@ -104,3 +104,15 @@ def test_power_game_seasons_match_exported_files():
     assert _js_int_list("POWER_GAME_SEASONS") == on_disk, (
         f"config.js POWER_GAME_SEASONS {_js_int_list('POWER_GAME_SEASONS')} != exported files {on_disk}"
     )
+
+
+def test_headline_weights_match_script_10():
+    """HEADLINE_WEIGHTS in config.js (the Compare screen's shares) must equal the blend script 10 computes the headline with."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_s10cfg", Path(__file__).parent.parent / "scripts" / "10_compute_team_ratings.py")
+    s10 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(s10)
+    m = re.search(r"HEADLINE_WEIGHTS:\s*\{\s*roster:\s*([\d./ ]+),\s*stats:\s*([\d./ ]+),\s*results:\s*([\d./ ]+)\s*\}", APP_JS.read_text(encoding="utf-8"))
+    assert m, "config.js has no HEADLINE_WEIGHTS"
+    roster, stats, results = (eval(x, {"__builtins__": {}}) for x in m.groups())
+    assert (roster, stats, results) == pytest.approx((s10.W_ROSTER_BLEND, s10.W_STATS_BLEND, s10.W_RESULTS_BLEND))

@@ -169,20 +169,25 @@ def roster_to_ovr(mean_top: float) -> float:
 #   results - the points it has scored and allowed against the opponents it played, opponent-adjusted (our own strengths,
 #             utils/opponent_strength.team_strength), through SP_OVERALL_ANCHORS: absolute anchors, not a percentile of the season
 # Until v4.20 the headline was 0.60 roster + 0.40 stats and used no result at all: a team's box score and its roster are not what
-# it did on the scoreboard. Measured on 1,306 team-seasons 2016-2025 (scripts/validate_team_overall.py), each reading's Spearman with
-# the NEXT season's points strength: roster 0.623, stats 0.686, results 0.731; the old 60/40 blend 0.670. In a season in progress the
-# points so far predict the games after week 8 at R2 0.50 against 0.31 for last season's roster, and carry 0.52 to 0.64 of the weight
-# of [results, last season's roster, last season's strength] from the cut after week 4 to the cut after week 10. The best blend on a
-# grid is nearly all results (0.731), which would stop saying what the roster and the box score show, so the rule is stated:
-# every reading keeps at least a fifth, results get the most, and the blend stays within 0.02 of the best. 0.30 / 0.20 / 0.50 scores
-# 0.716 (0.015 below the best, 0.046 above the old blend). The cost: a rating that leans on results describes what a team has done
-# more than what it is made of, and the stats half is 0.94 correlated with the results reading, so the two are partly the same
-# information. No ramp by games is added: the strengths come from a ridge, which already holds a thin sample near its conference.
+# it did on the scoreboard. v4.21 sets it at results 2/3, roster 1/6, stats 1/6, the owner's setting (like the FCS weight of 0.85),
+# which the measurements support:
+#   - each reading's Spearman with the NEXT season's points strength, 1,306 team-seasons 2016-2025 (scripts/validate_team_overall.py):
+#     roster 0.623, stats 0.686, results 0.731; the old 60/40 blend 0.671; fitted weights roster 0.06, stats 0, results 0.94;
+#   - in a season in progress (cuts after weeks 6, 8 and 10, 2017-2025, leave-one-season-out) the strength shown afterwards regressed on
+#     points so far and last season's strength gives R2 0.591 / 0.586 / 0.536, and adding the stats half (built from the per-game box scores
+#     in the API cache) moves that by +0.000 each; on the 2021-2025 cut runs (n = 661 per cut) 0.580 / 0.580 / 0.559, the stats half
+#     -0.001 / 0.000 / 0.000 and a cut-time roster reading +0.001 / -0.001 / -0.002 (python scripts/validate_team_overall.py --cut-roster):
+#     neither says anything about the rest of the season that the points so far do not. They correlate 0.85 (roster, stats) and 0.94 (stats,
+#     results) with each other and the box score
+#     is yards that do not always become points (Kansas State +133 yards per game, +12 points; its first three games against Nicholls,
+#     Washington State and Tulane were +35 and the next four -6).
+# The cost: the roster and stats readings are nearly cosmetic in the headline (a third of it, adding nothing to prediction) and are kept so
+# the rating still says what a team is made of; it describes what a team has done more than what it is made of. Both are at least 0.1.
 # Sum must equal 1.0. W_*_PLAY is the old two-reading blend, kept as the "rating part" that power (attach_power) adds results to,
 # so power does not count the results twice.
-W_ROSTER_BLEND = 0.30
-W_STATS_BLEND = 0.20
-W_RESULTS_BLEND = 0.50
+W_ROSTER_BLEND = 1 / 6
+W_STATS_BLEND = 1 / 6
+W_RESULTS_BLEND = 2 / 3
 W_ROSTER_PLAY = 0.60
 W_STATS_PLAY = 0.40
 

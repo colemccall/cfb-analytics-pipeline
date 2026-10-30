@@ -658,3 +658,9 @@ Roster reading = roster_to_ovr(slot score); slot score = sum over groups of weig
 Starters / depth: QB 1 / 1, RB 2 / 2, WR 5 / 3, TE 1 / 3, DL (+EDGE) 4 / 3, LB 4 / 3, DB (+CB, S) 6 / 4, K 1, P 1, OL = the line unit. A missing player is skipped; a group nobody is rated in drops out and the weights renormalise.
 Weights (half the non-negative-least-squares fit, half one per starter slot): QB .139 RB .091 WR .087 TE .029 OL .101 DL .131 LB .144 DB .252 K .012 P .015, which is 4.2 / 2.7 / 2.6 / 0.9 / 3.0 / 3.9 / 4.3 / 7.6 / 0.4 / 0.5 % of the final score.
 Headline = 0.30 roster + 0.20 team stats + 0.50 results; results = SP_OVERALL_ANCHORS(opponent-adjusted points scored + prevented per game against an average FBS team); offense and defense are the same blend over the offensive and defensive halves (results through SP_OFFENSE_ANCHORS / SP_DEFENSE_ANCHORS). Power's rating part = 0.60 roster + 0.40 stats (the "play" rating).
+
+## v4.21 - headline weights, QB tilt, rankings views (mirrors METHODS `team-ratings`, `qb-composite`)
+
+Headline = 1/6 roster + 1/6 team stats + 2/3 results (renormalised when one is absent); the group shares of the roster are 1/6 of the weights in the v4.20 table (QB 2.3%, RB 1.5%, WR 1.5%, TE 0.5%, OL 1.7%, DL 2.2%, LB 2.4%, DB 4.2%, K 0.2%, P 0.3%, stats 16.7%, results 66.7% of the final score). Offense and defense use the same weights. Power's rating part is unchanged (0.60 roster + 0.40 stats).
+QB volume score V = 1.05 passing yards + 0.6 rushing yards + 25 passing TD + 18 rushing TD - 20 interceptions (was 1.0, 0.7, 25, 20, -20); the game score is still 0.5 V + 0.5 V / max(attempts, 10) x 28.
+Live teams carry roster_half, stats_half, results_half, results_points and play_rating; a projected season exports its projection row only.

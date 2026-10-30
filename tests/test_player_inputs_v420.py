@@ -102,8 +102,7 @@ class TestQbEfficiencyBlend:
 
     def test_a_typical_attempt_count_is_unchanged(self):
         s = self._with_attempts(int(t06.QB_ATT_REF))
-        base = 280 + 2 * 25.0
-        assert t06._off_stat_composite("QB", s) == pytest.approx(base)
+        assert t06._off_stat_composite("QB", s) == pytest.approx(self._base(self.STATS))
 
     def test_fewer_attempts_for_the_same_score_is_worth_more(self):
         assert t06._off_stat_composite("QB", self._with_attempts(20)) > t06._off_stat_composite("QB", self._with_attempts(28))
@@ -111,19 +110,27 @@ class TestQbEfficiencyBlend:
     def test_more_attempts_for_the_same_score_is_worth_less(self):
         assert t06._off_stat_composite("QB", self._with_attempts(45)) < t06._off_stat_composite("QB", self._with_attempts(28))
 
+    @staticmethod
+    def _base(stats):
+        """The volume score for a game from the shipped weights, before the efficiency blend."""
+        w = t06.OFFENSIVE_COMPOSITE["QB"]
+        return sum(stats.get(k, 0) * v for k, v in w.items())
+
     def test_half_the_move_of_a_full_normalisation(self):
-        base, att = 330.0, 14
+        att = 14
+        base = self._base(self.STATS)
         full = base / att * t06.QB_ATT_REF
         assert t06._off_stat_composite("QB", self._with_attempts(att)) == pytest.approx(0.5 * base + 0.5 * full)
 
     def test_a_relief_appearance_is_floored(self):
         s2 = self._with_attempts(2)
-        floored = 0.5 * 330.0 + 0.5 * 330.0 / t06.QB_ATT_FLOOR * t06.QB_ATT_REF
+        base = self._base(self.STATS)
+        floored = 0.5 * base + 0.5 * base / t06.QB_ATT_FLOOR * t06.QB_ATT_REF
         assert t06._off_stat_composite("QB", s2) == pytest.approx(floored)
 
     def test_a_game_with_no_positive_score_is_not_rescaled(self):
         bad = {"passingYDS": 20, "passingTD": 0, "passingINT": 2, "passingC/ATT": "4/12"}
-        assert t06._off_stat_composite("QB", bad) == pytest.approx(20 - 40)
+        assert t06._off_stat_composite("QB", bad) == pytest.approx(20 * t06.OFFENSIVE_COMPOSITE["QB"]["passingYDS"] - 40)
 
     def test_attempts_are_read_from_either_form(self):
         assert t06._qb_attempts({"passingC/ATT": "12/20"}) == 20.0
@@ -133,6 +140,16 @@ class TestQbEfficiencyBlend:
     def test_other_positions_are_untouched(self):
         s = {"rushingYDS": 100, "rushingTD": 1, "receivingYDS": 20}
         assert t06._off_stat_composite("RB", s) == pytest.approx(100 + 20.0 + 0.9 * 20)
+
+    def test_passing_volume_outweighs_rushing_volume_for_the_same_yards(self):
+        # v4.21 tilt: a passing yard is worth more than a rushing yard, and a rushing touchdown less than before
+        w = t06.OFFENSIVE_COMPOSITE["QB"]
+        assert w["passingYDS"] > w["rushingYDS"] > 0
+        assert w["passingYDS"] == pytest.approx(1.05) and w["rushingYDS"] == pytest.approx(0.6) and w["rushingTD"] == pytest.approx(18.0)
+        assert w["passingTD"] == 25.0 and w["passingINT"] == -20.0
+        air = {"passingYDS": 150, "rushingYDS": 0, "passingC/ATT": "15/28"}
+        ground = {"passingYDS": 0, "rushingYDS": 150, "passingC/ATT": "15/28"}
+        assert t06._off_stat_composite("QB", air) > t06._off_stat_composite("QB", ground)
 
     def test_the_blend_is_in_range(self):
         assert 0.0 < t06.QB_EFFICIENCY_BLEND < 1.0 and t06.QB_ATT_FLOOR < t06.QB_ATT_REF
