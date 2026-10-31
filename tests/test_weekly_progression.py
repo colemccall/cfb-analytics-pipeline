@@ -191,3 +191,76 @@ class TestWeeklyFiles:
         for rows in wp["players"].values():
             for row in rows:
                 assert (row[4] is None) == (row[5] is None)
+
+
+class TestRankingMethods:
+    """The live file and the weekly files carry the three ranking methods (v4.23): games-only power, rating-weighted power, the rating."""
+
+    def test_the_live_file_carries_the_blend_beside_the_games_only_power(self):
+        live = _weekly("live_2026.json")
+        for t in live["teams"]:
+            if t["power_rating"] is None:
+                continue
+            assert t["rating_part"] == 0.0, "the games-only power has no rating part while a season is played"
+            assert t["power_blend"] is not None and t["rating_part_blend"] is not None and t["results_blend"] is not None, t["school"]
+            assert abs(t["power_blend"] - (t["rating_part_blend"] + t["results_blend"])) < 0.03, (t["school"], t["power_blend"])
+
+    def test_a_weekly_row_has_both_ranks_and_the_units(self):
+        doc = _weekly("weekly_teams_2026.json")
+        for wk in doc["weeks"]:
+            rows = [r for t in doc["teams"].values() for r in t["weeks"] if r["week"] == wk]
+            assert sorted(r["rk_blend"] for r in rows) == list(range(1, len(rows) + 1)), f"week {wk}: blend ranks are not 1..{len(rows)}"
+        last = [t["weeks"][-1] for t in doc["teams"].values()]
+        assert all(r["groups"] for r in last), "a team's last week has no position groups"
+        assert all(set(r["groups"]) <= {"QB", "RB", "WR", "TE", "DL", "LB", "DB", "K", "P", "OL"} for r in last)
+
+
+class TestGameLogs:
+    """gamelog_{season}_{team_id}.json (script 12): every player's box score for every game, joined to the schedule by game id."""
+
+    def _files(self):
+        files = sorted(APP_DATA.glob("gamelog_2026_*.json"))
+        if not files:
+            pytest.skip("no gamelog_2026_*.json exported - run scripts/12_export_frontend_json.py --game-logs")
+        return files
+
+    def test_a_file_per_team_and_every_game_is_on_that_teams_schedule(self):
+        files = self._files()
+        assert len(files) >= 130, f"{len(files)} team game logs"
+        sched = _weekly("schedules_2026.json")
+        bad = []
+        for f in files:
+            tid = f.stem.split("_")[-1]
+            doc = json.loads(f.read_text(encoding="utf-8"))
+            games = {g["game_id"] for g in sched.get(tid, [])}
+            for pid, rows in doc["players"].items():
+                for gid, stats in rows:
+                    if gid not in games or not isinstance(stats, dict) or not stats:
+                        bad.append((tid, pid, gid))
+        assert not bad, f"{len(bad)} game-log rows are not on the team's schedule or have no stats, e.g. {bad[:3]}"
+
+    def test_a_player_appears_in_one_teams_file_and_once_per_game(self):
+        seen = {}
+        for f in self._files():
+            doc = json.loads(f.read_text(encoding="utf-8"))
+            for pid, rows in doc["players"].items():
+                assert pid not in seen, f"player {pid} is in {seen[pid]} and {f.name}"
+                seen[pid] = f.name
+                gids = [g for g, _ in rows]
+                assert len(gids) == len(set(gids)), f"player {pid} has a game twice"
+
+    def test_export_game_logs_groups_by_team_and_keeps_every_stat_as_stored(self, tmp_path):
+        import pandas as pd
+        m = _load_script("12_export_frontend_json.py", "exp12")
+        T = {"stats": pd.DataFrame([
+                {"player_season_id": 1, "player_id": 999, "game_id": 10, "season": 2026, "stat_type": "game_aggregate", "data": {"passingYDS": "19", "passingC/ATT": "3/5"}},
+                {"player_season_id": 1, "game_id": 11, "season": 2026, "stat_type": "game_aggregate", "data": json.dumps({"passingYDS": "0"})},
+                {"player_season_id": 2, "game_id": 10, "season": 2026, "stat_type": "game_aggregate", "data": {"defensiveTOT": "4"}},
+                {"player_season_id": 1, "game_id": 10, "season": 2025, "stat_type": "game_aggregate", "data": {"passingYDS": "99"}},
+                {"player_season_id": 1, "season": 2026, "stat_type": "season_aggregate", "data": {"passingYDS": "500"}, "game_id": None}]),
+             "player_seasons": pd.DataFrame([{"id": 1, "player_id": 100, "team_id": 7, "season": 2026}, {"id": 2, "player_id": 200, "team_id": 8, "season": 2026}])}
+        m.export_game_logs(T, tmp_path, 2026)
+        a = json.loads((tmp_path / "gamelog_2026_7.json").read_text(encoding="utf-8"))
+        assert a["players"] == {"100": [[10, {"passingYDS": "19", "passingC/ATT": "3/5"}], [11, {"passingYDS": "0"}]]}      # a stored 0 is kept
+        b = json.loads((tmp_path / "gamelog_2026_8.json").read_text(encoding="utf-8"))
+        assert b["players"] == {"200": [[10, {"defensiveTOT": "4"}]]}

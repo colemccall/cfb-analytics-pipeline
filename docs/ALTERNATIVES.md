@@ -350,3 +350,11 @@ projections only — labelled through `projection_source`.
 | Player game grades for everyone who played | Rejected | A walk-on with one counted play gets a grade; only players holding a rating that week have one |
 | Re-grade every game with the latest opponent strengths | Experiment | Fixed and reproducible, but no longer what the model said that week |
 | Repair the zero scores in the 2026 raw file | Reverted | Ratings did not change (the store already restores the zeros on read); the only effect was the live file's records, fixed in the reader |
+
+## v4.23 - ranking methods, units, game logs
+
+| Option | Status | Why |
+|---|---|---|
+| Rating + games as the default for a season being played | Rejected | The roster and stats come from the games the results part reads, so it counts them twice; not backtested with the play rating as its prior |
+| A schedule screen with the rating and grade on each game | Not built | The team page's weekly table already lists game, grade and rating after it; a second place is two copies to keep in step |
+| Dropping all-zero defensive lines from the game log | Rejected | A tackle count of 0 is a measured value; dropping it would make zeros into gaps |

@@ -919,6 +919,7 @@ def compute_team_splits(
     # offensive line (as the line unit). Blending both keeps a star-driven roster and a uniformly solid one
     # distinguishable.
     slots = slot_score(slot_by_pos if slot_by_pos is not None else roster_by_pos, line_rating)
+    groups = group_scores(slot_by_pos if slot_by_pos is not None else roster_by_pos, line_rating)
     ros = compute_roster_splits(roster_by_pos, line_rating)
     # Every split can now be None — a position group with nobody rated no longer
     # contributes a fabricated 50 — so the rollup renormalises the same way.
@@ -998,6 +999,9 @@ def compute_team_splits(
         "results_half":   r2(results_ovr) if results_ovr is not None else None,
         "results_points": round(float(results["off"] + results["dfn"]), 2) if results else None,
         "play_rating":    r2(play) if play is not None else None,
+        # Each position group's starter-plus-depth score (the units the slot score is made of), on the player scale; OL is the line unit
+        # when there is one. Published so the weekly view can show a team changing as a unit.
+        "roster_groups":  {g: round(float(v), 1) for g, v in groups.items()},
         "partial_weight": round(float(shrink[0]), 3) if shrink is not None else 1.0,
         "sched_faced":    [round(float(sched[0]), 2), round(float(sched[1]), 2)] if sched is not None else None,
     }
@@ -1227,6 +1231,7 @@ def run_season(season: int, api_key: str) -> None:
             "results_half":       splits["results_half"],
             "results_points":     splits["results_points"],
             "play_rating":        splits["play_rating"],
+            "roster_groups":      splits["roster_groups"],
             "partial_weight":     splits["partial_weight"],
             "sched_faced":        splits["sched_faced"],
             "sp_offense_scaled":  round(sp_scaled(sp["offense"] if sp else None, sp_means[1]), 2),
@@ -1273,8 +1278,17 @@ def run_season(season: int, api_key: str) -> None:
         # with a strong stat line stayed high. A flat quality gives every team a rating part of 0; a finished season keeps
         # the validated prior. Backtest at the week-8 cut: 71.2% / MAE 13.44 flat against 71.5% / 13.24 with last season's
         # rating (scripts/validate_rankings.py machinery), placebo 57.4% / 16.24.
+        blend = [dict(r) for r in rows]
+        attach_power(blend, season, teams, quality=play_quality)         # the version with a rating part, kept as a second method
         play_quality = {t: 70.0 for t in play_quality}
     attach_power(rows, season, teams, quality=play_quality)
+    if in_progress:
+        # power_blend: the rating part (the play rating, 0.98 points a rating point) plus the results part solved against it. Not the
+        # ranking (v4.22 moved that to games alone); the Rankings screen offers it as a method beside the games-only power and the rating.
+        for r, b in zip(rows, blend):
+            r["power_blend"] = b["power_rating"]
+            r["rating_part_blend"] = b["rating_part"]
+            r["results_blend"] = b["results_rating"]
 
     new_df = pd.DataFrame(rows)
     existing = read_computed("team_ratings")

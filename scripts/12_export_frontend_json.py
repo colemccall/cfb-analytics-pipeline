@@ -1506,6 +1506,7 @@ def export_power_games(T: dict, output_dir: Path, season: int) -> None:
     if season < POWER_GAMES_FIRST_SEASON and season not in T["live_teams"]:
         return
     parts: dict = {}
+    blend_parts: dict = {}      # a season in progress also carries the rating-weighted power (v4.23): its expectation is exported beside the games-only one
     home_edge = 0.0
     lt = T["live_teams"].get(season)
     if lt:
@@ -1513,6 +1514,8 @@ def export_power_games(T: dict, output_dir: Path, season: int) -> None:
             if lrow.get("rating_part") is not None:
                 parts[int(tid)] = {"rating_part": lrow["rating_part"], "conf_part": lrow.get("conf_part") or 0.0}
                 home_edge = lrow.get("home_edge") or home_edge
+            if lrow.get("rating_part_blend") is not None:
+                blend_parts[int(tid)] = {"rating_part": lrow["rating_part_blend"], "conf_part": 0.0}
     else:
         tr = T["team_ratings"]
         rows = tr[(tr["season"] == season) & (tr["engine"].fillna("edge") != "projected")] if "engine" in tr.columns else tr[tr["season"] == season]
@@ -1533,19 +1536,59 @@ def export_power_games(T: dict, output_dir: Path, season: int) -> None:
             continue
         neutral = bool(x.get("neutral_site") == True)   # noqa: E712
         exp_home = expected_value(parts[h], parts[a], home_edge, neutral)
+        exp_home_blend = expected_value(blend_parts[h], blend_parts[a], home_edge, neutral) if h in blend_parts and a in blend_parts else None
         m = float(hs - as_)
         for tid, opp, sign, is_home, sc, osc in ((h, a, 1.0, True, hs, as_), (a, h, -1.0, False, as_, hs)):
             val = game_value(sign * m)
             exp = sign * exp_home
-            out.setdefault(str(tid), []).append({
+            entry = {
                 "week": _i(x.get("week")), "opp_id": opp, "opp": names.get(opp), "home": is_home and not neutral,
                 "neutral": neutral, "score": sc, "opp_score": osc, "margin": int(sign * m),
                 "value": round(val, 1), "expected": round(exp, 1), "over": round(val - exp, 1),
                 **({"post": True} if x.get("season_type") == "postseason" else {}),
-            })
+            }
+            if exp_home_blend is not None:
+                entry["expected_blend"] = round(sign * exp_home_blend, 1)
+                entry["over_blend"] = round(val - sign * exp_home_blend, 1)
+            out.setdefault(str(tid), []).append(entry)
     for tid in out:
         out[tid].sort(key=lambda e: (bool(e.get("post")), e["week"] is None, e["week"] or 0))
     write_json(output_dir / f"power_games_{season}.json", out)
+
+
+def export_game_logs(T: dict, output_dir: Path, season: int) -> None:
+    """Write gamelog_{season}_{team_id}.json for every team: each player's box-score line for every game he is on record in.
+
+    The file is {"season": s, "players": {player_id: [[game_id, {stat: value}], ...]}}; game_id is the id the schedule and the weekly
+    files use, so the card joins the opponent, score and week from the schedule it already holds. The stat keys are the per-game
+    ones (passingC/ATT, kickingFG, ...), which differ from the season totals' (script 01 stores both as the API names them); values
+    stay as stored, strings included, and a stat the game row does not hold is absent, never a zero. One file per team (a card needs
+    only its own team's, about 40 KB) rather than one for the league (about 5 MB). Only a season in progress is exported (the files
+    are rewritten each run, and removed first so a team that left the list does not leave a stale file).
+    """
+    st, ps = T["stats"], T["player_seasons"]
+    if st.empty or ps.empty:
+        return
+    g = st[(st["season"] == season) & (st["stat_type"] == "game_aggregate")][["player_season_id", "game_id", "data"]]   # the stats rows carry a player_id of their own: take only what the join needs
+    if g.empty:
+        print(f"  gamelog_{season}_*.json: no per-game stats for this season")
+        return
+    ids = ps[ps["season"] == season][["id", "player_id", "team_id"]].rename(columns={"id": "player_season_id"})
+    m = g.merge(ids, on="player_season_id")
+    by_team: dict = defaultdict(lambda: defaultdict(list))
+    for r in m.itertuples():
+        data = _parse_stat_data(r.data)
+        if data and pd.notna(r.team_id) and pd.notna(r.game_id):
+            by_team[int(r.team_id)][str(int(r.player_id))].append([int(r.game_id), data])
+    for old in output_dir.glob(f"gamelog_{season}_*.json"):
+        old.unlink()
+    total = 0
+    for team_id, players in by_team.items():
+        path = output_dir / f"gamelog_{season}_{team_id}.json"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(_clean_nan({"season": season, "players": players}), fh, separators=(",", ":"), default=_json_default, allow_nan=False)
+        total += path.stat().st_size
+    print(f"  Wrote gamelog_{season}_*.json: {len(by_team)} teams, {sum(len(v) for v in by_team.values())} players, {len(m)} player-games, {total / 1e6:.1f} MB")
 
 
 def export_player_cards(output_dir: Path) -> None:
@@ -1600,6 +1643,8 @@ def main():
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--cards", action="store_true",
                         help="also rebuild cards/ on a single-season run (a full run always does)")
+    parser.add_argument("--game-logs", action="store_true",
+                        help="write only the game logs for --season (default: the current season) and stop")
     args = parser.parse_args()
 
     output_dir: Path = args.output
@@ -1610,6 +1655,11 @@ def main():
 
     T = load_tables()
     print()
+
+    if args.game_logs:
+        export_game_logs(T, output_dir, args.season or CURRENT_SEASON)
+        print("\nDone.")
+        return
 
     # Season-independent exports (once, using latest season for display defaults)
     current = seasons[-1]
@@ -1659,6 +1709,10 @@ def main():
 
         print(f"  power_games_{season}.json...")
         export_power_games(T, output_dir, season)
+
+        if (output_dir / f"live_{season}.json").exists():       # a season in progress carries its game logs
+            print(f"  gamelog_{season}_*.json...")
+            export_game_logs(T, output_dir, season)
 
     if args.season is None or args.cards:
         print("\ncards/ (one shard file per player-id group)...")

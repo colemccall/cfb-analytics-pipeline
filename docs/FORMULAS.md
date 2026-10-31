@@ -671,3 +671,9 @@ Power for a season being played: power = results part (the rating part is 0 for 
 Week-N snapshot: games after week N unscored, script 06 `--in-progress --through-week N`, 07, script 10 `--through-week N` (team stats summed from the box scores of weeks 1..N, `utils/box_scores.py`; no line unit). Team rating = 1/6 roster + 1/6 stats + 2/3 results of that snapshot.
 Team game grade = results_to_ovr( clip(margin, -28, 28) - home_edge (home) or + home_edge (away) + opponent off+dfn after week N ). Player game grade = edge_to_ovr( sqrt(12) x the game's adjusted score, position ), only for a player who holds a rating that week.
 Games are read through `fill_shutouts` everywhere (the harvest had stored a 0 as missing; `scripts/01` now keeps it).
+
+## v4.23 - ranking methods, units, game logs (mirrors METHODS `power-rating`, `weekly-progression`)
+
+Rankings for a season being played, by method: Games only = power with a flat prior (rating part 0, results part only); Rating + games = `power_blend` = 0.98 x (play_rating - mean) + the results part solved against that prior (script 10, `power_blend`, `rating_part_blend`, `results_blend`; the expectation per game in `power_games` as `expected_blend`); Rating = the headline (1/6 roster, 1/6 stats, 2/3 results). A played season: Power (as shipped) or Rating.
+Units by week: `roster_groups` = each position group's starters-plus-depth score on the player scale (QB, RB, WR, TE, DL, LB, DB, K, P; OL only with a line unit, never in the weekly numbers), from `group_scores()`; offense and defense are the rating's two halves.
+Game logs: `gamelog_{season}_{team_id}.json` = {players: {player_id: [[game_id, stat blob as stored], ...]}} from the `game_aggregate` rows (script 12 `export_game_logs`).

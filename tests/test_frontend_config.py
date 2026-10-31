@@ -86,6 +86,19 @@ def test_weekly_seasons_match_exported_files():
     assert seasons("weekly_teams") == seasons("weekly_players"), "a weekly teams file has no players file (or the reverse)"
 
 
+def test_gamelog_seasons_match_exported_files():
+    """GAMELOG_SEASONS must list exactly the seasons with gamelog_{season}_{team}.json files (script 12).
+
+    The player card's Games tab asks for a team's file only for a listed season; one listed without files is a 404 on every card,
+    and files not listed are a tab the site never shows.
+    """
+    on_disk = sorted({int(m.group(1)) for p in APP_DATA.glob("gamelog_*_*.json")
+                      if (m := re.fullmatch(r"gamelog_(\d{4})_\d+\.json", p.name))})
+    assert _js_int_list("GAMELOG_SEASONS") == on_disk, (
+        f"config.js GAMELOG_SEASONS {_js_int_list('GAMELOG_SEASONS')} != exported seasons {on_disk}"
+    )
+
+
 def test_recruiting_seasons_match_exported_files():
     """RECRUITING_SEASONS must list exactly the class years with a recruiting_{year}.json.
 

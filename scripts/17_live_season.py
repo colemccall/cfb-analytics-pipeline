@@ -174,6 +174,11 @@ def build_export(season: int, sandbox: Path, progress: dict) -> dict:
             "roster_half": reading("roster_half"), "stats_half": reading("stats_half"),
             "results_half": reading("results_half"), "results_points": reading("results_points"),
             "play_rating": reading("play_rating"),
+            # The position groups the roster reading is made of, and the rating-weighted power (a second ranking method, v4.23).
+            "roster_groups": sub.get("roster_groups"),
+            "power_blend": float(t["power_blend"]) if "power_blend" in t and pd.notna(t["power_blend"]) else None,
+            "rating_part_blend": float(t["rating_part_blend"]) if "rating_part_blend" in t and pd.notna(t["rating_part_blend"]) else None,
+            "results_blend": float(t["results_blend"]) if "results_blend" in t and pd.notna(t["results_blend"]) else None,
             "preseason_overall": float(pre) if pre is not None and pd.notna(pre) else None,
             "change": round(ovr - float(pre), 1) if ovr is not None and pre is not None and pd.notna(pre) else None,
         })
