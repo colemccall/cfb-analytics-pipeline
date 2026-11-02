@@ -677,3 +677,18 @@ Games are read through `fill_shutouts` everywhere (the harvest had stored a 0 as
 Rankings for a season being played, by method: Games only = power with a flat prior (rating part 0, results part only); Rating + games = `power_blend` = 0.98 x (play_rating - mean) + the results part solved against that prior (script 10, `power_blend`, `rating_part_blend`, `results_blend`; the expectation per game in `power_games` as `expected_blend`); Rating = the headline (1/6 roster, 1/6 stats, 2/3 results). A played season: Power (as shipped) or Rating.
 Units by week: `roster_groups` = each position group's starters-plus-depth score on the player scale (QB, RB, WR, TE, DL, LB, DB, K, P; OL only with a line unit, never in the weekly numbers), from `group_scores()`; offense and defense are the rating's two halves.
 Game logs: `gamelog_{season}_{team_id}.json` = {players: {player_id: [[game_id, stat blob as stored], ...]}} from the `game_aggregate` rows (script 12 `export_game_logs`).
+
+---
+
+## v4.24 — part-time rating in a season in progress (mirrors METHODS `live-season`)
+
+```
+EDGE_level  = EDGE_raw x sqrt(12 / n)                  n = games the player has played (3 or more)
+rating      = a + b x edge_to_ovr(EDGE_level)          (a, b) = PART_SEASON_CURVE[position family, n]
+              families QB, RB, WR/TE, DL/EDGE, LB, DB; n buckets 3, 4, 5, 6, 7, "8-9" (8 or more uses it)
+              b runs from 0.30 (DL/EDGE, 3 games) to 0.91 (RB, 8-9)
+nothing reads his team's games played; no games damp in season; n of 1 or 2 keeps the low-game rule
+defensive game composite reads defensiveSACKS and defensiveTFL as decimals (0.5 is half)
+```
+
+A finished season keeps EDGE = sum of game scores / sqrt(games) and the games damp `max(0.25, games / 8)`.

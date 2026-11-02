@@ -358,3 +358,18 @@ projections only — labelled through `projection_source`.
 | Rating + games as the default for a season being played | Rejected | The roster and stats come from the games the results part reads, so it counts them twice; not backtested with the play rating as its prior |
 | A schedule screen with the rating and grade on each game | Not built | The team page's weekly table already lists game, grade and rating after it; a second place is two copies to keep in step |
 | Dropping all-zero defensive lines from the game log | Rejected | A tackle count of 0 is a measured value; dropping it would make zeros into gaps |
+
+## v4.24 - part-time rating, fractional sacks, week-N snapshots
+
+Mirrors the `live-season` and `weekly-progression` METHODS entries and the v4.24 CHANGES entry. Measured by `scripts/validate_part_time_rating.py` on 2021-2025, four cuts a season, leave-one-season-out, scored on the player's level in the games after the cut.
+
+| Option | Status | Why |
+|---|---|---|
+| Availability term in a part-season rating (v4.20: x sqrt of his share of his team's games) | Rejected | 10.79 mean error at 50-75% of team games against 10.58 for a placebo that deals shares to other players; bias -4.9. It measures how often he plays |
+| Level alone, no sample-size adjustment | Rejected | 10.03 at 50-75%, bias -1.21; the curve is 8.80 |
+| Level shrunk toward the position mean by reliability R(n) | Rejected | 9.09 at 50-75%, biased high at small samples (+3.94, +6.19 at 50% or fewer) |
+| Curve by position family and games played (`PART_SEASON_CURVE`) | Shipped | 8.80 at 50-75%; bias 0.00 in every family; full-time players 7.00 to 6.57. Cost: players rated 85+ play 3.6 lower afterwards |
+| Curve applied to finished seasons | Not done | One definition for every season would be its own release (full recompute plus projection gates) |
+| Integer sacks and tackles for loss | Replaced | 10.5% of sack values and 3.0% of TFL values are fractions; 2025 mean move EDGE +1.43, DL +1.36, LB +0.71, S +0.40, DB +0.27, CB +0.13; offence 0 rows. Frozen defensive anchors not re-derived |
+| Re-rank teams to remove head-to-head inversions | Listed only | `H2H_INVERSIONS_2025_2026.md`: 107 of 500 games (2026 power), 130 of 762 (2025 power); the owner decides |
+| Weekly snapshots that keep full-season stat totals | Replaced | At week 1, 595 players held a production rating with no game through it; now 10 (kickers and punters). Placebo: 0 of 6,553 earned ratings move when everything after week 3 is scrambled |
