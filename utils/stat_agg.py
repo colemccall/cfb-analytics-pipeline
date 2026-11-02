@@ -18,6 +18,8 @@ be split before any of it works.
 
 from __future__ import annotations
 
+import json
+
 # Paired "made/attempted" strings in game rows -> the two count keys a season
 # aggregate would have carried.
 _PAIRS = {
@@ -147,3 +149,19 @@ def aggregate_game_stats(game_dicts) -> dict:
             out[rate] = val * 100.0 if rate in _PCT_SCALE else val
 
     return out
+
+
+def parse_stat_data(val) -> dict:
+    """A stat blob as a dict, whether it is stored as a dict or as a JSON string; anything else is {}.
+
+    stats.json rows written before the store moved to JSON hold their `data` as a string; newer rows hold a dict.
+    Scripts 07 and 12 read both kinds through this one function.
+    """
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except ValueError:
+            pass
+    return {}

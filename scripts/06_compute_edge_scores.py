@@ -51,6 +51,7 @@ load_dotenv()
 
 from utils.store import read_raw, RAW_DIR
 from utils.api_client import load_api_key, fetch_sp_ratings_all, fetch_sp_ratings_breakdown, fetch_game_team_stats
+from utils.seasons import ALL_SEASONS
 
 MODEL_VERSION = "v4.3-local"
 
@@ -214,10 +215,19 @@ def _parse_stat_value(d: dict, key: str) -> float | None:
 # OPP_FCS_MULT below. The strengths are put on the scale the multiplier already reads (z-scores:
 # 1 + OPP_K_HI x z above average, 1 + OPP_K_LO x z below, z clipped to +-2), so the frozen anchors still apply.
 # CFB_OPP_SOURCE=sp restores the SP+ adjustment for comparison runs; the K values can be overridden the same way.
+# These environment switches exist for experiments only: they change frozen constants, so a run that writes ratings
+# anyone reads must leave CFB_OPP_SOURCE, CFB_OPP_K_HI, CFB_OPP_K_LO and CFB_OPP_FCS_MULT unset.
 OPP_SOURCE = os.environ.get("CFB_OPP_SOURCE", "own")
 OPP_K_HI = float(os.environ.get("CFB_OPP_K_HI", "0.35"))
 OPP_K_LO = float(os.environ.get("CFB_OPP_K_LO", "0.12"))
 OPP_FCS_KEY = -1
+# The SP+-like scale the opponent multiplier reads: an average offense scores, and an average defense allows,
+# SP_SCALE_MEAN points, and one standard deviation is SP_SCALE_SD_SHARE of that (0.26 x 27 = 7.02).
+SP_SCALE_MEAN = 27.0
+SP_SCALE_SD_SHARE = 0.26
+# The SP+ comparison path's bonus and penalty slopes. Fixed on purpose: OPP_K_HI / OPP_K_LO may be overridden
+# for an experiment, and the comparison must not move with them.
+SP_K_HI, SP_K_LO = 0.35, 0.12
 # THE FCS WEIGHT (v4.20). A game against a non-FBS opponent counts at one fixed multiplier, for every position and
 # both sides of the ball, instead of the pooled FCS team's strength read through the FBS curve (about 0.76 in a
 # finished season, and 1.0 in a season in progress until the live map was fixed). Measured on the same players
@@ -267,11 +277,11 @@ def build_opponent_map(season: int) -> dict:
     ids = [t for t in out if t != ostr.FCS]
     sd_o = float(np.std([out[t]["off"] for t in ids])) or 1.0
     sd_d = float(np.std([out[t]["dfn"] for t in ids])) or 1.0
-    unit = 0.26 * 27.0
+    unit = SP_SCALE_SD_SHARE * SP_SCALE_MEAN
     m = {}
     for t, v in out.items():
         zo, zd = v["off"] / sd_o, v["dfn"] / sd_d
-        m[int(t)] = {"offense": 27.0 + unit * zo, "defense": 27.0 - unit * zd, "overall": unit * (zo + zd)}
+        m[int(t)] = {"offense": SP_SCALE_MEAN + unit * zo, "defense": SP_SCALE_MEAN - unit * zd, "overall": unit * (zo + zd)}
     return m
 
 
@@ -331,18 +341,18 @@ def opponent_multiplier(opp_team_id, sp_map: dict, side: str, season_means: tupl
     if isinstance(sp_entry, dict):
         if side == "defense":
             val = sp_entry.get("defense", mean_def)
-            std = max(mean_def * 0.26, 1.0)
+            std = max(mean_def * SP_SCALE_SD_SHARE, 1.0)
             z = (mean_def - val) / std
         else:
             val = sp_entry.get("offense", mean_off)
-            std = max(mean_off * 0.26, 1.0)
+            std = max(mean_off * SP_SCALE_SD_SHARE, 1.0)
             z = (val - mean_off) / std
     else:
         sp = float(sp_entry)
         z = (sp - mean_ovr) / 30.0
 
     z = max(-2.0, min(2.0, z))
-    k_hi, k_lo = (OPP_K_HI, OPP_K_LO) if OPP_FCS_KEY in sp_map else (0.35, 0.12)
+    k_hi, k_lo = (OPP_K_HI, OPP_K_LO) if OPP_FCS_KEY in sp_map else (SP_K_HI, SP_K_LO)
     return 1.0 + z * (k_hi if z >= 0 else k_lo)
 
 
@@ -1596,7 +1606,7 @@ def main():
     _THROUGH_WEEK = args.through_week
 
     api_key = load_api_key()
-    seasons = list(range(2008, 2027)) if args.all_seasons else [args.season]
+    seasons = ALL_SEASONS if args.all_seasons else [args.season]
     for s in seasons:
         run_season(s, api_key, in_progress=args.in_progress)
     print("\nDone.")

@@ -71,6 +71,9 @@ def fill_shutouts(games: pd.DataFrame) -> pd.DataFrame:
     checked. Left as a gap the game had no result for the team that was shut out (it vanished from its
     record, its schedule result, its standings and every rating built on results). A game with BOTH scores
     missing is not played yet and is untouched.
+
+    The rule assumes the API never returns half a score for a game: it reports both scores or neither, and
+    since v4.22 the harvest keeps a 0 as 0, so new rows never need it. Old rows still do.
     """
     if games.empty or "home_score" not in games.columns:
         return games

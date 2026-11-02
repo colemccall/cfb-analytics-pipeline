@@ -44,6 +44,7 @@ load_dotenv()
 
 from utils.store import read_raw, read_computed, write_computed
 from utils.api_client import load_api_key, fetch_sp_ratings_breakdown, fetch_team_stats, fetch_teams, _get_list
+from utils.seasons import ALL_SEASONS, REGULAR_SEASON_GAMES
 from utils.box_scores import fetch_season_rows
 from utils.line_unit import line_unit_rating
 from utils.results_rating import power_components
@@ -72,10 +73,6 @@ W_PASS_DEF = 0.25;  W_RUN_DEF = 0.20;  W_SPEC = 0.05
 # Offense/defense rollup
 W_OFF_SPLIT = 0.50  # pass_off:run_off split
 W_DEF_SPLIT = 0.55  # pass_def:run_def split (pass-heavy)
-
-# Raw stat blend (raw × 0.60 + 3rd-down × 0.40, with havoc for defense)
-W_RAW_BASE  = 0.60;  W_3RD = 0.40
-W_RAW_D_BASE = 0.60; W_3RD_D = 0.20; W_HAVOC = 0.20
 
 # Recruiting constants
 REC_MIN = 0.80;  REC_MAX = 1.00
@@ -123,18 +120,6 @@ def _interp_anchors(val: float, anchors: list) -> float:
     xs = [a[0] for a in anchors]
     ys = [a[1] for a in anchors]
     return float(np.interp(val, xs, ys))
-
-
-def sp_overall_to_ovr(sp: float) -> float:
-    return _interp_anchors(sp, SP_OVERALL_ANCHORS)
-
-
-def sp_offense_to_ovr(sp: float) -> float:
-    return _interp_anchors(sp, SP_OFFENSE_ANCHORS)
-
-
-def sp_defense_to_ovr(sp: float) -> float:
-    return _interp_anchors(sp, SP_DEFENSE_ANCHORS)
 
 
 def results_to_ovr(points: float) -> float:
@@ -300,7 +285,7 @@ SCHED_COEF = 1.57
 # per-game efficiency, line-yard and points data (scripts/validate_early_reliability.py): per-game yards and
 # third downs are not on file, so the shrink is not backtested on the published stats half itself.
 SHRINK_GAMES_K = 8.0
-SEASON_GAMES = 12
+SEASON_GAMES = REGULAR_SEASON_GAMES
 
 
 def season_in_progress(games: "pd.DataFrame", season: int) -> bool:
@@ -722,99 +707,6 @@ def store_team_season_stats(season: int, api_key: str, teams: list) -> None:
     write_computed("team_season_stats", combined)
 
 
-def build_perf_scores(season: int, api_key: str) -> dict:
-    """Fetch team season stats and normalize 0-1 across FBS teams.
-
-    Returns {team_name_lower: {pass_off, run_off, pass_def, run_def}} — all 0-1.
-    """
-    raw = team_season_rows(season, api_key)
-    if not raw:
-        print(f"  Warning: no team stats returned for {season}")
-        return {}
-
-    # Extract needed fields per team
-    teams_data = {}
-    for row in raw:
-        name = (row.get("team") or "").lower().strip()
-        if not name:
-            continue
-        teams_data[name] = {
-            "net_pass_off":  row.get("netPassingYards") or 0,
-            "rush_off":      row.get("rushingYards") or 0,
-            "net_pass_def":  row.get("netPassingYardsAllowed") or row.get("netPassingYardsOpponent") or 0,
-            "rush_def":      row.get("rushingYardsAllowed") or row.get("rushingYardsOpponent") or 0,
-            "td3_att":       row.get("thirdDownConversions") or 0,
-            "td3_total":     max(row.get("thirdDowns") or 1, 1),
-            "td3d_att":      row.get("thirdDownConversionsAllowed") or row.get("thirdDownConversionsOpponent") or 0,
-            "td3d_total":    max(row.get("thirdDownsOpponent") or row.get("thirdDownsAllowed") or 1, 1),
-            "tfl":           row.get("tacklesForLoss") or 0,
-            "ints":          row.get("interceptions") or 0,
-            "fum_rec":       row.get("fumblesRecovered") or 0,
-        }
-
-    if not teams_data:
-        return {}
-
-    # Compute derived metrics
-    for d in teams_data.values():
-        d["3rd_off_rate"] = d["td3_att"] / d["td3_total"]
-        d["3rd_def_rate"] = d["td3d_att"] / d["td3d_total"]
-        d["havoc"] = d["tfl"] + d["ints"] * 2 + d["fum_rec"]
-
-    def normalize(key: str, vals: dict, invert: bool = False) -> dict:
-        """Normalize a metric 0-1 across all teams."""
-        v_list = [d[key] for d in vals.values()]
-        lo, hi = min(v_list), max(v_list)
-        if hi == lo:
-            return {n: 0.5 for n in vals}
-        result = {}
-        for n, d in vals.items():
-            norm = (d[key] - lo) / (hi - lo)
-            result[n] = 1.0 - norm if invert else norm
-        return result
-
-    n_pass_off  = normalize("net_pass_off",  teams_data)
-    n_rush_off  = normalize("rush_off",      teams_data)
-    n_pass_def  = normalize("net_pass_def",  teams_data, invert=True)
-    n_rush_def  = normalize("rush_def",      teams_data, invert=True)
-    n_3rd_off   = normalize("3rd_off_rate",  teams_data)
-    n_3rd_def   = normalize("3rd_def_rate",  teams_data, invert=True)
-    n_havoc     = normalize("havoc",         teams_data)
-
-    result = {}
-    for name in teams_data:
-        raw_pass_off_adv = n_pass_off[name] * W_RAW_BASE + n_3rd_off[name] * W_3RD
-        raw_run_off_adv  = n_rush_off[name] * W_RAW_BASE + n_3rd_off[name] * W_3RD
-        raw_pass_def_adv = n_pass_def[name] * W_RAW_D_BASE + n_3rd_def[name] * W_3RD_D + n_havoc[name] * W_HAVOC
-        raw_run_def_adv  = n_rush_def[name] * W_RAW_D_BASE + n_3rd_def[name] * W_3RD_D + n_havoc[name] * W_HAVOC
-        result[name] = {
-            "pass_off": raw_pass_off_adv * 100.0,
-            "run_off":  raw_run_off_adv  * 100.0,
-            "pass_def": raw_pass_def_adv * 100.0,
-            "run_def":  raw_run_def_adv  * 100.0,
-        }
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Match raw stats to DB team ids
-# ---------------------------------------------------------------------------
-
-def match_raw_to_teams(perf_scores: dict, teams: list) -> dict:
-    """Return {team_db_id: {pass_off, run_off, pass_def, run_def}} using fuzzy name match."""
-    perf_keys = list(perf_scores.keys())
-    result = {}
-    for db_id, school, _ in teams:
-        lower = school.lower()
-        if lower in perf_scores:
-            result[db_id] = perf_scores[lower]
-        else:
-            m = _fuzzy_match(lower, perf_keys)
-            if m:
-                result[db_id] = perf_scores[m]
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Recruiting (5-year rolling)
 # ---------------------------------------------------------------------------
@@ -890,7 +782,7 @@ def compute_team_splits(
     roster_by_pos: dict,
     team_stats: dict | None,
     sp_means: tuple,
-    recruiting_scaledcaled: float | None,
+    recruiting_scaled: float | None,
     line_rating: float | None = None,
     sched: tuple | None = None,
     shrink: tuple | None = None,
@@ -1130,11 +1022,6 @@ def run_season(season: int, api_key: str) -> None:
     slot_map = load_starter_ratings_by_position(season, min_rating=0.0)
     print(f"  {len(roster_map)} teams have starter-tier player ratings; {len(slot_map)} have a slot roster (every rated player)")
 
-    print("Loading raw team stats...")
-    perf_raw = build_perf_scores(season, api_key)
-    raw_map = match_raw_to_teams(perf_raw, teams)
-    print(f"  {len(raw_map)} teams have raw stat data")
-
     # Per-game team stats, written by store_team_season_stats above. These feed
     # the headline blend directly — they used to be persisted for the frontend
     # and never read back into the rating.
@@ -1196,7 +1083,6 @@ def run_season(season: int, api_key: str) -> None:
     for team_id, school, conference in teams:
         sp      = sp_map.get(team_id)
         by_pos  = dict(roster_map.get(team_id, {}))
-        raw     = raw_map.get(team_id)
         tstats  = tss_map.get(team_id)
         recruiting_scaled   = recruiting_map.get(team_id)
 
@@ -1456,7 +1342,7 @@ def main() -> None:
         return
 
     api_key = load_api_key()
-    seasons = list(range(2008, 2027)) if args.all_seasons else [args.season]
+    seasons = ALL_SEASONS if args.all_seasons else [args.season]
     for s in seasons:
         run_season(s, api_key)
     print("\nDone.")

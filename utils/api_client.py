@@ -298,34 +298,6 @@ def fetch_transfer_portal(api_key: str, year: int) -> list:
     return _get_list(api_key, "/player/portal", {"year": year})
 
 
-def fetch_drives(api_key: str, year: int) -> list:
-    """All drives for a year (regular + postseason), iterating by week."""
-    all_drives = []
-    for week in range(1, 17):
-        all_drives.extend(_get_list(api_key, "/drives", {"year": year, "week": week, "seasonType": "regular"}))
-        time.sleep(0.3)
-    for week in range(1, 7):
-        chunk = _get_list(api_key, "/drives", {"year": year, "week": week, "seasonType": "postseason"})
-        if chunk:
-            all_drives.extend(chunk)
-        time.sleep(0.3)
-    return all_drives
-
-
-def fetch_plays(api_key: str, year: int) -> list:
-    """All play-by-play for a year. Large payload — use only when needed."""
-    all_plays = []
-    for week in range(1, 17):
-        all_plays.extend(_get_list(api_key, "/plays", {"year": year, "week": week, "seasonType": "regular"}))
-        time.sleep(0.3)
-    for week in range(1, 7):
-        chunk = _get_list(api_key, "/plays", {"year": year, "week": week, "seasonType": "postseason"})
-        if chunk:
-            all_plays.extend(chunk)
-        time.sleep(0.3)
-    return all_plays
-
-
 def fetch_sp_ratings_all(api_key: str, year: int) -> dict:
     """Return {team_lower: sp_rating} for a year. Used for opponent quality adjustment."""
     raw = fetch_sp_ratings(api_key, year)

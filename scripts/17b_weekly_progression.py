@@ -50,10 +50,11 @@ sys.path.insert(0, str(ROOT))
 
 from utils import opponent_strength as ostr  # noqa: E402
 from utils.store import fill_shutouts  # noqa: E402
+from utils.seasons import REGULAR_SEASON_GAMES  # noqa: E402
 
 APP_DATA = ROOT.parent / "cfb-analytics-app" / "data"
 MARGIN_CAP = 28.0        # the cap power uses on a game's margin (utils/results_rating.CAP)
-SEASON_GAMES = 12        # a single game is graded as one game of this many
+SEASON_GAMES = REGULAR_SEASON_GAMES   # a single game is graded as one game of this many
 
 
 def _module(file_name: str, alias: str):
@@ -121,6 +122,12 @@ def snapshot(season: int, week: int, live17, t10, t07) -> dict:
         gdf = fill_shutouts(pd.DataFrame(games))     # a game's 0 is stored as missing; later weeks' scores are both missing and stay so
 
         gets = _run("06_compute_edge_scores.py", ["--season", str(season), "--in-progress", "--through-week", str(week)], sandbox)
+        # Every EDGE row of this snapshot must have been cut at this week: its games and its team's game count are
+        # the ones through week N (scripts/validate_snapshot_invariance.py checks the counts themselves).
+        edge = json.loads((sandbox / "raw" / "player_edge.json").read_text(encoding="utf-8"))
+        uncut = sum(1 for r in edge if r.get("season") == season and r.get("through_week") != week)
+        if uncut:
+            raise RuntimeError(f"week {week}: {uncut} EDGE rows were not cut at week {week}")
         gets += _run("07_compute_player_ratings.py", ["--season", str(season)], sandbox)
         gets += _run("10_compute_team_ratings.py", ["--season", str(season), "--through-week", str(week)], sandbox)
         if gets:

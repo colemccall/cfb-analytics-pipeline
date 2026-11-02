@@ -43,6 +43,20 @@ def test_no_ea_data_is_exported_or_referenced():
         assert not any("ea_ovr" in r for r in rows), "players_2026.json still carries ea_ovr"
 
 
+def test_the_version_shown_is_the_newest_build_log_entry():
+    """CONFIG.VERSION must equal the version of the first (newest) entry in js/changes.js.
+
+    The classic sidebar printed a hand-typed "v4.21.0" two releases after v4.21; one constant checked here
+    is what stops that drifting again.
+    """
+    m = re.search(r'VERSION:\s*"([^"]+)"', APP_JS.read_text(encoding="utf-8"))
+    assert m, "config.js has no VERSION"
+    changes = (APP / "js" / "changes.js").read_text(encoding="utf-8")
+    newest = re.search(r'const CHANGES = \[\s*\{\s*id:\s*"[^"]*",\s*version:\s*"([^"]+)"', changes)
+    assert newest, "js/changes.js has no first entry with a version"
+    assert m.group(1) == newest.group(1), f"config.js VERSION {m.group(1)} != newest Build Log entry {newest.group(1)}"
+
+
 def test_transfer_seasons_match_exported_files():
     """TRANSFER_SEASONS must list exactly the seasons with a transfers_{season}.json.
 

@@ -39,7 +39,8 @@ load_dotenv()
 
 from utils.store import read_raw, read_computed, write_computed
 from utils.class_year import derive_class_year, recruit_year_map
-from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score
+from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score, parse_stat_data as _parse_stat_data
+from utils.seasons import ALL_SEASONS, REGULAR_SEASON_GAMES
 
 MODEL_VERSION = "v4.0-edge-direct"
 
@@ -174,7 +175,6 @@ NOT_RATED_POSITIONS: dict[str, str] = {
 EDGE_POSITIONS = {"QB", "RB", "WR", "TE", "EDGE", "DL", "LB", "CB", "S", "DB"}
 
 # All seasons used for cross-season normalization
-ALL_SEASONS = list(range(2008, 2027))
 
 # ---------------------------------------------------------------------------
 # EDGE → OVR direct mapping (replaces weighted composite + percentile scaling
@@ -335,6 +335,7 @@ def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
     Pre-2016 defensive positions should NOT reach this function — they are
     handled by compute_pre2016_classic_ovr() in compute_edge_ratings().
     All other positions (offensive all eras, defensive 2016+) use EDGE_OVR_ANCHORS.
+    `season` is accepted (one caller passes it) and not used: the anchors are one set for every season.
     """
     anchors = EDGE_OVR_ANCHORS.get(pg)
     if not anchors or edge_score is None or (isinstance(edge_score, float) and np.isnan(edge_score)):
@@ -801,15 +802,6 @@ def stat_fallback_to_ovr(score: float, pg: str) -> float:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_position_data(season: int, pg: str) -> pd.DataFrame:
-    """Load one season's data for a position group.
-
-    Only includes players who appeared on a roster in this season, determined
-    by the presence of a season_aggregate stats row.
-    """
-    return _load_seasons([season], pg)
-
-
 # Raw tables are read once per process, not once per (season × position). Every
 # call to _load_seasons used to re-parse all of data/raw — 255 MB of stats alone —
 # so a --all-seasons run parsed it 228 times (19 seasons × 12 groups) and spent
@@ -865,18 +857,6 @@ def _computed_ratings() -> pd.DataFrame:
     if _RATINGS is None:
         _RATINGS = read_computed("ratings")
     return _RATINGS
-
-
-def _parse_stat_data(val) -> dict:
-    """Return a stat blob as a dict whether it arrives as a dict or a JSON string; anything else → {}."""
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str):
-        try:
-            return json.loads(val)
-        except Exception:
-            pass
-    return {}
 
 
 _STATS_INDEX: dict | None = None
@@ -1524,7 +1504,7 @@ def apply_multi_tier_treatment(scores: np.ndarray, df: pd.DataFrame, pg: str,
     return result
 
 
-GAMES_CONF_SEASON = 12.0     # the season length the 8-game full-confidence rule was written on
+GAMES_CONF_SEASON = float(REGULAR_SEASON_GAMES)   # the season length the 8-game full-confidence rule was written on
 
 
 def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame, pg: str = "") -> np.ndarray:
@@ -2143,7 +2123,7 @@ def main():
     parser.add_argument("--position",    type=str)
     args = parser.parse_args()
 
-    seasons = list(range(2008, 2027)) if args.all_seasons else [args.season]
+    seasons = ALL_SEASONS if args.all_seasons else [args.season]
     positions = [args.position.upper()] if args.position else list(WEIGHTS.keys())
 
     written = 0

@@ -49,73 +49,19 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.store import read_raw, read_computed, read_ratings, COMPUTED_DIR
+from utils.seasons import CURRENT_SEASON as SEASONS_CURRENT
 from utils.class_year import attach_class_year
-from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score
+from utils.stat_agg import META_KEYS, aggregate_game_stats, has_box_score, parse_stat_data as _parse_stat_data
+from utils.json_utils import _default as _json_default, clean_nan as _clean_nan, write_json  # the one copy; byte-identical output
 
 DEFAULT_OUTPUT = Path(__file__).parent.parent.parent / "cfb-analytics-app" / "data"
-CURRENT_SEASON = 2026
+CURRENT_SEASON = SEASONS_CURRENT
 TOP_N_PER_POSITION = 50
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _parse_stat_data(v) -> dict:
-    """Return a stat blob as a dict whether stored as a dict or a JSON string; anything unparseable → {}."""
-    if isinstance(v, dict):
-        return v
-    try:
-        return json.loads(v)
-    except Exception:
-        return {}
-
-
-def _clean_nan(o):
-    """Recursively replace float NaN/inf with None — literal NaN is invalid JSON
-    and breaks browser fetch().json(). pandas merges produce NaN for unmatched rows.
-    Handles both python float and numpy float (np.float64) NaN."""
-    if isinstance(o, dict):
-        return {k: _clean_nan(v) for k, v in o.items()}
-    if isinstance(o, list):
-        return [_clean_nan(v) for v in o]
-    if isinstance(o, float):
-        return o if math.isfinite(o) else None
-    # numpy scalar (np.float64 etc.) — unwrap then check
-    if hasattr(o, "item"):
-        try:
-            v = o.item()
-            if isinstance(v, float):
-                return v if math.isfinite(v) else None
-            return v
-        except (ValueError, TypeError):
-            return o
-    return o
-
-
-def write_json(path: Path, data) -> None:
-    """Write `data` to `path` as compact JSON after _clean_nan(), creating parent
-    directories. allow_nan=False makes a surviving NaN raise here rather than
-    ship as the bare `NaN` token browsers refuse to parse (the contract suite
-    guards the same seam).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(_clean_nan(data), f, separators=(",", ":"), default=_json_default, allow_nan=False)
-    size_kb = path.stat().st_size / 1024
-    n = len(data) if isinstance(data, (list, dict)) else "?"
-    print(f"  Wrote {path.name} ({size_kb:.1f} KB, {n} items)")
-
-
-def _json_default(o):
-    """json.dump fallback: Decimal → float, numpy scalars → Python via .item(); anything else raises."""
-    import decimal
-    if isinstance(o, decimal.Decimal):
-        return float(o)
-    if hasattr(o, "item"):
-        return o.item()
-    raise TypeError(f"Object of type {type(o)} is not JSON serializable")
-
 
 def _parse_shap(val) -> dict:
     """Return stored SHAP values as a dict whether stored as a dict or a JSON string; anything else → {}."""
