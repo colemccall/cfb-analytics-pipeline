@@ -51,7 +51,7 @@ load_dotenv()
 
 from utils.store import read_raw, RAW_DIR
 from utils.api_client import load_api_key, fetch_sp_ratings_all, fetch_sp_ratings_breakdown, fetch_game_team_stats
-from utils.seasons import ALL_SEASONS
+from utils.seasons import ALL_SEASONS, REGULAR_SEASON_GAMES
 
 MODEL_VERSION = "v4.3-local"
 
@@ -730,7 +730,7 @@ def _player_havoc_events(stats: dict) -> float:
     defensed, and fumble recoveries standing in for the forced fumbles the API
     does not attribute.
     """
-    return float(_coerce_int(stats.get("defensiveTFL"))
+    return float(_coerce_float(stats.get("defensiveTFL"))
                  + (_coerce_int(stats.get("defensivePD")) or _coerce_int(stats.get("defensivePBU")))
                  + _coerce_int(stats.get("fumblesREC")))
 
@@ -844,8 +844,8 @@ def _archetype_raws(pg: str, stats: dict, credit: float, solo_known: bool = Fals
         # Run support is the only archetype where tackles are production, so it is
         # the only one the solo/assist split touches.
         "run_support": (_tackle_credit(stats, r["tot"], solo_known)
-                        + _coerce_int(stats.get("defensiveTFL")) * r["tfl"]
-                        + _coerce_int(stats.get("defensiveSACKS")) * r["sacks"]
+                        + _coerce_float(stats.get("defensiveTFL")) * r["tfl"]
+                        + _coerce_float(stats.get("defensiveSACKS")) * r["sacks"]
                         + _coerce_int(stats.get("defensiveQB HUR")) * r["hur"]),
         "coverage":    credit,
     }
@@ -1225,8 +1225,11 @@ def _def_stat_composite(pg: str, stats: dict, solo_known: bool = False) -> tuple
     if not weights:
         return 0.0, 0.0
     tot   = _coerce_int(stats.get("defensiveTOT"))
-    sacks = _coerce_int(stats.get("defensiveSACKS"))
-    tfl   = _coerce_int(stats.get("defensiveTFL"))
+    # Sacks and tackles for loss are shared: the API writes a half as "0.5". They were read through int() until v4.24, which
+    # turned 0.5 into 0 and 1.5 into 1, so every shared play was lost or rounded down (10.5% of 2026 defensive games carry a
+    # fractional tackle for loss, 3.0% a fractional sack).
+    sacks = _coerce_float(stats.get("defensiveSACKS"))
+    tfl   = _coerce_float(stats.get("defensiveTFL"))
     hur   = _coerce_int(stats.get("defensiveQB HUR")) or _coerce_int(stats.get("defensiveQBH"))
     pbu   = _coerce_int(stats.get("defensivePD")) or _coerce_int(stats.get("defensivePBU"))
     ints  = _coerce_int(stats.get("interceptionsINT")) or _coerce_int(stats.get("defensiveINT"))
@@ -1433,9 +1436,23 @@ PACE_SHARE_EDGES = (0.5, 0.75, 0.9)           # share of team games played: <=0.
 PACE_SHARE_K = (0.8927, 0.9541, 0.9900, 1.0057)
 
 
-def pace_factor_for(raw: float, r_team: float, games: int, comp: int) -> float:
-    """The full-season EDGE for a part-season one: scale to a full season, then calibrate by share of games played.
+def level_edge(raw: float, games: int) -> float:
+    """The EDGE of a full season played at the level of these games: raw x sqrt(12 / games) (v4.24).
 
+    A part-season EDGE is sum / sqrt(games), so the same per-game level scores lower the fewer games it is averaged over.
+    Rescaling by the PLAYER'S OWN games gives sqrt(12) x his mean game score: what a 12-game season of this level would
+    score, and nothing about how many of his team's games he missed. (Until v4.24 the rescale used the team's games and a
+    calibration by his share of them, so a player lost rating for every game he sat out: Dante Moore went 85.6 to 72.9
+    without playing a snap. Measured on 2021-2025 that availability term predicted nothing about how he played afterwards;
+    scripts/validate_part_time_rating.py.) How much to trust a small sample is script 07's PART_SEASON_CURVE.
+    """
+    return raw * float(np.sqrt(REGULAR_SEASON_GAMES / games))
+
+
+def pace_factor_for(raw: float, r_team: float, games: int, comp: int) -> float:
+    """The v4.20 rule, no longer used for a rating: scale to a full season, then calibrate by share of games played.
+
+    Kept because scripts/validate_pace_scale.py and validate_part_time_rating.py score it as the baseline (L0).
     `raw` is the part-season EDGE, `r_team` the team's scheduled/completed ratio, `games` the player's games,
     `comp` the team's completed games.
     """
@@ -1473,8 +1490,8 @@ def save_edge(agg: pd.DataFrame, season: int, in_progress: bool = False) -> None
         meas_raw = int(r["stats_measured"]) if pd.notna(r.get("stats_measured")) else 0
         r_team, last_week, comp = pace.get(int(team_of.get(player_id, -1)), (None, None, 0))
         games = int(r["games_played"]) if pd.notna(r.get("games_played")) else 0
-        edge_new = (pace_factor_for(edge_raw, r_team, games, comp)
-                    if (r_team and edge_raw is not None) else edge_raw)
+        edge_new = (level_edge(edge_raw, games)
+                    if (r_team and edge_raw is not None and games > 0) else edge_raw)
         # one factor for everything scaled with the EDGE (the archetype scores follow it)
         scale_e = (edge_new / edge_raw) if (r_team and edge_raw) else (float(np.sqrt(r_team)) if r_team else 1.0)
         new_rows[ps_id] = {

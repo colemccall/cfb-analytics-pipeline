@@ -281,6 +281,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Week-by-week ratings for a season in progress")
     ap.add_argument("--season", type=int, required=True)
     ap.add_argument("--weeks", type=int, nargs="*", help="only these weeks (default: every complete week)")
+    ap.add_argument("--through-week", type=int, default=None,
+                    help="treat this as the last week: later complete weeks are ignored (a replay of a finished season stops at the "
+                         "last week whose team box scores are cached)")
     args = ap.parse_args()
 
     live17 = _module("17_live_season.py", "live17")
@@ -291,7 +294,7 @@ def main() -> None:
     # Only COMPLETE weeks get a snapshot (live17.COMPLETE_WEEK_SHARE of a week's FBS-involved games scored): a Tuesday-to-Friday
     # week with 7 of its 314 games played is not a week, and a snapshot of it would be a different, thinner number than the
     # one the next refresh replaces it with.
-    complete = live17.complete_weeks(games, args.season, fbs)
+    complete = [w for w in live17.complete_weeks(games, args.season, fbs) if args.through_week is None or w <= args.through_week]
     if not complete:
         sys.exit(f"No completed regular-season weeks for {args.season}.")
     latest_week = max(complete)

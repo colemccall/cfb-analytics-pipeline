@@ -186,13 +186,28 @@ class TestGamesDampShare:
         b = self._damp([{"games_played": 7, "team_games": 8, "_season": 2026}, {"games_played": 8, "team_games": 8, "_season": 2026}], [90.0, 60.0])
         assert a[0] == b[0] == 90.0
 
-    def test_missing_a_real_share_of_the_games_costs(self):
-        out = self._damp([{"games_played": 4, "team_games": 8, "_season": 2026}, {"games_played": 8, "team_games": 8, "_season": 2026}], [90.0, 60.0])
-        assert out[0] < 90.0
-
-    def test_a_part_timer_in_a_season_in_progress_is_scaled_by_share(self):
+    def test_a_season_in_progress_has_no_games_damp_the_curve_replaces_it(self):
+        """v4.24: missing a share of his team's games costs nothing; the sample-size rule is PART_SEASON_CURVE, applied in the rating."""
         out = self._damp([{"games_played": 3, "team_games": 7, "_season": 2026}, {"games_played": 7, "team_games": 7, "_season": 2026}], [90.0, 50.0])
-        avg = 70.0
-        share = 3 / 7 * t07.GAMES_CONF_SEASON / 8.0
-        assert out[0] == pytest.approx(avg + share * (90.0 - avg), abs=0.01)
-        assert out[1] == 50.0
+        assert list(out) == [90.0, 50.0]
+
+
+class TestPartSeasonCurve:
+    def test_the_same_level_is_believed_less_on_fewer_games(self):
+        """The curve is stricter the fewer games he has played, and never above the level it was given at these levels."""
+        three, five, eight = (t07.part_season_curve(90.0, "RB", n) for n in (3, 5, 8))
+        assert three < five < eight < 90.0
+
+    def test_a_game_his_team_played_without_him_changes_nothing(self):
+        """The rating is a function of his own games only: nothing in it reads how many games his team has played."""
+        import inspect
+        assert "team_games" not in inspect.signature(t07.part_season_curve).parameters
+
+    def test_eight_or_more_games_use_the_8_9_line_and_unfitted_groups_are_left_alone(self):
+        assert t07.part_season_curve(80.0, "QB", 11) == t07.part_season_curve(80.0, "QB", 8)
+        assert t07.part_season_curve(80.0, "K", 5) == 80.0        # no line for a kicker: nothing is applied
+
+    def test_the_level_edge_is_a_twelve_game_season_at_his_own_games(self):
+        # game scores summing to 40 over 4 games make an EDGE of 40 / sqrt(4) = 20; at 12 games' worth that is 20 x sqrt(12 / 4)
+        assert t06.level_edge(20.0, 4) == pytest.approx(20.0 * (12 / 4) ** 0.5)
+        assert t06.level_edge(20.0, 12) == pytest.approx(20.0)

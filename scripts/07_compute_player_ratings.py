@@ -329,6 +329,65 @@ def get_rating_era(season: int) -> str:
     return "modern" if season >= 2016 else "pre2016"
 
 
+# THE PART-SEASON CURVE (v4.24). A rating on a season in progress is the player's per-game level (script 06 level_edge: what a
+# 12-game season at his level scores) through the frozen anchors, then through this line for the number of games he has
+# PLAYED: rating = a + b x level, b below 1 where games are few. It answers "how much of a short stretch of play should be
+# believed", from the player's own games only: a game his team played without him changes nothing. Fitted on 2021-2025
+# (86,717 player-cuts at weeks 4, 6, 8 and 10) so that the rating predicts how he plays in his remaining games; scripts/
+# validate_part_time_rating.py reproduces the table and scores it (leave-one-season-out, against the rule it replaced and a
+# placebo). THE COST, stated: a player rated 85 or more by his level plays on average 3.6 points lower afterwards, so the curve
+# lowers the top of a short sample, and a mid-season rating for a high performer sits below the one a finished season gives
+# (a finished season is not curved). Eight or more games use the 8-9 line; fewer than 3 are the low-game rule's.
+PART_SEASON_CURVE = {
+    ("DB", "3"): (31.5387, 0.5630),
+    ("DB", "4"): (29.1020, 0.6184),
+    ("DB", "5"): (28.5869, 0.6221),
+    ("DB", "6"): (27.7084, 0.6379),
+    ("DB", "7"): (26.1067, 0.6610),
+    ("DB", "8-9"): (25.1679, 0.6804),
+    ("DL/EDGE", "3"): (49.0431, 0.3002),
+    ("DL/EDGE", "4"): (41.8771, 0.4253),
+    ("DL/EDGE", "5"): (39.7789, 0.4488),
+    ("DL/EDGE", "6"): (37.6871, 0.4827),
+    ("DL/EDGE", "7"): (35.0145, 0.5235),
+    ("DL/EDGE", "8-9"): (31.9308, 0.5696),
+    ("LB", "3"): (36.8298, 0.4756),
+    ("LB", "4"): (31.7183, 0.5738),
+    ("LB", "5"): (30.5666, 0.5908),
+    ("LB", "6"): (29.2349, 0.6117),
+    ("LB", "7"): (24.0050, 0.6852),
+    ("LB", "8-9"): (24.9842, 0.6748),
+    ("QB", "3"): (32.4978, 0.5785),
+    ("QB", "4"): (30.4431, 0.6159),
+    ("QB", "5"): (27.6059, 0.6471),
+    ("QB", "6"): (17.4848, 0.7734),
+    ("QB", "7"): (29.5235, 0.6340),
+    ("QB", "8-9"): (14.8252, 0.8129),
+    ("RB", "3"): (32.8687, 0.5261),
+    ("RB", "4"): (22.2365, 0.6983),
+    ("RB", "5"): (18.0170, 0.7466),
+    ("RB", "6"): (13.6362, 0.8144),
+    ("RB", "7"): (11.5683, 0.8409),
+    ("RB", "8-9"): (6.8367, 0.9135),
+    ("WR/TE", "3"): (41.6714, 0.4435),
+    ("WR/TE", "4"): (38.4622, 0.5051),
+    ("WR/TE", "5"): (32.2691, 0.5848),
+    ("WR/TE", "6"): (29.7257, 0.6212),
+    ("WR/TE", "7"): (25.2680, 0.6837),
+    ("WR/TE", "8-9"): (20.1337, 0.7511),
+}
+PART_SEASON_FAMILY = {"QB": "QB", "RB": "RB", "WR": "WR/TE", "TE": "WR/TE", "DL": "DL/EDGE", "EDGE": "DL/EDGE",
+                      "LB": "LB", "CB": "DB", "S": "DB", "DB": "DB"}
+
+
+def part_season_curve(ovr: float, pg: str, games: int) -> float:
+    """A level rating of a season in progress through the curve for the games he has played (see PART_SEASON_CURVE)."""
+    line = PART_SEASON_CURVE.get((PART_SEASON_FAMILY.get(pg), str(games) if games <= 7 else "8-9"))
+    if line is None:
+        return ovr
+    return float(np.clip(line[0] + line[1] * ovr, 30.0, 99.0))
+
+
 def edge_to_ovr(edge_score: float, pg: str, season: int = 2025) -> float:
     """Map raw edge_score to OVR via piecewise linear anchors.
 
@@ -1346,6 +1405,8 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[di
         elif has_opp_score(row, pg):
             es  = float(row.get("edge_score") or 0)
             ovr = edge_to_ovr(es, pg, row_season)
+            if float(row.get("team_games") or 0) > 0:        # a season in progress: his level, believed by the games he has played
+                ovr = part_season_curve(ovr, pg, int(row.get("games_played") or 0))
             contrib = {
                 "edge_score":     round(es, 4),
                 "games_played":   int(row.get("games_played") or 0),
@@ -1536,8 +1597,8 @@ def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame, pg: str = "") -
             continue  # CLASSIC system: season totals, no per-game confidence check
         games = float(row.get("games_played", 0) or 0)
         team_games = float(row.get("team_games", 0) or 0)
-        if team_games > 0:       # a season in progress: his share of his team's games so far, on a 12-game season
-            games = min(games / team_games, 1.0) * GAMES_CONF_SEASON
+        if team_games > 0:       # a season in progress: its sample-size rule is PART_SEASON_CURVE, applied where the rating is made
+            continue
         if games >= 8:
             continue  # full-season starters: no change
         # linear from 0.25 confidence at 1 game to 1.0 at 8 games
