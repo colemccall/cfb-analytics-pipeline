@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Pipeline invariants
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+The data-model invariants the pipeline depends on: join anchors, the NaN rule, the engine filter, one team per player per season, and the script run order. The root `CLAUDE.md` points here. (Retitled in v4.24: this file began as a CLAUDE.md, and some of its sections — the workspace layout, the test count — describe the project as it was then.)
 
 ## Workspace layout
 

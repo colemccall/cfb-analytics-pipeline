@@ -75,7 +75,10 @@ CFB_API_KEY=...
 
 ## Script Run Order
 
-Scripts are numbered by their dependency chain. Run them in this order for a complete data refresh:
+Scripts are numbered by their dependency chain. The full-recompute order for the rating chain is
+`06 → 07 → 10 → 11 → 15 → 16 → 10 (projected) → 13 → 14 → 12` (root `CLAUDE.md`).
+[`scripts/README.md`](scripts/README.md) maps every script, including 01b, 09, 17, 17b and 18–20, and
+[`docs/DATA_FLOW.md`](docs/DATA_FLOW.md) shows the whole path from the API to the pages. A complete refresh:
 
 ```text
 01  Teams, players, player_seasons, games, stats, transfers, plays
@@ -94,7 +97,7 @@ Scripts are numbered by their dependency chain. Run them in this order for a com
 05  Coaching changes (seed CSV + ESPN live tracker)
     python scripts/05_load_coaching_changes.py --csv-only
 
-06  EDGE scores per player-season  (requires plays from script 01)
+06  EDGE scores per player-season  (requires the per-game stat rows from script 01)
     python scripts/06_compute_edge_scores.py --season 2025
 
 07  Player ratings — Engine A  (requires EDGE from script 06)
@@ -167,13 +170,21 @@ Once games are played the season has results but no final ratings. Do not run th
 chain on it: a part-season row written to `engine="edge"` would be read by script 15 as a
 finished season. Script 17 rates it in a **private copy of the data** and exports one file:
 
+Each week, refresh only what changed (about 12 requests, staged and checked before anything is merged — v4.24):
+
 ```bash
-set CFB_REFRESH_YEARS=2026       # bypass the cache for 2026 (it has no expiry)
-python scripts/01_harvest_games_players_stats.py --year 2026
-python scripts/09_harvest_supplemental.py --dataset team_advanced_season --seasons 2026
-python scripts/17_live_season.py --season 2026     # -> data/live_2026.json (app) + computed/live_2026.json
-python scripts/validate_pace.py                    # the back-test the correction rests on
+python scripts/01b_refresh_in_season.py --season 2026 --weeks 9 --stage   # fetch into data/staging/2026/
+python scripts/validate_week_ingest.py  --season 2026 --weeks 9           # schema, counts, consistency
+python scripts/01b_refresh_in_season.py --season 2026 --weeks 9 --merge   # into the cache and data/raw (idempotent)
+python scripts/09_harvest_supplemental.py --dataset team_advanced_season team_records --seasons 2026
+python scripts/17_live_season.py --season 2026 --offline   # -> data/live_2026.json (app) + computed/live_2026.json
+python scripts/17b_weekly_progression.py --season 2026     # the week-by-week files (every week, ~30 min)
+python scripts/validate_snapshot_invariance.py --season 2026   # a week-N snapshot sees only weeks 1..N
+python scripts/validate_pace.py                             # the back-test the correction rests on
 ```
+
+A full re-harvest of the season (`CFB_REFRESH_YEARS=2026` with script 01, ~400 requests) still works and is only
+needed when rosters have to be refreshed.
 
 Two switches make this safe. `CFB_REFRESH_YEARS=2026,...` makes `utils/api_client.py` skip its cache
 for those years' requests; without it a re-harvest returns whatever was cached before the games.
@@ -262,7 +273,7 @@ coaching_changes     — HC/OC/DC/ST roles with from/to school and year
 nil_valuations       — On3 NIL values (currently empty — On3 blocks scraping)
 ```
 
-`stats.data` is a nested dict — keys follow CFB Data API naming (`passingYds`, `rushingCar`, `defensiveTot`, etc.).
+`stats.data` is a nested dict — keys are the API's category followed by its stat label as the API writes it (`passingYDS`, `rushingCAR`, `defensiveTOT`, `passingC/ATT`, etc.).
 
 `ratings.shap_values` is a JSON *string* (`json.dumps({})`), not a nested object.
 
@@ -271,17 +282,12 @@ nil_valuations       — On3 NIL values (currently empty — On3 blocks scraping
 ## Tests
 
 ```powershell
-pytest tests/ -v
+.venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-41 tests across 4 files — all unit tests with no database or API calls required:
-
-| File | Coverage |
-|------|----------|
-| `test_edge_anchors.py` | EDGE → OVR piecewise linear mapping for all position groups |
-| `test_playtime_tier.py` | Playtime tier classification logic |
-| `test_composite_to_100.py` | Recruiting composite normalization |
-| `test_clean_nan.py` | NaN/None cleaning for JSON export |
+About 570 tests in 29 files; none needs the network. Some read the real export in the app's `data/` (the contract
+suite), so run them after script 12. What each file guards, and the one test that fails by design, is in
+[`tests/README.md`](tests/README.md).
 
 ---
 
@@ -291,7 +297,8 @@ pytest tests/ -v
 |------|----------|---------|
 | `data/raw/` | API harvest output (JSON per endpoint per season) | No |
 | `data/computed/` | Ratings engine output | No |
-| `data/coaching_changes_seed.csv` | Historical coaching data seed file | Yes |
+| `data/coaching_changes_seed.csv` | Historical coaching data seed file | **No** — `data/*.csv` is ignored, so a fresh clone lacks it and script 05 skips it |
+| `data/staging/` | A staged in-season refresh waiting to be validated (script 01b) | No |
 | `.cache/` | API response cache keyed by MD5 hash | No |
 
 ---
@@ -312,4 +319,4 @@ pytest tests/ -v
 - On3 actively blocks scraping, so `nil_valuations.json` is empty and Engine B (script 11) runs recruiting-only until a working NIL source lands.
 - Script 01 with `--historical` fetches 2008–2020 data. Plays are the largest payload (~40k per season) and fetched last.
 - If you add a new season, re-run scripts 01 → 06 → 07 → 10 → 12 in order.
-- Transfer matching (script 03) requires `from_school` to match a `player_seasons` row — ambiguous name matches return `None` rather than guessing. Scraped-source matching (scripts 04, 08) uses the shared rules in `utils/matching.py`.
+- Transfer matching (script 03) requires `from_school` to match a `player_seasons` row — ambiguous name matches return `None` rather than guessing. Scraped-source matching (script 04) uses the shared rules in `utils/matching.py`.

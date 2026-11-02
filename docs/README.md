@@ -1,0 +1,23 @@
+# docs/
+
+The pipeline's long-form documents. The site explains itself through three registries in the app (`js/methods.js`,
+`js/findings.js`, `js/changes.js`); several of these files mirror registry prose and must change with it
+(`FORMULAS.md`, `ALTERNATIVES.md`, `HOW_PROJECTIONS_WORK.md`, `RESEARCH_METHODS.md`).
+
+| Document | Read it when |
+|---|---|
+| [`DATA_FLOW.md`](DATA_FLOW.md) | You want the whole path: API → raw → computed → app JSON → pages. Start here. |
+| [`PIPELINE_INVARIANTS.md`](PIPELINE_INVARIANTS.md) | Before changing how data is joined or stored: join anchors, the NaN rule, one team per season, run order. |
+| [`RATING_AND_PROJECTION_MODEL.md`](RATING_AND_PROJECTION_MODEL.md) | Before touching a rating or a projection. |
+| [`FORMULAS.md`](FORMULAS.md) | You need a formula exactly as the code computes it (mirrors METHODS). |
+| [`AUDIT_FINDINGS.md`](AUDIT_FINDINGS.md) | Before changing any constant: why each one is where it is. |
+| [`ALTERNATIVES.md`](ALTERNATIVES.md) | Before proposing an idea: it may already be built, measured and rejected. |
+| [`HOW_PROJECTIONS_WORK.md`](HOW_PROJECTIONS_WORK.md) | The projection engines in prose. |
+| [`RESEARCH_METHODS.md`](RESEARCH_METHODS.md) | How the research findings are measured (shrinkage, placebos). |
+| [`ROADMAP.md`](ROADMAP.md) | What is next for the pipeline. The product roadmap is a different file, `../../docs/ROADMAP.md`. |
+| [`ARCHITECTURE_REVIEW_2026-08.md`](ARCHITECTURE_REVIEW_2026-08.md) | The ordered backlog (§6) and the measurements behind it. |
+| [`DESIGN_REVIEW_2026-08.md`](DESIGN_REVIEW_2026-08.md) | The August design review. |
+| [`BUILD_LOG_SPEC.md`](BUILD_LOG_SPEC.md) | Writing a `CHANGES` entry (the build log on `changes.html`). |
+| [`CODING_STANDARDS.md`](CODING_STANDARDS.md) | Style and documentation rules (enforced by `tests/test_docstrings.py`). |
+| [`API_INVENTORY.md`](API_INVENTORY.md), [`SUPPLEMENTAL_DATA.md`](SUPPLEMENTAL_DATA.md) | What the CFB Data API has, from which season, and what we harvest. |
+| [`INTERNAL_REFERENCE.md`](INTERNAL_REFERENCE.md) | Internal notes. |
