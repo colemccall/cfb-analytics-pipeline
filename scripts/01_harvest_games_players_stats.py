@@ -601,23 +601,29 @@ def save_postseason_stats(postseason_stats_raw, player_id_map, ps_id_map,
     _save_stat_rows(list(seen.values()))
 
 
-def save_game_stats(game_stats_raw, player_id_map, team_id_map, game_id_map, season) -> None:
-    """Build and save one `game_aggregate` stat row per player per game.
+def build_game_stat_rows(game_stats_raw, player_id_map, team_id_map, game_id_map, season) -> tuple[list, dict]:
+    """The `game_aggregate` rows a /games/players payload makes, and what it could not link.
 
-    Walks the /games/players payload (game → team → category → type →
-    athlete), which carries API player ids, so this join is by id rather than
-    by name. A player is kept only when his (player, team) has a
-    player_season for this season; games not in `game_id_map` are skipped.
-    Keys use the same category + type-label shape as the season rows. This is
-    the per-game input script 06 computes EDGE from.
+    Walks the payload (game → team → category → type → athlete), which carries
+    API player ids, so this join is by id rather than by name. A player is kept
+    only when his (player, team) has a player_season for this season; games not
+    in `game_id_map` are skipped. Keys use the same category + type-label shape
+    as the season rows.
+
+    Returns (rows, counts). `counts` says how many athlete-stat entries were
+    linked and how many were dropped because the athlete has no player row
+    (`no_player`) or no player_season on that team (`no_season`), so a refresh
+    can see when its roster has fallen behind the box scores.
     """
     ps_lookup = _build_ps_lookup_local(season)
     rows_dict: dict = {}
+    counts = {"linked": 0, "no_player": 0, "no_season": 0, "games_skipped": 0}
 
     for game in game_stats_raw:
         gid_api = game.get("id")
         gid_db  = game_id_map.get(gid_api)
         if not gid_db:
+            counts["games_skipped"] += 1
             continue
         for team_block in game.get("teams", []):
             school = team_block.get("team") or team_block.get("school", "")
@@ -639,10 +645,13 @@ def save_game_stats(game_stats_raw, player_id_map, team_id_map, game_id_map, sea
                             continue
                         db_id = player_id_map.get(api_pid_int)
                         if not db_id:
+                            counts["no_player"] += 1
                             continue
                         ps_id = ps_lookup.get((db_id, tid))
                         if not ps_id:
+                            counts["no_season"] += 1
                             continue
+                        counts["linked"] += 1
                         key = (ps_id, gid_db)
                         if key not in rows_dict:
                             rows_dict[key] = {}
@@ -659,6 +668,15 @@ def save_game_stats(game_stats_raw, player_id_map, team_id_map, game_id_map, sea
         for (ps_id, gid), stats in rows_dict.items()
         if stats
     ]
+    return rows, counts
+
+
+def save_game_stats(game_stats_raw, player_id_map, team_id_map, game_id_map, season) -> None:
+    """Build and save one `game_aggregate` stat row per player per game (see build_game_stat_rows).
+
+    This is the per-game input script 06 computes EDGE from.
+    """
+    rows, _ = build_game_stat_rows(game_stats_raw, player_id_map, team_id_map, game_id_map, season)
     if not rows:
         print("  No game-aggregate stat rows to save")
         return

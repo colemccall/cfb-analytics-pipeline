@@ -60,20 +60,34 @@ EARNED_BASES = ("production", "blended")
 LIVE_STATUSES = ("rated", "too_few_games", "no_games", "not_rated")
 
 
-def _run(script: str, args: list, data_dir: Path, season: int) -> None:
+def _run(script: str, args: list, data_dir: Path, season: int, offline: bool = False) -> None:
     """Run one pipeline script against the private data folder.
 
     The child sees CFB_DATA_DIR (so it reads and writes only the copy) and
     CFB_REFRESH_YEARS=<season> (so SP+ and team stats are fetched fresh rather than
     served from a cache written before the games were played). Raises on a
     non-zero exit, with the tail of its output.
+
+    offline=True is for a run after scripts/01b_refresh_in_season.py has refreshed
+    exactly the keys that changed: the child reads the cache only (no
+    CFB_REFRESH_YEARS, and a dead proxy so a cache miss cannot reach the API), and
+    any request it attempts fails the run — a cache miss would otherwise come back
+    as an empty list and silently drop data.
     """
-    env = dict(os.environ, CFB_DATA_DIR=str(data_dir), CFB_REFRESH_YEARS=str(season), PYTHONIOENCODING="utf-8")
+    env = dict(os.environ, CFB_DATA_DIR=str(data_dir), PYTHONIOENCODING="utf-8")
+    if offline:
+        env.pop("CFB_REFRESH_YEARS", None)
+        env.update(HTTPS_PROXY="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9")
+    else:
+        env["CFB_REFRESH_YEARS"] = str(season)
     cmd = [sys.executable, "-B", "-W", "ignore", str(ROOT / "scripts" / script)] + args
     print(f"  {script} {' '.join(args)}")
     out = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=ROOT)
     if out.returncode != 0:
         raise RuntimeError(f"{script} failed:\n{(out.stdout + out.stderr)[-800:]}")
+    gets = sum(1 for ln in (out.stdout + out.stderr).splitlines() if ln.startswith("  GET"))
+    if offline and gets:
+        raise RuntimeError(f"{script}: {gets} request(s) attempted in an offline run (a cache key is missing)")
 
 
 def _load(path: Path) -> pd.DataFrame:
@@ -242,6 +256,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Earned-to-date ratings for a season in progress")
     ap.add_argument("--season", type=int, required=True)
     ap.add_argument("--keep-sandbox", action="store_true")
+    ap.add_argument("--offline", action="store_true",
+                    help="read the API cache only (after scripts/01b_refresh_in_season.py); fail on any request")
     args = ap.parse_args()
 
     # Through fill_shutouts, as every other reader of games does: the harvest stored a shutout's 0 as missing, and read raw the
@@ -260,9 +276,9 @@ def main() -> None:
         print(f"private data copy: {sandbox}")
         for sub in ("raw", "computed"):
             shutil.copytree(ROOT / "data" / sub, sandbox / sub)
-        _run("06_compute_edge_scores.py", ["--season", str(args.season), "--in-progress"], sandbox, args.season)
-        _run("07_compute_player_ratings.py", ["--season", str(args.season)], sandbox, args.season)
-        _run("10_compute_team_ratings.py", ["--season", str(args.season)], sandbox, args.season)
+        _run("06_compute_edge_scores.py", ["--season", str(args.season), "--in-progress"], sandbox, args.season, args.offline)
+        _run("07_compute_player_ratings.py", ["--season", str(args.season)], sandbox, args.season, args.offline)
+        _run("10_compute_team_ratings.py", ["--season", str(args.season)], sandbox, args.season, args.offline)
         export = build_export(args.season, sandbox, progress)
     finally:
         if not args.keep_sandbox:

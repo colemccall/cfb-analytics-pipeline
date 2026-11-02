@@ -59,30 +59,29 @@ def _cache_key(path: str, params: dict | None) -> str:
     return hashlib.md5(key_str.encode()).hexdigest()
 
 
-def _get(api_key: str, path: str, params: dict | None = None, retries: int = 5) -> list | dict:
-    """Make a GET request to the CFB API, serving from file cache when available.
+def cache_path(path: str, params: dict | None) -> str:
+    """The cache file that holds the response to `path` with `params` (it may not exist yet)."""
+    return os.path.join(CACHE_DIR, f"{_cache_key(path, params)}.json")
 
-    Args:
-        api_key: Bearer token from CFB_API_KEY.
-        path: API path, e.g. "/teams/fbs".
-        params: Query parameters dict.
-        retries: Number of retry attempts on 429 rate-limit responses.
 
-    Returns:
-        Parsed JSON response as list or dict.
-    """
+def cache_read(path: str, params: dict | None) -> list | dict | None:
+    """The cached response to `path` with `params`, or None when there is none. Never touches the network."""
+    f = cache_path(path, params)
+    if not os.path.exists(f):
+        return None
+    with open(f) as fh:
+        return json.load(fh)
+
+
+def cache_write(path: str, params: dict | None, data: list | dict) -> None:
+    """Store `data` as the cached response to `path` with `params`, replacing what was there."""
     os.makedirs(CACHE_DIR, exist_ok=True)
-    cache_key = _cache_key(path, params)
-    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+    with open(cache_path(path, params), "w") as f:
+        json.dump(data, f)
 
-    year = (params or {}).get("year")
-    refresh = year is not None and str(year).isdigit() and int(year) in refresh_years()
 
-    if os.path.exists(cache_file) and not refresh:
-        print(f"  [cache] {path} {params or ''}")
-        with open(cache_file) as f:
-            return json.load(f)
-
+def _request(api_key: str, path: str, params: dict | None, retries: int = 5) -> list | dict:
+    """One GET to the CFB API with back-off on 429; no cache read or write. Raises on any other HTTP error."""
     print(f"  GET {path} {params or ''}")
     for attempt in range(retries):
         resp = requests.get(
@@ -98,13 +97,48 @@ def _get(api_key: str, path: str, params: dict | None = None, retries: int = 5) 
             time.sleep(wait)
             continue
         resp.raise_for_status()
-        data = resp.json()
-        n = len(data) if isinstance(data, list) else "ok"
-        print(f"  -> {n} records, cached.")
-        with open(cache_file, "w") as f:
-            json.dump(data, f)
-        return data
+        return resp.json()
     raise RuntimeError(f"Still rate-limited after {retries} retries: {path}")
+
+
+def fetch_fresh(api_key: str, path: str, params: dict | None = None) -> list | dict:
+    """GET `path` from the API whatever the cache holds, and leave the cache alone.
+
+    For a refresh that stages a response for checking before anything reads it
+    (scripts/01b_refresh_in_season.py): the cache is only replaced once the
+    staged response has passed validation.
+    """
+    data = _request(api_key, path, params)
+    n = len(data) if isinstance(data, list) else "ok"
+    print(f"  -> {n} records (not cached)")
+    return data
+
+
+def _get(api_key: str, path: str, params: dict | None = None, retries: int = 5) -> list | dict:
+    """Make a GET request to the CFB API, serving from file cache when available.
+
+    Args:
+        api_key: Bearer token from CFB_API_KEY.
+        path: API path, e.g. "/teams/fbs".
+        params: Query parameters dict.
+        retries: Number of retry attempts on 429 rate-limit responses.
+
+    Returns:
+        Parsed JSON response as list or dict.
+    """
+    year = (params or {}).get("year")
+    refresh = year is not None and str(year).isdigit() and int(year) in refresh_years()
+
+    cached = None if refresh else cache_read(path, params)
+    if cached is not None:
+        print(f"  [cache] {path} {params or ''}")
+        return cached
+
+    data = _request(api_key, path, params, retries)
+    n = len(data) if isinstance(data, list) else "ok"
+    print(f"  -> {n} records, cached.")
+    cache_write(path, params, data)
+    return data
 
 
 def _get_list(api_key: str, path: str, params: dict | None = None) -> list:

@@ -45,3 +45,6 @@ Thumbs.db
 # insurance, not artifacts — raw_backup_2026-05-22.zip predates this rule and is
 # left tracked rather than rewritten out of history.
 data/raw_backup_pre_*.zip
+
+# Staged API responses awaiting validation (scripts/01b_refresh_in_season.py --stage)
+data/staging/
