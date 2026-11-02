@@ -9,12 +9,14 @@ cannot be told apart from a real one. Two checks:
                             (the count the in-season scale divides by) must equal that team's completed regular-season
                             games through week N, counted here independently from games.json.
 
-  (b) future-scramble placebo   the week-N chain (06 then 07) is run twice: once as 17b runs it, once with everything
-                            from after week N scrambled — every per-game stat row after week N deleted, and the season
+  (b) future-scramble placebo   the week-N chain (06 then 07) is run twice, both times cut to week N the way 17b cuts it
+                            (17b limit_to_week): once on the real data, once on data in which everything dated after
+                            week N has first been scrambled — the per-game rows after week N deleted, the season
                             totals (cumulative to the day they were fetched) shuffled across players of the same
-                            position with half of them dropped. Shuffling alone would keep WHICH players have a row;
-                            dropping half breaks that too. A snapshot that uses only weeks 1..N cannot move. Every
-                            rating that does move is a leak, and the players are listed.
+                            position with half of them dropped, and the team advanced stats dealt to other teams.
+                            Shuffling alone would keep WHICH players have a row; dropping half breaks that too. A
+                            snapshot that uses only weeks 1..N cannot move: every rating that does move was read from a
+                            channel the cut does not cover, and the players are listed.
 
     python scripts/validate_snapshot_invariance.py --season 2026 --weeks 3 6 9 --placebo-week 3
 
@@ -105,9 +107,10 @@ def scramble_future(stats: list, season: int, week: int, week_of_game: dict, pg_
 
 
 def ratings_of(sandbox: Path, season: int) -> dict:
-    """{player_season_id: overall_rating} for the season's edge rows the sandbox's script 07 wrote."""
+    """{player_season_id: overall_rating} for the season's earned rows (production or blended basis, the ones the live and weekly files publish) that the sandbox's script 07 wrote."""
     df = pd.DataFrame(_read(sandbox / "computed" / "ratings.json"))
-    df = df[(df["season"] == season) & (df["engine"] == "edge") & df["overall_rating"].notna()]
+    df = df[(df["season"] == season) & (df["engine"] == "edge") & df["overall_rating"].notna()
+            & df["rating_basis"].isin(["production", "blended"])]
     return dict(zip(df["player_season_id"].astype(int), df["overall_rating"].astype(float)))
 
 
@@ -138,30 +141,55 @@ def check_counts(sandbox: Path, games: list, season: int, weeks: list, team_of_p
 
 def check_placebo(sandbox: Path, games: list, stats: list, season: int, week: int, week_of_game: dict, pg_of_ps: dict,
                   names: dict) -> bool:
-    """Check (b): rate week N as 17b does and again with everything after week N scrambled; True if no rating moves."""
-    _write(sandbox / "raw" / "games.json", mask_games(games, season, week))
-    results = {}
-    for label in ("as 17b runs it", "future scrambled"):
-        if label == "future scrambled":
-            scrambled, info = scramble_future(stats, season, week, week_of_game, pg_of_ps)
-            _write(sandbox / "raw" / "stats.json", scrambled)
-            print(f"      scrambled: {info}")
-        else:
-            _write(sandbox / "raw" / "stats.json", stats)
+    """Check (b): rate week N on the real data and on data scrambled after week N, one channel at a time; True if no earned rating moves."""
+    masked = mask_games(games, season, week)
+    _write(sandbox / "raw" / "games.json", masked)
+    latest_week = max(g["week"] for g in games if g.get("season") == season and g.get("season_type") == "regular"
+                      and (g.get("home_score") is not None or g.get("away_score") is not None))
+    adv_path = sandbox / "raw" / "team_advanced_season.json"
+    adv = _read(adv_path)
+
+    def dealt_advanced():
+        rng = np.random.default_rng(5)
+        out = [dict(r) for r in adv]
+        mine = [i for i, r in enumerate(out) if r.get("season") == season]
+        ids = [out[i].get("team_id") for i in mine]
+        for i, j in zip(mine, rng.permutation(len(mine))):
+            out[i]["team_id"] = ids[j]
+        return out, len(mine)
+
+    arms = {}
+    for label in ("real data", "stats scrambled", "advanced stats dealt"):
+        stats_in, adv_in, note = stats, adv, ""
+        if label == "stats scrambled":
+            stats_in, info = scramble_future(stats, season, week, week_of_game, pg_of_ps)
+            note = str(info)
+        elif label == "advanced stats dealt":
+            adv_in, n = dealt_advanced()
+            note = f"{n} teams' season advanced stats dealt to other teams"
+        _write(sandbox / "raw" / "stats.json", stats_in)
+        _write(adv_path, adv_in)
+        t17b.limit_to_week(sandbox, season, masked, week, latest_week)
         run("06_compute_edge_scores.py", ["--season", str(season), "--in-progress", "--through-week", str(week)], sandbox)
         run("07_compute_player_ratings.py", ["--season", str(season)], sandbox)
-        results[label] = ratings_of(sandbox, season)
-    a, b = results["as 17b runs it"], results["future scrambled"]
-    both = set(a) & set(b)
-    moved = sorted(((abs(a[k] - b[k]), k) for k in both if abs(a[k] - b[k]) > MOVE_TOLERANCE), reverse=True)
-    only = len(set(a) ^ set(b))
-    status = "PASS" if not moved and not only else "FAIL"
-    largest = f" (largest {moved[0][0]:.2f})" if moved else ""
-    print(f"  {status}  (b) week {week}: {len(both)} players rated both times; {len(moved)} moved when later data was "
-          f"scrambled{largest}; {only} rated in one run only")
-    for _, k in moved[:10]:
-        print(f"        {names.get(k, k)}: {a[k]:.2f} -> {b[k]:.2f}")
-    return status == "PASS"
+        arms[label] = ratings_of(sandbox, season)
+        if note:
+            print(f"      {label}: {note}")
+    base = arms["real data"]
+    ok = True
+    for label in ("stats scrambled", "advanced stats dealt"):
+        other = arms[label]
+        both = set(base) & set(other)
+        moved = sorted(((abs(base[k] - other[k]), k) for k in both if abs(base[k] - other[k]) > MOVE_TOLERANCE), reverse=True)
+        only = len(set(base) ^ set(other))
+        status = "PASS" if not moved and not only else "FAIL"
+        ok &= status == "PASS"
+        largest = f" (largest {moved[0][0]:.2f})" if moved else ""
+        print(f"  {status}  (b) week {week}, {label}: {len(both)} earned ratings in both runs; {len(moved)} moved{largest}; "
+              f"{only} earned in one run only")
+        for _, k in moved[:6]:
+            print(f"        {names.get(k, k)}: {base[k]:.2f} -> {other[k]:.2f}")
+    return ok
 
 
 def main() -> None:

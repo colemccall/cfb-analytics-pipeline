@@ -100,8 +100,8 @@ class TestShutoutsReadBack:
         live = _load_script("17_live_season.py", "live17t")
         games = pd.DataFrame([{"season": 2026, "season_type": "regular", "week": 1, "home_team_id": 1, "away_team_id": None,
                                "home_score": 34.0, "away_score": None}])
-        assert live.season_progress(games, 2026)["completed"] == 0           # read raw, the game has no result
-        got = live.season_progress(fill_shutouts(games), 2026)
+        assert live.season_progress(games, 2026, {1})["completed"] == 0       # read raw, the game has no result
+        got = live.season_progress(fill_shutouts(games), 2026, {1})
         assert got["completed"] == 1 and got["records"] == {1: (1, 0)}
 
 

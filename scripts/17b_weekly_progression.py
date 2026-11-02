@@ -1,10 +1,20 @@
 """Week-by-week ratings for a season being played: the live chain re-run as it stood after each week.
 
 Script 17 rates a season to date. This script runs the same chain once per completed week N, in a private copy of the data in
-which every game after week N is unscored and every per-game statistic after week N is out of reach:
+which nothing after week N can be seen:
 
     games.json   scores of games after week N removed (the schedule stays, so the pace scale and the "season in progress" test
                  see the season as it stood)
+    stats.json   per-game stat rows after week N removed; for every week but the latest the season-total rows keep only their
+                 usage / PPA / award fields, so script 07 rebuilds each player's production from his games through N (before
+                 v4.24 it read the whole season's totals into every week, and rated players on games they had not yet
+                 played), and postseason totals are removed. The latest week keeps its totals: they are cumulative to it.
+    computed/    the season's own edge rows in ratings.json and team_ratings.json removed, so nothing from a finished run
+                 can survive in a snapshot (script 07 only replaces the players it re-rates)
+    team_advanced_season.json   (the defenders' opportunity index) the season's rows removed for every week but the latest.
+                 The API gives only season-to-date totals, with no per-game file for 2026 to rebuild a week from, and the
+                 index's own rule is that a season with under 300 defensive plays per team is "too partial to normalise"
+                 (multiplier 1.0). The latest week keeps them: they are cumulative to exactly that point.
     06           --in-progress --through-week N    player EDGE from the games through N
     07                                             player ratings
     10           --through-week N                  team readings; team statistics summed from the box scores of weeks 1..N
@@ -51,6 +61,7 @@ sys.path.insert(0, str(ROOT))
 from utils import opponent_strength as ostr  # noqa: E402
 from utils.store import fill_shutouts  # noqa: E402
 from utils.seasons import REGULAR_SEASON_GAMES  # noqa: E402
+from utils.stat_agg import META_KEYS, parse_stat_data  # noqa: E402
 
 APP_DATA = ROOT.parent / "cfb-analytics-app" / "data"
 MARGIN_CAP = 28.0        # the cap power uses on a game's margin (utils/results_rating.CAP)
@@ -107,7 +118,54 @@ def _run(script: str, args: list, sandbox: Path) -> int:
     return sum(1 for ln in text.splitlines() if ln.startswith("  GET"))
 
 
-def snapshot(season: int, week: int, live17, t10, t07) -> dict:
+def limit_to_week(sandbox: Path, season: int, games: list, week: int, latest_week: int) -> dict:
+    """Cut the sandbox's stats and computed files to what was known after regular-season `week`; return what was cut.
+    `latest_week` is the newest complete week: only there are the season's totals (player and team advanced stats, all
+    cumulative to the day they were fetched) in range, so only there are they kept.
+
+    Per-game stat rows of later games go. A season-total row (the API's cumulative figures, fetched on one day) cannot be
+    cut to a week, so only its usage / PPA / award fields stay (script 07 then sums the player's own game rows through the
+    week), and the postseason totals go. The season's rated rows in computed/ go too, so a player who is not re-rated this
+    week cannot keep a rating from a finished run.
+    """
+    week_of = {g["id"]: g.get("week") for g in games if g.get("season") == season and g.get("season_type") == "regular"}
+    cut = {"game_rows": 0, "totals_trimmed": 0, "postseason_totals": 0, "advanced_rows": 0}
+    if week < latest_week:
+        apath = sandbox / "raw" / "team_advanced_season.json"
+        rows = json.loads(apath.read_text(encoding="utf-8"))
+        left = [r for r in rows if r.get("season") != season]
+        cut["advanced_rows"] = len(rows) - len(left)
+        apath.write_text(json.dumps(left, separators=(",", ":")), encoding="utf-8")
+    path = sandbox / "raw" / "stats.json"
+    kept = []
+    for r in json.loads(path.read_text(encoding="utf-8")):
+        if r.get("season") != season:
+            kept.append(r)
+        elif r.get("game_id") is not None:
+            if (week_of.get(r["game_id"]) or 99) <= week:
+                kept.append(r)
+            else:
+                cut["game_rows"] += 1
+        elif r.get("stat_type") == "season_aggregate" and week < latest_week:
+            data = parse_stat_data(r.get("data"))
+            kept.append({**r, "data": {k: v for k, v in data.items() if k in META_KEYS}})
+            cut["totals_trimmed"] += 1
+        elif r.get("stat_type") == "postseason_aggregate" and week < latest_week:
+            cut["postseason_totals"] += 1
+        else:
+            kept.append(r)
+    path.write_text(json.dumps(kept, separators=(",", ":")), encoding="utf-8")
+    del kept
+    for name, key in (("ratings", "player_season_id"), ("team_ratings", "team_id")):
+        cpath = sandbox / "computed" / f"{name}.json"
+        rows = json.loads(cpath.read_text(encoding="utf-8"))
+        left = [r for r in rows if not (r.get("season") == season and r.get("engine") == "edge")]
+        cut[f"{name}_rows"] = len(rows) - len(left)
+        cpath.write_text(json.dumps(left, separators=(",", ":")), encoding="utf-8")
+    return cut
+
+
+def snapshot(season: int, week: int, latest_week: int, live17, t10, t07) -> dict:
     """Run the chain as of `week` and return that week's teams, players and game grades."""
     sandbox = Path(tempfile.mkdtemp(prefix=f"wk{week}_"))
     try:
@@ -119,6 +177,7 @@ def snapshot(season: int, week: int, live17, t10, t07) -> dict:
             if g.get("season") == season and g.get("season_type") == "regular" and (g.get("week") or 99) > week:
                 g["home_score"] = g["away_score"] = None
         gpath.write_text(json.dumps(games, separators=(",", ":")), encoding="utf-8")
+        limit_to_week(sandbox, season, games, week, latest_week)
         gdf = fill_shutouts(pd.DataFrame(games))     # a game's 0 is stored as missing; later weeks' scores are both missing and stay so
 
         gets = _run("06_compute_edge_scores.py", ["--season", str(season), "--in-progress", "--through-week", str(week)], sandbox)
@@ -133,7 +192,8 @@ def snapshot(season: int, week: int, live17, t10, t07) -> dict:
         if gets:
             raise RuntimeError(f"week {week}: the children made {gets} request(s); the weekly run must be cache-only")
 
-        progress = live17.season_progress(gdf, season)
+        fbs = set(pd.DataFrame(json.loads((ROOT / "data" / "raw" / "teams.json").read_text(encoding="utf-8")))["id"])
+        progress = live17.season_progress(gdf, season, fbs)
         export = live17.build_export(season, sandbox, progress)
         export.pop("_roster", None)
 
@@ -220,27 +280,32 @@ def main() -> None:
     """
     ap = argparse.ArgumentParser(description="Week-by-week ratings for a season in progress")
     ap.add_argument("--season", type=int, required=True)
-    ap.add_argument("--weeks", type=int, nargs="*", help="only these weeks (default: every week with a scored game)")
+    ap.add_argument("--weeks", type=int, nargs="*", help="only these weeks (default: every complete week)")
     args = ap.parse_args()
 
     live17 = _module("17_live_season.py", "live17")
     t10 = _module("10_compute_team_ratings.py", "t10")
     t07 = _module("07_compute_player_ratings.py", "t07")
     games = fill_shutouts(pd.DataFrame(json.loads((ROOT / "data" / "raw" / "games.json").read_text(encoding="utf-8"))))
-    g = games[(games["season"] == args.season) & (games["season_type"] == "regular") & games["home_score"].notna() & games["away_score"].notna()]
-    weeks = sorted(int(w) for w in g["week"].dropna().unique() if w >= 1)
-    if args.weeks:
-        weeks = [w for w in weeks if w in args.weeks]
-    if not weeks:
+    fbs = set(pd.DataFrame(json.loads((ROOT / "data" / "raw" / "teams.json").read_text(encoding="utf-8")))["id"])
+    # Only COMPLETE weeks get a snapshot (live17.COMPLETE_WEEK_SHARE of a week's FBS-involved games scored): a Tuesday-to-Friday
+    # week with 7 of its 314 games played is not a week, and a snapshot of it would be a different, thinner number than the
+    # one the next refresh replaces it with.
+    complete = live17.complete_weeks(games, args.season, fbs)
+    if not complete:
         sys.exit(f"No completed regular-season weeks for {args.season}.")
-    print(f"{args.season}: weeks {weeks[0]}-{weeks[-1]}")
+    latest_week = max(complete)
+    weeks = [w for w in complete if not args.weeks or w in args.weeks]
+    if not weeks:
+        sys.exit(f"None of the requested weeks is complete for {args.season} (complete: {complete}).")
+    print(f"{args.season}: weeks {weeks[0]}-{weeks[-1]} (latest complete week {latest_week})")
 
     team_weeks: dict = {}
     player_weeks: dict = {}
     snaps = {}
     for wk in weeks:
         print(f"  week {wk} ...", flush=True)
-        snap = snapshot(args.season, wk, live17, t10, t07)
+        snap = snapshot(args.season, wk, latest_week, live17, t10, t07)
         snaps[wk] = snap
         for tid, row in weekly_team_rows(snap, t10).items():
             team_weeks.setdefault(tid, []).append(row)

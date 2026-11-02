@@ -97,9 +97,33 @@ def _load(path: Path) -> pd.DataFrame:
     return pd.DataFrame(json.loads(path.read_text(encoding="utf-8")))
 
 
-def season_progress(games: pd.DataFrame, season: int) -> dict:
-    """Where a season stands: games scheduled and completed, last completed week,
-    and each team's regular-season record so far. Postseason games are ignored.
+# A week is complete — it gets a weekly snapshot, and the live file is labelled through it — only when at least this
+# share of its FBS-involved games have a result (the shutout rule applies). A week's Tuesday-to-Friday games come
+# before its Saturday: until v4.24 a refresh on a Friday labelled the season "through week 9" on 7 of 314 games.
+# Complete weeks of 2026 run 0.95 to 1.0 (a cancelled game, an FCS score the API never wrote).
+COMPLETE_WEEK_SHARE = 0.9
+
+
+def complete_weeks(games: pd.DataFrame, season: int, fbs: set) -> list:
+    """The regular-season weeks of `season` (1 and up) with at least COMPLETE_WEEK_SHARE of their FBS-involved games scored.
+
+    `games` must already have been read through fill_shutouts; `fbs` is the set of team ids in teams.json.
+    """
+    g = games[(games["season"] == season) & (games["season_type"] == "regular")]
+    g = g[g["home_team_id"].isin(fbs) | g["away_team_id"].isin(fbs)]
+    weeks = []
+    for wk, grp in g.groupby("week"):
+        if pd.isna(wk) or wk < 1:
+            continue
+        scored = int((grp["home_score"].notna() & grp["away_score"].notna()).sum())
+        if scored >= COMPLETE_WEEK_SHARE * len(grp):
+            weeks.append(int(wk))
+    return weeks
+
+
+def season_progress(games: pd.DataFrame, season: int, fbs: set) -> dict:
+    """Where a season stands: games scheduled and completed, the last complete week, the games already played after
+    it, and each team's regular-season record so far (every completed game counts). Postseason games are ignored.
     """
     g = games[(games["season"] == season) & (games["season_type"] == "regular")]
     done = g[g["home_score"].notna() & g["away_score"].notna()]
@@ -111,8 +135,10 @@ def season_progress(games: pd.DataFrame, season: int) -> dict:
                 continue
             w, l = rec.get(int(tid), (0, 0))
             rec[int(tid)] = (w + won, l + (not won))
-    return {"scheduled": len(g), "completed": len(done),
-            "through_week": int(done["week"].max()) if len(done) else 0, "records": rec}
+    weeks = complete_weeks(games, season, fbs)
+    through = max(weeks) if weeks else 0
+    return {"scheduled": len(g), "completed": len(done), "through_week": through,
+            "games_after_through_week": int((done["week"] > through).sum()), "records": rec}
 
 
 def live_roster(earned: pd.DataFrame, ps_all: pd.DataFrame, edge: pd.DataFrame) -> list:
@@ -236,6 +262,7 @@ def build_export(season: int, sandbox: Path, progress: dict) -> dict:
         validation = json.loads(vpath.read_text(encoding="utf-8"))
     return {
         "season": season, "through_week": progress["through_week"],
+        "games_after_through_week": progress["games_after_through_week"],   # already counted, in a week not yet complete
         "games_completed": progress["completed"], "games_scheduled": progress["scheduled"],
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "median_pace_factor": round(float(pace.median()), 3) if len(pace) else None,
@@ -263,13 +290,15 @@ def main() -> None:
     # Through fill_shutouts, as every other reader of games does: the harvest stored a shutout's 0 as missing, and read raw the
     # live file's records left out every game a team won 40-0 (Oklahoma showed 3-3 for 4-3 before v4.22).
     games = fill_shutouts(_load(ROOT / "data" / "raw" / "games.json"))
-    progress = season_progress(games, args.season)
+    fbs = set(_load(ROOT / "data" / "raw" / "teams.json")["id"])
+    progress = season_progress(games, args.season, fbs)
     if not progress["completed"]:
         sys.exit(f"No completed regular-season games for {args.season} — harvest first (script 01).")
     if progress["completed"] >= progress["scheduled"]:
         print(f"Note: every {args.season} regular-season game is complete; the normal chain (06, 07, 10) applies.")
     print(f"{args.season}: {progress['completed']:,} of {progress['scheduled']:,} regular-season games "
-          f"complete, through week {progress['through_week']}")
+          f"complete, through week {progress['through_week']}"
+          + (f" (+{progress['games_after_through_week']} games of a week not yet complete)" if progress["games_after_through_week"] else ""))
 
     sandbox = Path(tempfile.mkdtemp(prefix="live_"))
     try:
