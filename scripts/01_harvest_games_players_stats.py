@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.api_client import (
@@ -719,7 +721,13 @@ def run_year(api_key: str, season: int) -> None:
     player_stats_raw = fetch_player_stats(api_key, season)
     ppa_raw          = fetch_ppa(api_key, season)
     usage_raw        = fetch_player_usage(api_key, season)
-    awards_raw       = fetch_awards(api_key, season)
+    try:
+        awards_raw = fetch_awards(api_key, season)
+    except requests.HTTPError as e:
+        # Awards are a season-end fact: for a season being played the API has none, and has answered with an error
+        # (2026 never returned a response). That is the one request a harvest may lose; award_tier stays 0.
+        print(f"  awards unavailable for {season} ({e}); award_tier stays 0")
+        awards_raw = []
     save_season_stats(
         player_stats_raw, ppa_raw, usage_raw, awards_raw,
         player_id_map, ps_id_map, rosters_by_team, team_id_map, season,

@@ -644,6 +644,7 @@ def main() -> None:
 
     print(f"Seasons: {min(seasons)}–{max(seasons)}   Datasets: {len(names)}")
     total = 0
+    failed = []
     for n in names:
         try:
             if n == "play_stats":
@@ -653,12 +654,16 @@ def main() -> None:
             else:
                 total += harvest_one(n, seasons, api_key, args.dry_run)
         except Exception as e:
-            # One dead endpoint must not cost the other fifteen. The failure is
-            # printed rather than raised so a --all run finishes and says what
-            # it could not get.
+            # One dead endpoint must not cost the other fifteen, so the run goes on to the next dataset. The failed
+            # dataset writes nothing (a fetch error is raised before its write), so its stored seasons stay as they
+            # were, and the run exits non-zero at the end naming it (v4.24: a failed request used to come back as
+            # an empty list and REPLACE the stored season with nothing).
+            failed.append(n)
             print(f"  ERROR harvesting {n}: {type(e).__name__}: {e}")
 
     print(f"\nDone. {total} rows written across {len(names)} dataset(s).")
+    if failed:
+        sys.exit(f"{len(failed)} dataset(s) failed and were left as stored: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

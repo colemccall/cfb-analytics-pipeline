@@ -65,19 +65,34 @@ def cache_path(path: str, params: dict | None) -> str:
 
 
 def cache_read(path: str, params: dict | None) -> list | dict | None:
-    """The cached response to `path` with `params`, or None when there is none. Never touches the network."""
+    """The cached response to `path` with `params`, or None when there is none. Never touches the network.
+
+    A file that does not parse (a run killed while writing, before writes were atomic) counts as no response, so
+    the next request fetches it again instead of failing on it for ever.
+    """
     f = cache_path(path, params)
     if not os.path.exists(f):
         return None
-    with open(f) as fh:
-        return json.load(fh)
+    try:
+        with open(f) as fh:
+            return json.load(fh)
+    except ValueError:
+        print(f"  [cache] {path} {params or ''}: unreadable file ignored")
+        return None
 
 
 def cache_write(path: str, params: dict | None, data: list | dict) -> None:
-    """Store `data` as the cached response to `path` with `params`, replacing what was there."""
+    """Store `data` as the cached response to `path` with `params`, replacing what was there.
+
+    Written to a temporary file and renamed over the target, so a run killed mid-write leaves the old response (or
+    none), never a truncated one.
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(cache_path(path, params), "w") as f:
+    target = cache_path(path, params)
+    tmp = f"{target}.tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
+    os.replace(tmp, target)
 
 
 def _request(api_key: str, path: str, params: dict | None, retries: int = 5) -> list | dict:
@@ -142,13 +157,20 @@ def _get(api_key: str, path: str, params: dict | None = None, retries: int = 5) 
 
 
 def _get_list(api_key: str, path: str, params: dict | None = None) -> list:
-    """Like _get but guarantees a list return — returns [] on any error or non-list response."""
+    """Like _get but guarantees a list return: [] when the API has nothing there (HTTP 404, or a response that is
+    not a list), and an exception for anything else.
+
+    Until v4.24 every failure returned [] too, so a 500, a dropped connection or exhausted rate-limit retries read as
+    "this season has no data" and a harvest that replaces a season wrote nothing over the stored rows.
+    """
     try:
         result = _get(api_key, path, params)
-        return result if isinstance(result, list) else []
-    except Exception as e:
-        print(f"  WARNING: {path} {params} failed: {e}")
-        return []
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            print(f"  {path} {params}: not found (404), treated as no data")
+            return []
+        raise
+    return result if isinstance(result, list) else []
 
 
 # ── PUBLIC FETCH FUNCTIONS ──────────────────────────────────────────────────

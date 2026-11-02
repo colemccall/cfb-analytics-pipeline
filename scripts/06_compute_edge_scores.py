@@ -1560,12 +1560,10 @@ def run_season(season: int, api_key: str, in_progress: bool = False) -> None:
                 print(f"    {pg}: n={len(sub)} p50={p[0]:.1f} p90={p[1]:.1f} max={sub.max():.1f}")
 
     print("Building team defensive context map...")
-    try:
-        ctx_map = build_game_context_map(api_key, season)
-        print(f"  {len(ctx_map)} game-team context entries")
-    except Exception as e:
-        print(f"  Warning: {e}. Skipping context signal.")
-        ctx_map = None
+    # No try/except: a context map that cannot be built (an API failure) must stop the run. It used to print a
+    # warning and rate every defender without the signal, which is a different rating written as if it were the same.
+    ctx_map = build_game_context_map(api_key, season)
+    print(f"  {len(ctx_map)} game-team context entries")
 
     print("Computing defensive EDGE...")
     def_agg = compute_defensive_edge(season, sp_map, ctx_map=ctx_map)
