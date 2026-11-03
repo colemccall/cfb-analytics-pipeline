@@ -692,3 +692,5 @@ defensive game composite reads defensiveSACKS and defensiveTFL as decimals (0.5 
 ```
 
 A finished season keeps EDGE = sum of game scores / sqrt(games) and the games damp `max(0.25, games / 8)`.
+
+In a season in progress the curve applies to every player with three or more games and an EDGE score: `has_opp_score` (a count of stat events) and the playing-time tier are skipped for him (`part_time_edge` in script 07; `CFB_EDGE_FOR_PART_TIME=0` turns it off). A finished season is unchanged.

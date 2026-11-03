@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -1402,7 +1403,7 @@ def compute_edge_ratings(df: pd.DataFrame, pg: str) -> tuple[np.ndarray, list[di
                 "recruit_composite":  round(rec_ovr, 2),
                 "classic_system":     True,
             }
-        elif has_opp_score(row, pg):
+        elif has_opp_score(row, pg) or part_time_edge(row):
             es  = float(row.get("edge_score") or 0)
             ovr = edge_to_ovr(es, pg, row_season)
             if float(row.get("team_games") or 0) > 0:        # a season in progress: his level, believed by the games he has played
@@ -1565,7 +1566,23 @@ def apply_multi_tier_treatment(scores: np.ndarray, df: pd.DataFrame, pg: str,
     return result
 
 
-GAMES_CONF_SEASON = float(REGULAR_SEASON_GAMES)   # the season length the 8-game full-confidence rule was written on
+# v4.24, measured by scripts/validate_part_time_gates.py on a replay of 2025 (weeks 6 and 8): in a season in progress, a player with three
+# or more games and an EDGE score is rated by his EDGE level through PART_SEASON_CURVE whatever his volume of counted stats
+# (has_opp_score) or his tier says. Those two gates are volume tests built for a full season: below them a player was sent to a
+# stat-only fallback (cap 78) or blended with his recruiting prior, so a player who played well in few games was rated for how little he
+# played. For the 19.5% of part-timers this changes, error against how they went on to play fell from 15.84 to 10.01 and bias from
+# -11.08 to +1.64; the placebo that deals the changes to other players scored 10.19, worse than shipping nothing (8.98). A finished
+# season has no `team_games`, so nothing here touches it. CFB_EDGE_FOR_PART_TIME=0 turns it off (the validator's baseline run).
+EDGE_FOR_PART_TIME = os.environ.get("CFB_EDGE_FOR_PART_TIME", "1") != "0"
+
+
+def part_time_edge(row: pd.Series) -> bool:
+    """True for a part-time player of a season in progress who the switch routes through the EDGE level and the curve."""
+    if not EDGE_FOR_PART_TIME or float(row.get("team_games") or 0) <= 0:
+        return False
+    return int(row.get("games_played") or 0) > LOW_GAME_MAX and _has_valid_edge(row)
+
+GAMES_CONF_SEASON = float(REGULAR_SEASON_GAMES)  # the season length the 8-game full-confidence rule was written on
 
 
 def apply_games_confidence(scaled: np.ndarray, df: pd.DataFrame, pg: str = "") -> np.ndarray:
@@ -2056,6 +2073,8 @@ def rate_position(season: int, pg: str) -> list[dict]:
         # A low-game rating is already the blend of his stretch and the recruiting prior; the tier blend would take the
         # stretch out again (a bench-tier player would go back to recruiting alone).
         keep = basis_map.get(rkeys[i]) == "low_games"
+        if part_time_edge(season_df.iloc[i]):          # his rating is already the curve's reading of his own games: no recruiting blend on top
+            keep = True
         r["overall_rating"] = float(ratings_arr[i] if keep else adjusted_ratings[i])
         r["position_rating"] = r["overall_rating"]
 

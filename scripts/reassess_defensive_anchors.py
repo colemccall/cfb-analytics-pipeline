@@ -38,6 +38,7 @@ def load_07():
 
 
 def load_edge(path, pos_of):
+    """Read a player_edge file into {season: {position: {player: edge}}}, read-only."""
     by = defaultdict(lambda: defaultdict(dict))
     for r in json.load(open(path)):
         if r["season"] in SEASONS and r["edge_score"] is not None:
@@ -62,6 +63,7 @@ def kth(scores, k):
 
 
 def main():
+    """Print the five anchor-reassessment sections; writes nothing."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--before", required=True, type=Path)
     ap.add_argument("--after", type=Path, default=ROOT / "data" / "raw" / "player_edge.json")

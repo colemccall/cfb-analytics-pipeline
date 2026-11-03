@@ -211,3 +211,31 @@ class TestPartSeasonCurve:
         # game scores summing to 40 over 4 games make an EDGE of 40 / sqrt(4) = 20; at 12 games' worth that is 20 x sqrt(12 / 4)
         assert t06.level_edge(20.0, 4) == pytest.approx(20.0 * (12 / 4) ** 0.5)
         assert t06.level_edge(20.0, 12) == pytest.approx(20.0)
+
+
+class TestPartTimeThroughTheEdgePath:
+    """v4.24: a part-time player of a season in progress is rated by his EDGE level and the curve, not by a volume gate."""
+
+    @staticmethod
+    def _row(team_games, games=3, measured=18, edge=53.2247):
+        return pd.DataFrame([{"edge_score": edge, "stats_measured": measured, "games_played": games, "team_games": team_games,
+                              "_season": 2026, "opp_avg_sp": 15.0}])
+
+    def test_below_the_volume_gate_he_is_still_rated_by_his_level_in_season(self):
+        """Eighteen counted events is under a DL's 20, which sent him to the stat fallback (73.6 for Harkless's 93.6 level)."""
+        in_season = t07.compute_edge_ratings(self._row(8.0), "DL")[0][0]
+        level = t07.edge_to_ovr(53.2247, "DL", 2026)
+        assert in_season == pytest.approx(t07.part_season_curve(level, "DL", 3))
+        assert in_season > 76.0
+
+    def test_a_finished_season_keeps_the_volume_gate(self):
+        """No team_games: the same row below the gate goes to the stat fallback, as before."""
+        finished = t07.compute_edge_ratings(self._row(0.0), "DL")[0][0]
+        assert finished != pytest.approx(t07.part_season_curve(t07.edge_to_ovr(53.2247, "DL", 2026), "DL", 3))
+
+    def test_one_or_two_games_and_a_missing_score_are_not_routed(self):
+        row = lambda **kw: self._row(8.0, **kw).iloc[0]          # noqa: E731
+        assert t07.part_time_edge(row())
+        assert not t07.part_time_edge(row(games=2))
+        assert not t07.part_time_edge(row(edge=float("nan")))
+        assert not t07.part_time_edge(self._row(0.0).iloc[0])
