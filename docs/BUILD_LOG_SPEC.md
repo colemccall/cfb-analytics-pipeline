@@ -1,5 +1,7 @@
 # Build log — spec for `changes.html`
 
+> **v4.25:** the `changes.html` shell and the nav entry in `js/shell.js` described below were retired with the classic site. The Build Log is now the reader at `menu.html#/changes` (`menuScreensPages.js`), and `methods` ids link to `#/methods/<id>`. The entry contract and the rules for what an entry must say are unchanged and still binding.
+
 *A task brief. Hand this to Claude Code as its own session, before any backlog work.*
 
 ## Why this exists

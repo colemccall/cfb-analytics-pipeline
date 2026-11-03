@@ -2,7 +2,7 @@
 
 One page for the whole path. Each box names the script or file that owns that step; the scripts' docstrings and
 [`../scripts/README.md`](../scripts/README.md) say how. The site's own version of this page is the `data-flow` entry
-on `methods.html`.
+under About › Methods (`menu.html#/methods/data-flow`).
 
 ```
  CollegeFootballData API  (key: CFB_API_KEY from the environment / gitignored .env)

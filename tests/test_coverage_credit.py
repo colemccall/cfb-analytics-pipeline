@@ -240,25 +240,30 @@ class TestCoverageShareSurvivesToTheUI:
 
 
 class TestTheFrontendPrintsTheSameWeights:
-    """A defensive back's overall IS his three archetypes, so the modal prints the
+    """A defensive back's overall IS his three archetypes, so the player card prints the
     weights beside the sub-ratings. Those weights are a hand-kept copy in the other
     repo — nothing at runtime reconciles them, and a UI that itemises a rating with
     the wrong weights is worse than one that doesn't itemise it at all.
+
+    The copy lives in menuCard.js (MENU_ARCHETYPE_WEIGHTS) since the classic modal in
+    playerSearch.js was retired in v4.25. The app being present while the file is not
+    is a failure, not a skip: a guard that goes quiet when its target moves guards nothing.
     """
 
-    APP_JS = (Path(__file__).parent.parent.parent
-              / "cfb-analytics-app" / "js" / "playerSearch.js")
+    APP = Path(__file__).parent.parent.parent / "cfb-analytics-app"
+    APP_JS = APP / "js" / "menuCard.js"
 
     def test_weights_match_script_06(self):
-        if not self.APP_JS.exists():
+        if not self.APP.exists():
             pytest.skip("cfb-analytics-app not present in this checkout")
+        assert self.APP_JS.exists(), "cfb-analytics-app/js/menuCard.js is missing: the archetype weights guard has nothing to read"
         src = self.APP_JS.read_text(encoding="utf-8")
-        block = re.search(r"ARCHETYPE_WEIGHTS\s*=\s*\{(.*?)\n\};", src, re.S)
-        assert block, "playerSearch.js has no ARCHETYPE_WEIGHTS"
+        block = re.search(r"MENU_ARCHETYPE_WEIGHTS\s*=\s*\{(.*?)\n\};", src, re.S)
+        assert block, "menuCard.js has no MENU_ARCHETYPE_WEIGHTS"
 
         for pg, want in SECONDARY_ARCHETYPE_WEIGHTS.items():
             row = re.search(rf"\b{pg}:\s*\{{([^}}]*)\}}", block.group(1))
-            assert row, f"playerSearch.js ARCHETYPE_WEIGHTS has no {pg}"
+            assert row, f"menuCard.js MENU_ARCHETYPE_WEIGHTS has no {pg}"
             got = {}
             for k, v in re.findall(r"(\w+):\s*([\d./\s]+?)(?:,|$)", row.group(1)):
                 got[k] = eval(v.strip(), {"__builtins__": {}})  # noqa: S307 — "1 / 3"
