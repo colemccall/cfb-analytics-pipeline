@@ -57,6 +57,6 @@ Before a refresh, copy `data/raw` and `data/computed` aside: they are gitignored
 | Step | Failure | Check |
 |---|---|---|
 | API → raw | a failed request read as "no data"; a week merged twice | `validate_week_ingest.py`; the merge is idempotent by key |
-| raw → a week-N snapshot | the snapshot reads something from after week N | `validate_snapshot_invariance.py` |
+| raw → a week-N snapshot | the snapshot reads something from after week N, including a finished season's postseason (numbered weeks 1-5 again; v4.25.1) | `validate_snapshot_invariance.py` (a) game counts, (b) later weeks scrambled, (c) the postseason scrambled |
 | computed → app | `NaN` tokens, two seasons in one file, orphaned files | `tests/test_export_contract.py` |
 | app → page | a missing number drawn as 0 | the UI rule: missing renders "—" |

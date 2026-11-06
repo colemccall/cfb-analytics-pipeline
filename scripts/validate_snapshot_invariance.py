@@ -18,9 +18,19 @@ cannot be told apart from a real one. Two checks:
                             snapshot that uses only weeks 1..N cannot move: every rating that does move was read from a
                             channel the cut does not cover, and the players are listed.
 
-    python scripts/validate_snapshot_invariance.py --season 2026 --weeks 3 6 9 --placebo-week 3
+  (c) postseason placebo    for a FINISHED season (v4.25.1): the week-N snapshot is built twice with 17b's own snapshot(), once on the
+                            real data and once after every postseason score has been replaced with a random one. The
+                            snapshot is a regular-season object, so no team reading (headline, power, results, roster, stats,
+                            record) may move. Checks (a) and (b) run the player chain only and cut games by regular-season
+                            week, which is why a leak through script 10's results reading (it solves strengths from every
+                            scored game on file) went unseen until the pre-playoff marker test: it let the bowls and the
+                            playoff into every week of the 2024 and 2025 replays.
 
-Exit code 1 if either check fails. Takes a few minutes (one 06 run per week, two 06+07 runs for the placebo).
+    python scripts/validate_snapshot_invariance.py --season 2026 --weeks 3 6 9 --placebo-week 3
+    python scripts/validate_snapshot_invariance.py --season 2025 --weeks 3 --placebo-week 3 --postseason-weeks 5 15
+
+Exit code 1 if any check fails. Takes a few minutes (one 06 run per week, two 06+07 runs for the placebo, two full snapshots per
+postseason week).
 """
 
 import argparse
@@ -56,11 +66,11 @@ def _write(path: Path, rows: list) -> None:
 
 
 def mask_games(games: list, season: int, week: int) -> list:
-    """games.json as it stood after `week`: later regular-season scores removed (17b's rule)."""
+    """games.json as it stood after `week`: the scores of later regular-season games and of every postseason game removed (17b's rule)."""
     out = []
     for g in games:
         g = dict(g)
-        if g.get("season") == season and g.get("season_type") == "regular" and (g.get("week") or 99) > week:
+        if g.get("season") == season and (g.get("season_type") != "regular" or (g.get("week") or 99) > week):
             g["home_score"] = g["away_score"] = None
         out.append(g)
     return out
@@ -146,6 +156,8 @@ def check_placebo(sandbox: Path, games: list, stats: list, season: int, week: in
     _write(sandbox / "raw" / "games.json", masked)
     latest_week = max(g["week"] for g in games if g.get("season") == season and g.get("season_type") == "regular"
                       and (g.get("home_score") is not None or g.get("away_score") is not None))
+    finished = any(g.get("season") == season and g.get("season_type") == "postseason"
+                   and (g.get("home_score") is not None or g.get("away_score") is not None) for g in games)   # 17b's rule
     adv_path = sandbox / "raw" / "team_advanced_season.json"
     adv = _read(adv_path)
 
@@ -169,7 +181,7 @@ def check_placebo(sandbox: Path, games: list, stats: list, season: int, week: in
             note = f"{n} teams' season advanced stats dealt to other teams"
         _write(sandbox / "raw" / "stats.json", stats_in)
         _write(adv_path, adv_in)
-        t17b.limit_to_week(sandbox, season, masked, week, latest_week)
+        t17b.limit_to_week(sandbox, season, masked, week, None if finished else latest_week)
         run("06_compute_edge_scores.py", ["--season", str(season), "--in-progress", "--through-week", str(week)], sandbox)
         run("07_compute_player_ratings.py", ["--season", str(season)], sandbox)
         arms[label] = ratings_of(sandbox, season)
@@ -192,13 +204,60 @@ def check_placebo(sandbox: Path, games: list, stats: list, season: int, week: in
     return ok
 
 
+TEAM_FIELDS = ("overall_rating", "power_rating", "roster_half", "stats_half", "results_half", "wins", "losses")
+
+
+def scramble_postseason(season: int, seed: int = 11):
+    """A snapshot() `mutate` hook: every postseason game of `season` gets random scores (so who won, and by how much, is noise)."""
+    rng = np.random.default_rng(seed)
+
+    def mutate(games: list) -> None:
+        for g in games:
+            if g.get("season") == season and g.get("season_type") == "postseason":
+                g["home_score"], g["away_score"] = (int(x) for x in rng.integers(0, 60, 2))
+    return mutate
+
+
+def check_team_postseason(season: int, weeks: list) -> bool:
+    """Check (c): a finished season's week-N team readings must not move when its postseason is scrambled; True if none does."""
+    live17 = t17b._module("17_live_season.py", "live17")
+    t10 = t17b._module("10_compute_team_ratings.py", "t10")
+    t07 = t17b._module("07_compute_player_ratings.py", "t07")
+    ok = True
+    for wk in weeks:
+        base = t17b.snapshot(season, wk, wk, live17, t10, t07)
+        alt = t17b.snapshot(season, wk, wk, live17, t10, t07, mutate=scramble_postseason(season))
+        a = {t["team_id"]: t for t in base["export"]["teams"]}
+        b = {t["team_id"]: t for t in alt["export"]["teams"]}
+        moved: dict = {f: [] for f in TEAM_FIELDS}
+        for tid in set(a) & set(b):
+            for f in TEAM_FIELDS:
+                x, y = a[tid].get(f), b[tid].get(f)
+                if (x is None) != (y is None) or (x is not None and abs(float(x) - float(y)) > MOVE_TOLERANCE):
+                    moved[f].append((abs(float(x or 0) - float(y or 0)), a[tid].get("school") or tid, x, y))
+        only = len(set(a) ^ set(b))
+        status = "PASS" if not any(moved.values()) and not only else "FAIL"
+        ok &= status == "PASS"
+        summary = "; ".join(f"{f} {len(v)} teams (largest {max(v)[0]:.2f})" for f, v in moved.items() if v) or "none moved"
+        print(f"  {status}  (c) week {wk}, postseason scrambled: {len(set(a) & set(b))} teams in both runs; {summary}; {only} in one run only")
+        for f in ("overall_rating", "results_half"):
+            for d, name, x, y in sorted(moved[f], reverse=True)[:4]:
+                print(f"        {f}: {name}: {x} -> {y}")
+    return ok
+
+
 def main() -> None:
-    """Run checks (a) and (b) in one private copy of the data; exit 1 on any failure."""
+    """Run checks (a) and (b) in one private copy of the data, and (c) when asked; exit 1 on any failure."""
     ap = argparse.ArgumentParser(description="Does a week-N snapshot see only weeks 1..N?")
     ap.add_argument("--season", type=int, required=True)
     ap.add_argument("--weeks", type=int, nargs="+", default=[3, 6, 9], help="weeks for the games-played check (a)")
     ap.add_argument("--placebo-week", type=int, default=3, help="week for the future-scramble placebo (b)")
+    ap.add_argument("--postseason-weeks", type=int, nargs="*", default=[],
+                    help="weeks for the postseason placebo (c), for a finished season; omitted, (c) is not run")
+    ap.add_argument("--only-postseason", action="store_true", help="run only check (c)")
     args = ap.parse_args()
+    if args.only_postseason:
+        sys.exit(0 if check_team_postseason(args.season, args.postseason_weeks) else 1)
 
     games = _read(ROOT / "data" / "raw" / "games.json")
     stats = _read(ROOT / "data" / "raw" / "stats.json")
@@ -218,7 +277,8 @@ def main() -> None:
         ok_b = check_placebo(sandbox, games, stats, args.season, args.placebo_week, week_of_game, pg_of_ps, names)
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
-    sys.exit(0 if ok_a and ok_b else 1)
+    ok_c = check_team_postseason(args.season, args.postseason_weeks) if args.postseason_weeks else True
+    sys.exit(0 if ok_a and ok_b and ok_c else 1)
 
 
 if __name__ == "__main__":

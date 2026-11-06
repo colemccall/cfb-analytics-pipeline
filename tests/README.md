@@ -23,6 +23,8 @@ change as the output it judges. It waits on the owner's decision.
 | `test_low_game_ratings.py`, `test_slots_and_pace.py`, `test_player_inputs_v420.py` | Part-season players: the low-game rule, the in-season pace scale, share of team games. |
 | `test_team_ratings.py`, `test_schedule_adjust.py`, `test_results_rating.py`, `test_line_unit.py` | The team rating, its schedule adjustment, power, and the line unit that replaced the withdrawn OL rating. |
 | `test_weekly_progression.py` | Week-by-week snapshots: box-score totals equal `/stats/season`, the game grades, records through a week, the last week equals the live file. |
+| `test_playoff_markers.py` | The pre-playoff marker test: its scoring on made-up leagues, and the data it scores (twelve selected teams and one champion a season, eleven playoff games, a week-15 snapshot for every selected team, the spread's sign). |
+| `test_ratings_spec.py` | `docs/RATINGS_SPEC.md`'s constants table equals what `scripts/spec_constants.py` generates now; owner and frozen labels; the site's `system-spec` entry exists. |
 | `test_store_*.py`, `test_clean_nan.py`, `test_api_cache.py` | The persistence layer: per-season replace, `CFB_DATA_DIR`, the shutout rule, the NaN rule, the cache-bypass switch. |
 | `test_stat_agg.py`, `test_matching.py`, `test_interruptions.py`, `test_coaching.py`, `test_shrinkage.py`, `test_headshots.py` | Helpers in `utils/` and the research scripts. |
 | `test_docstrings.py` | The documentation rule: every module-level function over five lines has a docstring. |

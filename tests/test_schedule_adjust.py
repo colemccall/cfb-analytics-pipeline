@@ -187,3 +187,22 @@ class TestSeasonInProgress:
 
     def test_no_games_is_not_in_progress(self):
         assert not _s10.season_in_progress(self._games(unscored_after=0).iloc[0:0], 2026)
+
+    def test_late_games_between_two_non_fbs_teams_do_not_make_a_snapshot_look_finished(self):
+        # v4.25.1: 2025 holds four lower-division games stored as regular week 1 and dated December. In a week-N replay their scores
+        # stay, so the last scored game looked like the season's last and every snapshot was treated as a played season.
+        import pandas as pd
+        g = self._games(unscored_after=400, season=2025).assign(home_team_id=1, away_team_id=2)
+        odd = pd.DataFrame([dict(season=2025, season_type="regular", game_date="2025-12-13T18:00:00Z", home_score=21, away_score=13,
+                                 home_team_id=900, away_team_id=901)] * 4)
+        both = pd.concat([g, odd], ignore_index=True)
+        assert not _s10.season_in_progress(both, 2025)                  # the old reading: fooled by the December games
+        assert _s10.season_in_progress(both, 2025, fbs={1, 2})           # FBS games only: still 400 to play
+        assert not _s10.season_in_progress(g.assign(home_score=30, away_score=20), 2025, fbs={1, 2})
+
+    def test_counting_fbs_games_a_championship_week_is_still_in_progress_and_army_navy_alone_is_not(self):
+        # After week 14 the FBS games left are the conference championships (12 in 2024, 10 in 2025); after week 15, one or two.
+        g = self._games(unscored_after=10, season=2025).assign(home_team_id=1, away_team_id=2)
+        assert _s10.season_in_progress(g, 2025, fbs={1, 2})
+        assert not _s10.season_in_progress(self._games(unscored_after=2, season=2025).assign(home_team_id=1, away_team_id=2), 2025, fbs={1, 2})
+        assert _s10.IN_PROGRESS_MIN_FBS < 10 <= _s10.IN_PROGRESS_MIN_ALL

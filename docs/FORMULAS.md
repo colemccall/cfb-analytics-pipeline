@@ -694,3 +694,31 @@ defensive game composite reads defensiveSACKS and defensiveTFL as decimals (0.5 
 A finished season keeps EDGE = sum of game scores / sqrt(games) and the games damp `max(0.25, games / 8)`.
 
 In a season in progress the curve applies to every player with three or more games and an EDGE score: `has_opp_score` (a count of stat events) and the playing-time tier are skipped for him (`part_time_edge` in script 07; `CFB_EDGE_FOR_PART_TIME=0` turns it off). A finished season is unchanged.
+
+---
+
+## v4.25.1 - what a week-N snapshot holds; the spec's constants table (mirrors METHODS `weekly-progression`, `system-spec`)
+
+```
+week-N snapshot of season S (script 17b):
+  blank the scores of every game of S with  season_type != "regular"  OR  week > N
+      (postseason weeks are numbered 1, 2, ... again, so they are matched on the type, never on the week number)
+  finished(S) = S has a scored postseason game
+      a finished season's season totals include the postseason, so no week of it reads them: totals are rebuilt from game rows through N
+  the week's game shown for a team = its regular-season game of week N
+
+season_in_progress(games, S, fbs) = unscored regular-season games with an FBS team, dated after the last scored one, >= 5
+      (fbs = the teams table; games between two lower-division teams are not counted; IN_PROGRESS_MIN_FBS = 5,
+       IN_PROGRESS_MIN_ALL = 20 when every game is counted)
+```
+
+The FBS limit exists because four 2025 games between two lower-division teams are stored as regular-season week 1 and dated 2025-12-13. A week-N
+snapshot never blanks a week-1 score, so without the limit every 2025 snapshot looked like a played season: the rating part of power was on and the
+part-season shrink was off. Counting FBS games only, the minimum drops from 20 to 5: a postponed finale or two is fewer than 5 FBS games, and a
+conference-championship week holds 10 to 12 (12 after 2024's week 14, 10 after 2025's; after week 15, 2 and 1). Every finished season from 2008 to
+2025 has 0 such games, so no production verdict changes, and 2026 is in progress at every week either way. On the snapshots, 2024 keeps the verdict
+it had at every week (in progress through week 14, played after week 15), and 2025 weeks 1 to 14 change from played to in progress, matching it.
+Week 15, the marker test's snapshot, reads as played in both seasons under either rule.
+
+The constants table in `RATINGS_SPEC.md` §12 is `scripts/spec_constants.py` `rows()`, read from the live modules. `tests/test_ratings_spec.py`
+fails when the spec's copy differs.

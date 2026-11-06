@@ -288,20 +288,35 @@ SHRINK_GAMES_K = 8.0
 SEASON_GAMES = REGULAR_SEASON_GAMES
 
 
-def season_in_progress(games: "pd.DataFrame", season: int) -> bool:
+IN_PROGRESS_MIN_ALL = 20     # unscored games still to come, counting every regular-season game on file (lower divisions included)
+IN_PROGRESS_MIN_FBS = 5      # the same, counting only games with an FBS team: a postponed finale or two is fewer, a conference-
+                             # championship week holds 10 to 12 (2024: 12 after week 14, 2025: 10; after week 15: 2 and 1)
+
+
+def season_in_progress(games: "pd.DataFrame", season: int, fbs=None) -> bool:
     """True when the season still has regular-season games to play: unscored games dated after the last scored one.
 
     A few unscored games before that date are cancellations (2020 has none left over, 2024 has 14, 2025 has 6) and a played season
-    has none after it; 2026 through week 8 has 1,144. At least 20 are required so a postponed finale is not mistaken for a season.
+    has none after it; 2026 through week 8 has 1,144. A minimum is required so a postponed finale is not mistaken for a season:
+    IN_PROGRESS_MIN_ALL over every game, IN_PROGRESS_MIN_FBS when `fbs` is given.
+
+    `fbs` (team ids) limits the test to games with an FBS team in them. v4.25.1: the file holds four 2025 games between two
+    lower-division teams stored as regular-season week 1 and dated 2025-12-13; a week-N replay never blanks a week-1 score, so
+    without the limit every 2025 snapshot looked like a played season (rating part on, no part-season shrink). With the limit
+    and its minimum of 5, every finished season 2008-2025 has 0 such games (unchanged), 2024's replay gets the verdict it had
+    at every week (in progress through week 14, played after week 15), and 2025's replay now matches it.
     """
     g = games[(games["season"] == season) & (games["season_type"] == "regular")]
+    if fbs is not None and not g.empty:
+        g = g[g["home_team_id"].isin(fbs) | g["away_team_id"].isin(fbs)]
     if g.empty:
         return False
     d = pd.to_datetime(g["game_date"], errors="coerce", utc=True)
     scored = g["home_score"].notna() & g["away_score"].notna()
     if not scored.any():
         return False
-    return int(((~scored) & (d > d[scored].max())).sum()) >= 20
+    need = IN_PROGRESS_MIN_ALL if fbs is None else IN_PROGRESS_MIN_FBS
+    return int(((~scored) & (d > d[scored].max())).sum()) >= need
 
 
 def partial_weight(games) -> float:
@@ -1071,7 +1086,7 @@ def run_season(season: int, api_key: str) -> None:
     m_off = float(np.mean([h[0] for h in halves if h[0] is not None])) if any(h[0] is not None for h in halves) else None
     m_def = float(np.mean([h[1] for h in halves if h[1] is not None])) if any(h[1] is not None for h in halves) else None
     m_line = float(np.mean([v[0] for v in line_map.values() if v[0] is not None])) if line_map else None
-    in_progress = season_in_progress(read_raw("games"), season)
+    in_progress = season_in_progress(read_raw("games"), season, fbs={int(t[0]) for t in teams})
     pw = {t: partial_weight(tss_map[t].get("games")) if in_progress else 1.0 for t in tss_map}
     if any(w < 1.0 for w in pw.values()):
         print(f"  Season in progress: part-season readings keep {min(pw.values()):.2f}-{max(pw.values()):.2f} of their distance from the league mean")

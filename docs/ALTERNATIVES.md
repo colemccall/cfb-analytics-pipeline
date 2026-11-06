@@ -376,3 +376,22 @@ Mirrors the `live-season` and `weekly-progression` METHODS entries and the v4.24
 | Re-derive the EDGE/DL/LB anchors after the decimal sack fix (rank-preserving, `scripts/reassess_defensive_anchors.py`) | Proposed, not applied | Holds 85+ per season at EDGE 36 / DL 40 / LB 46 instead of 42 / 53 / 58. Scores are not more repeatable (DL 0.458 to 0.478, others within 0.004), so the evidence does not choose between the counts. CB/S/DB moved 0.8-2.4%, left alone. Needs a full recompute and its own release |
 | Keep the volume gate and the tier in front of the part-season curve | Replaced | In 2026 35% of players with 3+ games and an EDGE score were below the gate (11.5 points under their curve rating). On a 2025 replay the change moves 19.5% of part-time player-cuts: error against the later level 15.84 to 10.01, bias -11.08 to +1.64; placebo 10.19 against 8.98 for no change. Cost: bias +13.2 for players who then play under a 60 level |
 | Skip only the playing-time tier on part-season ratings | Rejected | Moved 0.0% of players (8.98 either way): a starter-tier player is 100% formula. The gate in front of it was the cause |
+
+## v4.25.1 - the spec, the marker test, the replays
+
+Mirrors the `system-spec` and `weekly-progression` METHODS entries and the v4.25.1 CHANGES entry. The replay checks are
+`scripts/validate_snapshot_invariance.py` check (c), which scrambles a finished season's postseason scores and asks whether any week-N team
+reading moves.
+
+| Option | Status | Why |
+|---|---|---|
+| Blank later games by week number only (v4.22 to v4.25) | Replaced | Postseason games are numbered weeks 1 to 5 again, so their scores stayed in every snapshot of a finished season and script 10 solved the results reading from them. Scrambling the 2025 postseason moved the headline of 136 of 136 teams at week 5 (largest 6.10) and 135 at week 15 (4.22), results 135 and 136 (9.16, 6.31). After the fix: 0 of 136 at both weeks |
+| Count every regular-season game in `season_in_progress` | Replaced | Four 2025 lower-division games stored as week 1 and dated in December made every 2025 snapshot look like a played season. Counting FBS games only (minimum 5) changes no production verdict 2008-2026, gives 2024's replay the verdict it had at every week, and makes 2025's match it |
+| Count FBS games only but keep the minimum at 20 | Rejected | A conference-championship week has 10 to 12 FBS games left, so it would read as a played season: 2024's week 14 would change and a live season would switch to the finished-season method a week early |
+| Special-case 2025 (or the four games) instead of a rule | Rejected | One rule for every season; the next mislabelled game would need another special case |
+| Relabel the four 2025 games in `games.json` | Not done | An edit to a gitignored raw file that the next harvest would undo; listed in the spec's outstanding issues |
+| Score the marker test with the published season ratings | Rejected | They include the postseason and the line unit; the test needs what was known when the field was picked |
+| Snapshot after week 14 for the marker test | Rejected | Week 15 holds the conference championships the committee saw before it picked; week 16 (Army–Navy) comes after the pick and is excluded |
+| Bracket accuracy as the headline marker | Rejected | 11 games a season; picks over 22 games and selection over 24 teams are reported with intervals and a placebo instead |
+| Make the marker test a gate now | Blocked | The owner's decision (question 3 in the spec); a gate is never added in the release it first judges |
+| Type the spec's constants table by hand | Rejected | A hand-typed table drifts: the Methods entry `opponent-strength` gave the cross-conference weight as 1.0 until v4.18 while the code had 1.5. The table is generated and a test fails on a difference |

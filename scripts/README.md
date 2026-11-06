@@ -49,8 +49,14 @@ The whole flow, from the API to the pages, is in [`../docs/DATA_FLOW.md`](../doc
 ## Checks — read-only, each reproduces a constant or guards a seam
 
 Run before trusting a refresh: `validate_week_ingest.py` (a staged refresh against the stored weeks),
-`validate_snapshot_invariance.py` (a week-N snapshot sees only weeks 1..N), `report_rating_moves.py` (what moved, and
-whether past weeks held still), `validate_ratings.py --season Y` (the rating distribution).
+`validate_snapshot_invariance.py` (a week-N snapshot sees only weeks 1..N; `--postseason-weeks` adds check (c), a finished
+season's postseason scrambled), `report_rating_moves.py` (what moved, and whether past weeks held still),
+`validate_ratings.py --season Y` (the rating distribution).
+
+The ratings spec: `validate_playoff_markers.py` (the pre-playoff marker test: each reading's week-15 snapshot of 2024 and
+2025 against the CFP field, the playoff games and the bowls; `--write-doc` writes `docs/PLAYOFF_MARKERS_2024_2025.md`) and
+`spec_constants.py` (the constants table in `docs/RATINGS_SPEC.md`, generated from the code; `--update-spec` rewrites it).
+`report_replay.py --season Y` describes how a replayed finished season held up week by week.
 
 The others each reproduce a constant named in their docstring, so a constant can be re-measured rather than
 trusted: `validate_pace*.py` (the in-season scale), `validate_low_game_weights.py`, `validate_fcs_weight.py`,

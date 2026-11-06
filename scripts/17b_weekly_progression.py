@@ -3,12 +3,15 @@
 Script 17 rates a season to date. This script runs the same chain once per completed week N, in a private copy of the data in
 which nothing after week N can be seen:
 
-    games.json   scores of games after week N removed (the schedule stays, so the pace scale and the "season in progress" test
-                 see the season as it stood)
+    games.json   scores of games after week N removed, and of every postseason game (the schedule stays, so the "season in
+                 progress" test sees the season as it stood); before v4.25.1 the postseason scores stayed, and script 10's
+                 results reading, which solves from every scored game on file, let a finished season's bowls and playoff into
+                 every week of its replay
     stats.json   per-game stat rows after week N removed; for every week but the latest the season-total rows keep only their
                  usage / PPA / award fields, so script 07 rebuilds each player's production from his games through N (before
                  v4.24 it read the whole season's totals into every week, and rated players on games they had not yet
-                 played), and postseason totals are removed. The latest week keeps its totals: they are cumulative to it.
+                 played), and postseason totals are removed. The latest week of a season in progress keeps its totals: they are
+                 cumulative to it. A finished season keeps none at any week (they run through the postseason).
     computed/    the season's own edge rows in ratings.json and team_ratings.json removed, so nothing from a finished run
                  can survive in a snapshot (script 07 only replaces the players it re-rates)
     team_advanced_season.json   (the defenders' opportunity index) the season's rows removed for every week but the latest.
@@ -118,10 +121,12 @@ def _run(script: str, args: list, sandbox: Path) -> int:
     return sum(1 for ln in text.splitlines() if ln.startswith("  GET"))
 
 
-def limit_to_week(sandbox: Path, season: int, games: list, week: int, latest_week: int) -> dict:
+def limit_to_week(sandbox: Path, season: int, games: list, week: int, latest_week) -> dict:
     """Cut the sandbox's stats and computed files to what was known after regular-season `week`; return what was cut.
-    `latest_week` is the newest complete week: only there are the season's totals (player and team advanced stats, all
-    cumulative to the day they were fetched) in range, so only there are they kept.
+    `latest_week` is the newest complete week of a season IN PROGRESS: only there are the season's totals (player and team
+    advanced stats, all cumulative to the day they were fetched) in range, so only there are they kept. It is None for a finished
+    season: its totals run through the postseason, so they are in range at no week (v4.25.1; before it, week 15 of 2024 and 2025
+    kept them).
 
     Per-game stat rows of later games go. A season-total row (the API's cumulative figures, fetched on one day) cannot be
     cut to a week, so only its usage / PPA / award fields stay (script 07 then sums the player's own game rows through the
@@ -130,7 +135,8 @@ def limit_to_week(sandbox: Path, season: int, games: list, week: int, latest_wee
     """
     week_of = {g["id"]: g.get("week") for g in games if g.get("season") == season and g.get("season_type") == "regular"}
     cut = {"game_rows": 0, "totals_trimmed": 0, "postseason_totals": 0, "advanced_rows": 0}
-    if week < latest_week:
+    totals_in_range = latest_week is not None and week >= latest_week
+    if not totals_in_range:
         apath = sandbox / "raw" / "team_advanced_season.json"
         rows = json.loads(apath.read_text(encoding="utf-8"))
         left = [r for r in rows if r.get("season") != season]
@@ -146,11 +152,11 @@ def limit_to_week(sandbox: Path, season: int, games: list, week: int, latest_wee
                 kept.append(r)
             else:
                 cut["game_rows"] += 1
-        elif r.get("stat_type") == "season_aggregate" and week < latest_week:
+        elif r.get("stat_type") == "season_aggregate" and not totals_in_range:
             data = parse_stat_data(r.get("data"))
             kept.append({**r, "data": {k: v for k, v in data.items() if k in META_KEYS}})
             cut["totals_trimmed"] += 1
-        elif r.get("stat_type") == "postseason_aggregate" and week < latest_week:
+        elif r.get("stat_type") == "postseason_aggregate" and not totals_in_range:
             cut["postseason_totals"] += 1
         else:
             kept.append(r)
@@ -165,19 +171,31 @@ def limit_to_week(sandbox: Path, season: int, games: list, week: int, latest_wee
     return cut
 
 
-def snapshot(season: int, week: int, latest_week: int, live17, t10, t07) -> dict:
-    """Run the chain as of `week` and return that week's teams, players and game grades."""
+def snapshot(season: int, week: int, latest_week: int, live17, t10, t07, mutate=None) -> dict:
+    """Run the chain as of `week` and return that week's teams, players and game grades.
+
+    `mutate(games)` (a test hook, never used by a run) alters the sandbox's game rows in place BEFORE the cut: the invariance
+    validator scrambles the postseason with it to prove a snapshot cannot see it.
+    """
     sandbox = Path(tempfile.mkdtemp(prefix=f"wk{week}_"))
     try:
         for sub in ("raw", "computed"):
             shutil.copytree(ROOT / "data" / sub, sandbox / sub)
         gpath = sandbox / "raw" / "games.json"
         games = json.loads(gpath.read_text(encoding="utf-8"))
+        if mutate is not None:
+            mutate(games)
+        # A season whose postseason has been played is FINISHED: its season totals (player and team) include the postseason, so
+        # no week of it has totals in range (limit_to_week), and the scores of every non-regular game go with the later weeks'.
+        finished = any(g.get("season") == season and g.get("season_type") == "postseason"
+                       and (g.get("home_score") is not None or g.get("away_score") is not None) for g in games)   # a shutout stores one side's 0 as missing
         for g in games:
-            if g.get("season") == season and g.get("season_type") == "regular" and (g.get("week") or 99) > week:
+            # Postseason weeks are numbered 1, 2, ... again, so they must be matched on the type, not the week: before v4.25.1
+            # their scores stayed in every snapshot and script 10 (which solves results from every scored game on file) read them.
+            if g.get("season") == season and (g.get("season_type") != "regular" or (g.get("week") or 99) > week):
                 g["home_score"] = g["away_score"] = None
         gpath.write_text(json.dumps(games, separators=(",", ":")), encoding="utf-8")
-        limit_to_week(sandbox, season, games, week, latest_week)
+        limit_to_week(sandbox, season, games, week, None if finished else latest_week)
         gdf = fill_shutouts(pd.DataFrame(games))     # a game's 0 is stored as missing; later weeks' scores are both missing and stay so
 
         gets = _run("06_compute_edge_scores.py", ["--season", str(season), "--in-progress", "--through-week", str(week)], sandbox)
@@ -206,7 +224,7 @@ def snapshot(season: int, week: int, latest_week: int, live17, t10, t07) -> dict
         # every team script 10 knows (not only the ones with a row this week): a game's opponent may have results and no rating yet
         strength = ostr.solve(scored, conf_of, [int(t) for t in teams_raw["id"]])
         return {"week": week, "export": export, "progress": progress, "strength": strength,
-                "scores": scores.merge(ps, on="player_season_id"), "games": gdf[(gdf["season"] == season) & (gdf["week"] == week)]}
+                "scores": scores.merge(ps, on="player_season_id"), "games": gdf[(gdf["season"] == season) & (gdf["week"] == week) & (gdf["season_type"] == "regular")]}
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
 
