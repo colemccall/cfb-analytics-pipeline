@@ -31,6 +31,11 @@ under About › Methods (`menu.html#/methods/data-flow`).
    cfb-analytics-app/data/*.json   players_{s} · rosters_{s} · teams · schedules_{s} · live_2026 ·
                                    weekly_*_{s} · gamelog_{s}_{team} · manifest · …
           │
+          ├─▶ 21 export contract → data/exports/v1/ (schema, teams, players, manifest) — read by the sibling apps,
+          │      never by this site; tests/test_export_contract_v1.py
+          ├─▶ 22 freeze → data/snapshots/{s}-wk{NN}-{release}/ — write-once, re-hashed on every run;
+          │      tests/test_snapshots.py (docs/SNAPSHOTS.md)
+          │
           ▼   js/dataLoader.js — the only code in the app that fetches
    menu.html  (js/menu*.js screens; js/methods.js, findings.js, changes.js explain the numbers)
 ```
@@ -47,6 +52,8 @@ python scripts/17_live_season.py --season 2026 --offline                  # live
 python scripts/17b_weekly_progression.py --season 2026                    # weekly_*_2026.json (every week, ~30 min)
 python scripts/12_export_frontend_json.py --season 2026                   # the app's per-season files
 python scripts/12_export_frontend_json.py --season 2026 --game-logs       # gamelog_2026_{team}.json
+python scripts/21_export_contract.py                                      # data/exports/v1/ for the sibling apps
+python scripts/22_freeze_snapshot.py                                      # data/snapshots/2026-wkNN-<release>/, write-once
 python scripts/report_rating_moves.py --season 2026 --before <copy of data/computed taken first>
 ```
 

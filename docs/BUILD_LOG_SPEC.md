@@ -104,3 +104,37 @@ produced it.
 - A `METHODS`-style entry is **not** required for this change — but a `CHANGES`
   entry for building the changes page is, and it should be the first one written
   by hand rather than backfilled.
+
+---
+
+## v4.26: entries for work nobody asked for (`origin: "claude-initiative"`)
+
+The owner's rule (2026-11-06): any work Claude does that the owner did not explicitly ask for gets its own Build Log entry,
+flagged so it can be seen and filtered. The goal is that anyone can open the site and understand what changed, why and how,
+without reading commits or code. An initiative entry is an ordinary entry (every field above, `tried` and `unfixed`
+still required, because CLAUDE.md §2 asks an off-script change to name the alternative it rejected), plus:
+
+```
+origin      "claude-initiative"                 absent means the owner asked for the work
+initiative  {
+  what       one sentence: what was done
+  why        why it was worth doing unasked
+  how        { steps: [...], files: [...] }      the steps in order, and every file touched
+  evidence   what was measured, with numbers, or the exact string "untested"
+  reverse    how to undo it: the files to revert, any data to regenerate, what else it would undo
+  questions  [ ... ]                             open questions for the owner; at least one, "None." if there are none
+}
+```
+
+Rules:
+
+- **One initiative per entry.** Two unrelated things done unasked are two entries, so each can be reversed alone.
+- **The owner's own request is not an initiative**, even when Claude chose how to do it. Choosing a folder layout for snapshots the
+  owner asked for is part of the request; recovering past weeks from git history when nobody asked is an initiative.
+- **If an idea would touch a standing decision** (absolute anchors, era buckets, NIL, missing = unknown, a frozen constant in
+  CLAUDE.md §3), it is not built: stop and ask. An idea not built goes to `docs/IDEAS.md`, not to the Build Log.
+- **Rendering:** the Build Log's list marks initiative entries with a "Claude initiative" chip, the entry opens with an initiative
+  panel (what, why, how, evidence, reverse, questions) in a distinct frame, and a row of filter buttons above the list shows all
+  entries, the requested ones or the initiatives. The frame and chip use existing tokens; no colour literal is added.
+- **Checked:** `tools/registry-check.mjs` fails an entry whose `origin` is not one of the known values, and an initiative entry
+  missing any initiative field, with `evidence` empty, or with no question.

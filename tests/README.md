@@ -25,6 +25,8 @@ change as the output it judges. It waits on the owner's decision.
 | `test_weekly_progression.py` | Week-by-week snapshots: box-score totals equal `/stats/season`, the game grades, records through a week, the last week equals the live file. |
 | `test_playoff_markers.py` | The pre-playoff marker test: its scoring on made-up leagues, and the data it scores (twelve selected teams and one champion a season, eleven playoff games, a week-15 snapshot for every selected team, the spread's sign). |
 | `test_ratings_spec.py` | `docs/RATINGS_SPEC.md`'s constants table equals what `scripts/spec_constants.py` generates now; owner and frozen labels; the site's `system-spec` entry exists. |
+| `test_snapshots.py` | Frozen snapshots: never overwritten, a run that changes nothing is refused, every step classified (data, model, both), every snapshot on disk still hashes to its manifest; the model fingerprint ignores docstrings and comments and sees code. |
+| `test_export_contract_v1.py` | The sibling-app contract: every field in the schema in order, every value typed, every null with a reason from the vocabulary, linemen withheld rather than defaulted, no-box-score players null rather than zero. |
 | `test_store_*.py`, `test_clean_nan.py`, `test_api_cache.py` | The persistence layer: per-season replace, `CFB_DATA_DIR`, the shutout rule, the NaN rule, the cache-bypass switch. |
 | `test_stat_agg.py`, `test_matching.py`, `test_interruptions.py`, `test_coaching.py`, `test_shrinkage.py`, `test_headshots.py` | Helpers in `utils/` and the research scripts. |
 | `test_docstrings.py` | The documentation rule: every module-level function over five lines has a docstring. |

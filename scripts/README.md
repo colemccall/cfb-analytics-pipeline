@@ -45,6 +45,8 @@ The whole flow, from the API to the pages, is in [`../docs/DATA_FLOW.md`](../doc
 |---|---|
 | `12_export_frontend_json.py` | Every per-season app file (players, rosters, teams, schedules, game logs, manifest). `--season Y` for one season, `--game-logs` for the per-team game logs. |
 | `18_export_recruiting.py` | `recruiting_{year}.json` for the Recruiting screen. |
+| `21_export_contract.py` | `data/exports/v1/`: the versioned contract the sibling apps read (schema, teams, players, manifest). Every null carries a reason; `--check` validates without writing. |
+| `22_freeze_snapshot.py` | `data/snapshots/{season}-wk{NN}-{release}/`: this week's published numbers, stamped and write-once. `--verify` re-hashes every snapshot; `--dry-run` writes nothing. |
 
 ## Checks — read-only, each reproduces a constant or guards a seam
 
