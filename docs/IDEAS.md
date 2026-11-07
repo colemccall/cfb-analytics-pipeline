@@ -54,21 +54,8 @@ report-only today.
 **Why it is interesting:** the token check (`contrast-check.mjs`) passed while text over the team photos measured 1.7:1. Only a
 rendered measurement sees what the pages compose.
 
-**What must be true first:** the remaining failures are fixed or listed as accepted with a reason. The gate also ships in a
-release of its own, never with the fixes it would judge (CLAUDE.md §3).
-
-**Raised by:** Claude (v4.26).
-
-## Choose badge text by contrast, not by a luminance cut
-
-`ratingTextColor()` picks white or near-black text by perceived luminance with a frozen cut at 140. For six palette colours it
-picks white where white fails WCAG AA (3.08 to 3.79:1) and dark text would pass (5.5 to 6.8:1). Choosing whichever of the two
-has the higher contrast ratio would fix all six without touching the palette.
-
-**Why it is interesting:** these colours are the position and low-rating badges on every roster and list.
-
-**What must be true first:** the owner's written go-ahead. The threshold is a frozen constant (CLAUDE.md §3), so this is a written
-case, not a refactor. The case and the numbers are in the v4.26 Build Log entry.
+**What must be true first:** the failures it reports are fixed or listed as accepted with a reason. Since v4.26.1 they are fixed:
+0 text failures on any screen it covers. The gate ships in a release of its own, never with the fixes it would judge (CLAUDE.md §3).
 
 **Raised by:** Claude (v4.26).
 
@@ -137,3 +124,10 @@ game of 3 on file).
 endpoint. Each points to a different fix.
 
 **Raised by:** Claude (v4.25.1).
+
+---
+
+## Left this file
+
+- **Choose badge text by contrast, not by a luminance cut.** Built in v4.26.1 on the owner's go-ahead (Build Log
+  `v4.26.1-badge-text-by-contrast`): black or white, whichever has the higher contrast with the fill, so every badge clears AA.
