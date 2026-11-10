@@ -592,6 +592,7 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             "results_rating":   _f(r.get("results_rating")),
             "results_games":    _i(r.get("results_games")),
             "power_rating":     _f(r.get("power_rating")),
+            "earned_rating":    _f(r.get("earned_rating")),
             "rating_part":      _f(r.get("rating_part")),
             "conf_part":        _f(r.get("conf_part")),
             "home_edge":        _f(r.get("home_edge")),
@@ -618,6 +619,7 @@ def export_team_ratings(T: dict, output_dir: Path, season: int) -> None:
             row["live_offense_rating"] = _f(lrow.get("offense_rating"))
             row["live_defense_rating"] = _f(lrow.get("defense_rating"))
             row["live_power_rating"]   = _f(lrow.get("power_rating"))
+            row["live_earned_rating"]  = _f(lrow.get("earned_rating"))
             row["live_results_rating"] = _f(lrow.get("results_rating"))
             row["live_results_games"]  = _i(lrow.get("results_games"))
             row["live_rating_part"]    = _f(lrow.get("rating_part"))
@@ -1447,7 +1449,7 @@ def export_power_games(T: dict, output_dir: Path, season: int) -> None:
     to be worth, and the difference (`over`). A team's results part is roughly the average of its `over` values, shrunk toward 0 for
     few games. Seasons before POWER_GAMES_FIRST_SEASON are not exported.
     """
-    from utils.results_rating import expected_value, game_value
+    from utils.results_rating import EARNED_BONUS, EARNED_CAP, expected_value, game_value
 
     if season < POWER_GAMES_FIRST_SEASON and season not in T["live_teams"]:
         return
@@ -1491,6 +1493,7 @@ def export_power_games(T: dict, output_dir: Path, season: int) -> None:
                 "week": _i(x.get("week")), "opp_id": opp, "opp": names.get(opp), "home": is_home and not neutral,
                 "neutral": neutral, "score": sc, "opp_score": osc, "margin": int(sign * m),
                 "value": round(val, 1), "expected": round(exp, 1), "over": round(val - exp, 1),
+                "earned_value": round(game_value(sign * m, EARNED_CAP, EARNED_BONUS), 1),
                 **({"post": True} if x.get("season_type") == "postseason" else {}),
             }
             if exp_home_blend is not None:

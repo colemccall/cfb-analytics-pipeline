@@ -202,6 +202,7 @@ def build_export(season: int, sandbox: Path, progress: dict) -> dict:
             "wins": int(w), "losses": int(l),
             "overall_rating": ovr,
             "power_rating": float(t["power_rating"]) if "power_rating" in t and pd.notna(t["power_rating"]) else None,
+            "earned_rating": float(t["earned_rating"]) if "earned_rating" in t and pd.notna(t["earned_rating"]) else None,
             "results_rating": float(t["results_rating"]) if "results_rating" in t and pd.notna(t["results_rating"]) else None,
             "rating_part": float(t["rating_part"]) if "rating_part" in t and pd.notna(t["rating_part"]) else None,
             "conf_part": float(t["conf_part"]) if "conf_part" in t and pd.notna(t["conf_part"]) else None,

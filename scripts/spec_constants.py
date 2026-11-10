@@ -97,6 +97,7 @@ def rows() -> list:
     add("SHRINK_GAMES_K", s10.SHRINK_GAMES_K, "10", "data")
     add("IN_PROGRESS_MIN_FBS / IN_PROGRESS_MIN_ALL (games still to come for a season in progress)", f"{s10.IN_PROGRESS_MIN_FBS} / {s10.IN_PROGRESS_MIN_ALL}", "10", "design")
     add("CAP / BONUS / LAM / BETA (the results reading and power)", f"{rr.CAP} / {rr.BONUS} / {rr.LAM} / {rr.BETA}", "utils/results_rating", "data")
+    add("EARNED_CAP / EARNED_BONUS (the earned order)", f"{rr.EARNED_CAP} / {rr.EARNED_BONUS}", "utils/results_rating", "design")
     return L
 
 

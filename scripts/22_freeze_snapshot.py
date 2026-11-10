@@ -43,7 +43,7 @@ from utils import model_version  # noqa: E402
 APP_DATA = ROOT.parent / "cfb-analytics-app" / "data"
 SNAP_ROOT = APP_DATA / "snapshots"
 TEAM_FIELDS = ["team_id", "school", "rating", "offense", "defense", "power", "roster", "stats", "results", "wins", "losses",
-               "rank_rating", "rank_power"]
+               "rank_rating", "rank_power", "earned", "rank_earned"]
 PLAYER_FIELDS = ["player_id", "team_id", "position_group", "rating", "basis", "games"]
 
 
@@ -72,10 +72,11 @@ def _ranks(rows: list, key: str) -> dict:
 def slim(live: dict) -> tuple:
     """The published numbers of a live file as two {fields, rows} tables (a missing value stays null)."""
     teams = live["teams"]
-    rk_rating, rk_power = _ranks(teams, "overall_rating"), _ranks(teams, "power_rating")
+    rk_rating, rk_power, rk_earned = _ranks(teams, "overall_rating"), _ranks(teams, "power_rating"), _ranks(teams, "earned_rating")
     trows = [[t["team_id"], t.get("school"), t.get("overall_rating"), t.get("offense_rating"), t.get("defense_rating"), t.get("power_rating"),
               t.get("roster_half"), t.get("stats_half"), t.get("results_half"), t.get("wins"), t.get("losses"),
-              rk_rating.get(t["team_id"]), rk_power.get(t["team_id"])] for t in sorted(teams, key=lambda t: t["team_id"])]
+              rk_rating.get(t["team_id"]), rk_power.get(t["team_id"]), t.get("earned_rating"), rk_earned.get(t["team_id"])]
+             for t in sorted(teams, key=lambda t: t["team_id"])]
     players = [p for p in live["players"] if p.get("overall_rating") is not None]
     prows = [[p["player_id"], p.get("team_id"), p.get("position_group"), p.get("overall_rating"), p.get("rating_basis"), p.get("games_played")]
              for p in sorted(players, key=lambda p: p["player_id"])]

@@ -88,7 +88,8 @@ is the check.
 The candidates are:
 - per-group sub-ratings (a defensive back's three jobs, the team's position-group scores);
 - the schedule and results per game;
-- the line unit's five measurements.
+- the line unit's five measurements;
+- the earned order (`earned_rating`), which the site ranks by since v4.27.
 
 Each is published on the site already, so each would be an additive field (v1.1), not a break.
 
@@ -124,6 +125,31 @@ game of 3 on file).
 endpoint. Each points to a different fix.
 
 **Raised by:** Claude (v4.25.1).
+
+## Treat a missing recruiting grade as unknown on the low-game rule
+
+A player with no recruiting grade on file is read as zero stars, 33 points below the position average, so he starts near 40 however he played. v4.27 took two-game players of a
+season in progress off that rule; one game, and two in a finished season, are still on it. Of the players on the rule who earned a rating the next season, those with no grade were rated
+35.5 and earned 66.7, against 54.4 and 63.9 for recruited players (gap 21.71, shuffled 0.41). Correcting the level cuts their miss from 31.18 to 6.22, level with the dumb baseline
+(`scripts/validate_low_game_weights.py`).
+
+**Why it is interesting:** it is the standing rule "missing means unknown, never zero", broken on one path; v4.24 listed it and deferred it.
+
+**What must be true first:** a measurement of every path that reads stars for a missing grade, and the projection gates, since it changes finished seasons. Its own release.
+
+**Raised by:** Claude (v4.27, from Max Cutforth).
+
+## Two games in a finished season
+
+A two-game player of a season in progress is rated on his own play since v4.27; the same player keeps the low-game rule once the season ends, so his rating can fall when the season is
+finished if he plays no more. The owner's rule was stated for the season being played. Whether it reaches finished seasons is a separate question: it needs the same test on them and the
+projection gates.
+
+**Why it is interesting:** one rule for every season, and no step at the end of the year.
+
+**What must be true first:** the owner's say, and a full recompute.
+
+**Raised by:** Claude (v4.27).
 
 ## A defensive back's coverage credit should not fall for a game he sat out
 

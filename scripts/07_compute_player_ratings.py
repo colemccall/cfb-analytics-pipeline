@@ -338,7 +338,8 @@ def get_rating_era(season: int) -> str:
 # validate_part_time_rating.py reproduces the table and scores it (leave-one-season-out, against the rule it replaced and a
 # placebo). THE COST, stated: a player rated 85 or more by his level plays on average 3.6 points lower afterwards, so the curve
 # lowers the top of a short sample, and a mid-season rating for a high performer sits below the one a finished season gives
-# (a finished season is not curved). Eight or more games use the 8-9 line; fewer than 3 are the low-game rule's.
+# (a finished season is not curved). Eight or more games use the 8-9 line; TWO games use the three-game line (v4.27, two_game_rating);
+# ONE game is the low-game rule's.
 PART_SEASON_CURVE = {
     ("DB", "3"): (31.5387, 0.5630),
     ("DB", "4"): (29.1020, 0.6184),
@@ -1867,6 +1868,10 @@ def _position_pool(pg: str) -> dict:
 
     for rkey, row in all_backup_df.iterrows():
         base = fallback_rating(int(row.get("stars", 0)), pos_avg)
+        two = two_game_rating(row, pg) if pg in EDGE_POSITIONS else None
+        if two is not None:
+            ratings_map[rkey], contrib_map[rkey], basis_map[rkey] = two[0], two[1], "two_games"
+            continue
         if low_mean:
             lgr = low_game_rating(row.get("edge_all"), row.get("games_played"), row.get("stats_measured"), pg, base,
                                   low_mean.get(int(row.get("games_played") or 0), 0.0))
@@ -1925,6 +1930,32 @@ LOW_GAME_WEIGHT = {(1, False): 0.115, (1, True): 0.175, (2, False): 0.173, (2, T
 LOW_GAME_CEILING = 72.0
 
 
+# Two games in a season in progress (v4.27, the owner: "players with 2 games have enough of a sample to get a rating based on their performance").
+# A two-game player is rated like a three-game one: his per-game level through the frozen anchors, then the three-game line of
+# PART_SEASON_CURVE. Measured by scripts/validate_two_game_rating.py against how he went on to play (2024-2025, 3,115 player-cuts): mean error
+# 17.49 for the low-game rule (bias -14.56, -27.09 with no recruiting grade, where it started him near 40), 9.86 for this, 11.27 for a placebo
+# that deals the levels to other players, 10.92 for the position's mean. A line fitted for two games scored the same (9.91) with a slope
+# of 0.17 to 0.45, so performance would count for less and there would be six more constants. The cost, stated: the line was fitted on
+# players who kept playing, so one who never plays again is rated about 14 points higher than before, with no way to score it;
+# and a player rated 80 or more on it then plays 4.8 lower. A finished season has no team_games and keeps the low-game rule.
+TWO_GAME_LINE = 3
+
+
+def two_game_rating(row, pg: str) -> tuple[float, dict] | None:
+    """Rating and contribution record for a two-game player of a season in progress, or None for anyone else."""
+    if float(row.get("team_games") or 0) <= 0 or int(row.get("games_played") or 0) != 2:
+        return None
+    try:
+        ea = float(row.get("edge_all"))
+    except (TypeError, ValueError):
+        return None
+    if ea != ea or ea <= 0:
+        return None
+    edge = ea * float(np.sqrt(REGULAR_SEASON_GAMES / 2))       # script 06 level_edge: edge_all is the raw sum / sqrt(games)
+    rating = part_season_curve(edge_to_ovr(edge, pg), pg, TWO_GAME_LINE)
+    return round(rating, 2), {"edge_score": round(edge, 4), "games_played": 2, "stats_measured": int(float(row.get("stats_measured") or 0)), "part_season_line": TWO_GAME_LINE}
+
+
 def low_game_rating(edge_all, games, events, pg: str, prior: float, mean_r_edge: float) -> tuple[float, dict] | None:
     """Rating and its contribution record for a player with one or two productive games, or None when he has no score.
 
@@ -1961,6 +1992,8 @@ def rating_basis_for(rkey: str, tier: str, basis_map: dict) -> str:
         return "default"
     if produced == "low_games":      # production over one or two games blended with the recruiting prior, whatever the tier
         return "blended"
+    if produced == "two_games":      # two games in a season in progress: his own play through the part-season curve, whatever the tier
+        return "production"
     if produced == "production":
         return TIER_RATING_BASIS.get(tier, "production")
     if tier == "bench":
@@ -2072,7 +2105,7 @@ def rate_position(season: int, pg: str) -> list[dict]:
     for i, r in enumerate(rows):
         # A low-game rating is already the blend of his stretch and the recruiting prior; the tier blend would take the
         # stretch out again (a bench-tier player would go back to recruiting alone).
-        keep = basis_map.get(rkeys[i]) == "low_games"
+        keep = basis_map.get(rkeys[i]) in ("low_games", "two_games")
         if part_time_edge(season_df.iloc[i]):          # his rating is already the curve's reading of his own games: no recruiting blend on top
             keep = True
         r["overall_rating"] = float(ratings_arr[i] if keep else adjusted_ratings[i])

@@ -47,7 +47,7 @@ from utils.api_client import load_api_key, fetch_sp_ratings_breakdown, fetch_tea
 from utils.seasons import ALL_SEASONS, REGULAR_SEASON_GAMES
 from utils.box_scores import fetch_season_rows
 from utils.line_unit import line_unit_rating
-from utils.results_rating import power_components
+from utils.results_rating import earned_ratings, power_components
 
 MODEL_VERSION = "v2.0-team"
 
@@ -945,8 +945,11 @@ def attach_power(rows: list, season: int, teams, with_results: bool = True, qual
         if not g.empty:
             games = g[(g["season"] == season) & (g["season_type"] == "regular")].to_dict("records")
     parts, info = power_components(games, quality, conf_of)
+    earned = earned_ratings(games, quality, conf_of) if games else {}       # the earned order (v4.27): results only, in every season
     for r in rows:
         p = parts.get(int(r["team_id"]))
+        e = earned.get(int(r["team_id"]))
+        r["earned_rating"] = round(e, 2) if e is not None else None
         r["power_rating"] = round(p["power"], 2) if p else None
         r["rating_part"] = round(p["rating_part"], 2) if p else None
         r["conf_part"] = round(p["conf_part"], 2) if p else None

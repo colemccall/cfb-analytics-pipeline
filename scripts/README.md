@@ -64,7 +64,7 @@ The others each reproduce a constant named in their docstring, so a constant can
 trusted: `validate_pace*.py` (the in-season scale), `validate_low_game_weights.py`, `validate_fcs_weight.py`,
 `validate_qb_composite.py`, `validate_opponent_strength.py`, `validate_stats_schedule.py`,
 `validate_team_overall.py`, `validate_team_roster.py`, `validate_early_reliability.py`, `validate_rankings.py`,
-`validate_part_time_rating.py` (should a part-season rating count missed games — the Gaines question, v4.24),
+`validate_part_time_rating.py` (should a part-season rating count missed games — the Gaines question, v4.24), `validate_two_game_rating.py` (two games rated on his own play, v4.27), `validate_earned_ranking.py` (the earned order's constants and what they cost, v4.27),
 `validate_reliability.py`, `validate_vs_draft.py`. Two of them write a JSON the app reads
 (`validate_rankings.py` → `ranking_validation.json`; `validate_reliability.py` without `--no-export`), so they are
 not pure gates.

@@ -644,7 +644,7 @@ after the last scored one are unscored. Calibrated on scripts/validate_early_rel
 R_edge = edge_to_ovr(edge_all), edge_all = sum of opponent-adjusted game scores / sqrt(games), kept by script 06 where edge_score is withheld (under 3 games).
 rating = prior + w x (R_edge - mean R_edge of low-game players at his position and games), clipped to 30..72; prior = position average + step for stars (unchanged); basis blended.
 w = 0.115 (1 game, under 4 counted events), 0.175 (1 game, 4+), 0.173 (2 games, under 4), 0.209 (2 games, 4+) (script 07 LOW_GAME_WEIGHT). Fitted by scripts/validate_low_game_weights.py as the slope of the next season's earned rating on R_edge.
-The tier blend is skipped for these players. Players with no productive game keep the recruiting-only rating.
+The tier blend is skipped for these players. Players with no productive game keep the recruiting-only rating. Since v4.27 two games in a season in progress are rated by `two_game_rating` (below); this rule keeps one game and finished seasons.
 
 ## v4.20 - live adjustment, FCS, QB score, roster layout, three-reading headline (mirrors METHODS `team-ratings`, `opponent-strength`, `live-season`, `qb-composite`)
 
@@ -683,11 +683,11 @@ Game logs: `gamelog_{season}_{team_id}.json` = {players: {player_id: [[game_id, 
 ## v4.24 — part-time rating in a season in progress (mirrors METHODS `live-season`)
 
 ```
-EDGE_level  = EDGE_raw x sqrt(12 / n)                  n = games the player has played (3 or more)
+EDGE_level  = EDGE_raw x sqrt(12 / n)                  n = games the player has played (3 or more; 2 since v4.27, read through the 3-game line)
 rating      = a + b x edge_to_ovr(EDGE_level)          (a, b) = PART_SEASON_CURVE[position family, n]
               families QB, RB, WR/TE, DL/EDGE, LB, DB; n buckets 3, 4, 5, 6, 7, "8-9" (8 or more uses it)
               b runs from 0.30 (DL/EDGE, 3 games) to 0.91 (RB, 8-9)
-nothing reads his team's games played; no games damp in season; n of 1 or 2 keeps the low-game rule
+nothing reads his team's games played; no games damp in season; n of 1 keeps the low-game rule (n of 2 did until v4.27)
 defensive game composite reads defensiveSACKS and defensiveTFL as decimals (0.5 is half)
 ```
 
@@ -722,3 +722,23 @@ Week 15, the marker test's snapshot, reads as played in both seasons under eithe
 
 The constants table in `RATINGS_SPEC.md` §12 is `scripts/spec_constants.py` `rows()`, read from the live modules. `tests/test_ratings_spec.py`
 fails when the spec's copy differs.
+
+## v4.27 - the earned order; two games in a season being played (mirrors METHODS `earned-ranking`, `low-game-players`)
+
+```
+value(game)  = clip(margin, +-7) + 12 if won, - 12 if lost        from the team's side; a tie is 0
+earned       = utils/results_rating.earned_ratings: power_components with every rating part 0, cap 7 (EARNED_CAP), bonus 12 (EARNED_BONUS), lambda 2,
+               every regular-season game between two FBS teams, in every season, finished or not
+               a team with no FBS game has no number, not a zero
+```
+
+Script 10 writes `earned_rating` beside `power_rating`; 17 carries it to the live file; 17b writes `earned` and `rk_earned` for each replayed week; 12 exports it, `live_earned_rating`,
+and each game's `earned_value`; 22 freezes `earned` and `rank_earned`. Power is unchanged. The site's one ranked order (`menuTeamRankValue`) is earned where a number exists and power otherwise.
+
+```
+two games, season in progress   level  = edge_to_ovr(edge_all x sqrt(12 / 2))
+                                rating = a + b x level        (a, b) = PART_SEASON_CURVE[family, 3 games]        basis production, no tier blend
+one game; two in a finished season   the low-game rule, unchanged
+```
+
+Scripts: `scripts/validate_earned_ranking.py`, `scripts/validate_two_game_rating.py`, and the no-recruiting-grade section of `scripts/validate_low_game_weights.py`.

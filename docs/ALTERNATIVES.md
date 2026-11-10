@@ -395,3 +395,22 @@ reading moves.
 | Bracket accuracy as the headline marker | Rejected | 11 games a season; picks over 22 games and selection over 24 teams are reported with intervals and a placebo instead |
 | Make the marker test a gate now | Blocked | The owner's decision (question 3 in the spec); a gate is never added in the release it first judges |
 | Type the spec's constants table by hand | Rejected | A hand-typed table drifts: the Methods entry `opponent-strength` gave the cross-conference weight as 1.0 until v4.18 while the code had 1.5. The table is generated and a test fails on a difference |
+
+## v4.27 - the earned order, two-game players
+
+| Option | Status | Why |
+|---|---|---|
+| A second number, earned (cap 7, bonus 12, no rating part), the default order everywhere a rank is shown | Shipped | The owner: a two-loss team that lost head to head should not be top 5, nor a three-loss team top 15. 2026 through week 10: Alabama 1 to 6, LSU 7 to 19, Liberty 13 to 25, New Mexico 15 to 17. Cost if it replaced power: 72.0% to 69.3% of later winners after week 10, miss 13.21 to 13.76, which is why it does not |
+| Change power's own constants | Rejected | The accuracy above, and 46 teams move 10 or more places. A separate number costs power nothing |
+| Win bonus 14, cap 28 | Rejected | 71.5%; Alabama 3rd, LSU 9th: does not meet the owner's conditions |
+| Cap 14, bonus 14 | Rejected | 70.0%; Alabama 4th, LSU 15th: does not meet them |
+| Wins and losses only, opponents kept | Rejected | 68.6%; Alabama 6th, LSU 20th. Meets them but discards margin altogether for 0.7 fewer points of winners |
+| Fewest losses first, power within | Rejected | 69.7%; Alabama 12th, LSU 33rd, 8-1 Liberty and New Mexico above Alabama |
+| Cap blowouts in the results reading at 21 or 28 | Rejected | Mean miss 13.07 to 13.21 and 13.13 after week 10; LSU stays 2nd on the headline |
+| Conference level off in the results reading | Not adopted | LSU 4th, Alabama 5th on the headline at no measured cost (72.2% against 71.8%, miss 13.09 against 13.07); declined in v4.21 as too large; SEC teams beat their number by 1.55 in bowls (s.e. 1.82) and are 28-2 outside the league in 2026 |
+| A head-to-head tie-break | Not built | 62 pairs after week 10: the head-to-head winner did 2.34 worse afterwards than the team ranked above it (s.e. 1.76, placebo p 0.21). No predictive case; it may still be wanted as a presentation rule |
+| More weight on the loss column in power | Rejected | At equal power a team with an extra loss did 1.54 to 1.83 points better afterwards: power already counts a loss for more than it predicts |
+| Two games in a season in progress rated through the three-game line | Shipped | The owner's rule. Against how he went on to play (2024-2025, 3,115 player-cuts): 9.86 against 17.49 for the low-game rule; placebo 11.27; position mean 10.92. Cost: a player who never plays again publishes about 14 points higher, unscorable; rated 80+ then plays 4.8 lower |
+| A line fitted for two games | Rejected | 9.91, equal accuracy; better bias (-0.25 against +0.99), but a slope of 0.17 to 0.45, so performance counts for less, and six more constants. Max Cutforth about 75.6 instead of 83.0 |
+| His own level, believed entirely | Rejected | 12.95, bias -4.78; misses by 7 more below a level of 60 and runs 7.9 hot at 75 and up |
+| Keep the low-game rule and treat a missing recruiting grade as unknown | Not built for two games | 1,197 players with no grade were rated 35.5 and earned 66.7 the next year (recruited 54.4 to 63.9; gap 21.71, shuffled 0.41). Correcting the level cuts their miss from 31.18 to 6.22. It still stands for one game and finished seasons |

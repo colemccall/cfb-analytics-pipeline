@@ -23,6 +23,12 @@ played better. The constants are derived once by scripts/validate_rankings.py on
 cut after week 8, scored on every later FBS game).
 
 Only regular-season games between two FBS teams are used.
+
+The EARNED order (v4.27) is a second number from the same solve, not a change to power: every game is worth its margin capped at
++-EARNED_CAP plus EARNED_BONUS for a win or minus it for a loss, against the opponents played, with no rating part, in every season.
+Power answers "how good are they". Earned answers "what have they done": a loss costs more and a blowout buys less. Power predicts
+later games better (72.0% against 69.3% after week 10, 2016-2025), which is why it is not replaced; scripts/validate_earned_ranking.py
+has the sweep the two constants came from, and says plainly that they were chosen to give the order the owner asked for.
 """
 
 import numpy as np
@@ -32,6 +38,8 @@ BONUS = 8.0           # points added to a win's value and taken from a loss's
 LAM = 2.0             # ridge on a team's results part: about two games of prior
 LAM_CONF = 1e9        # a conference level is OFF: measured, it adds nothing the ratings and results do not (see validate_rankings.py)
 BETA = 0.98           # points per game per rating point (the slope of margin on rating gap, fitted)
+EARNED_CAP = 7.0      # the earned order: a margin counts up to one touchdown
+EARNED_BONUS = 12.0   # the earned order: what a win adds and a loss takes away
 
 
 def _clean(games, team_ids):
@@ -112,6 +120,16 @@ def power_components(games, quality, conf_of, cap=CAP, bonus=BONUS, lam=LAM, lam
         p = teams[t]
         p["power"] = p["rating_part"] + p["conf_part"] + p["results_part"]
     return teams, {"home_edge": home_edge, "conference_levels": conf_level, "mean_rating": qm}
+
+
+def earned_ratings(games, team_ids, conf_of) -> dict:
+    """{team_id: earned rating} for every team with at least one FBS game; a team with none has no number, not a zero.
+
+    The solve is power_components with every team's rating part at 0 and the earned constants, so an opponent's own results still
+    decide what beating it is worth. Only `games` and the opponents they name go in: nothing about a team's players or last season.
+    """
+    parts, _ = power_components(games, {int(t): 0.0 for t in team_ids}, conf_of, cap=EARNED_CAP, bonus=EARNED_BONUS)
+    return {t: p["power"] for t, p in parts.items() if p["games"]}
 
 
 def expected_value(parts_home: dict, parts_away: dict, home_edge: float, neutral: bool) -> float:

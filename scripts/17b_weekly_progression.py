@@ -236,6 +236,7 @@ def weekly_team_rows(snap: dict, t10) -> dict:
     rk_head = {t["team_id"]: i + 1 for i, t in enumerate(sorted(teams, key=lambda t: -(t["overall_rating"] or -1e9)))}
     rk_pow = {t["team_id"]: i + 1 for i, t in enumerate(sorted(teams, key=lambda t: -(t["power_rating"] if t["power_rating"] is not None else -1e9)))}
     rk_blend = {t["team_id"]: i + 1 for i, t in enumerate(sorted(teams, key=lambda t: -(t["power_blend"] if t["power_blend"] is not None else -1e9)))}
+    rk_earned = {t["team_id"]: i + 1 for i, t in enumerate(sorted(teams, key=lambda t: -(t["earned_rating"] if t["earned_rating"] is not None else -1e9)))}
     by_id = {t["team_id"]: t for t in teams}
     strength = snap["strength"]
     played = {}
@@ -262,8 +263,8 @@ def weekly_team_rows(snap: dict, t10) -> dict:
                "head": _r(t["overall_rating"]), "power": _r(t["power_rating"], 2),
                "roster": _r(t["roster_half"]), "stats": _r(t["stats_half"]), "results": _r(t["results_half"]),
                "off": _r(t["offense_rating"]), "def": _r(t["defense_rating"]), "groups": t.get("roster_groups"),
-               "blend": _r(t["power_blend"], 2),
-               "rk_head": rk_head[tid], "rk_power": rk_pow[tid], "rk_blend": rk_blend[tid]}
+               "blend": _r(t["power_blend"], 2), "earned": _r(t["earned_rating"], 2),
+               "rk_head": rk_head[tid], "rk_power": rk_pow[tid], "rk_blend": rk_blend[tid], "rk_earned": rk_earned[tid]}
         row.update(played.get(tid, {}))
         out[tid] = row
     return out
