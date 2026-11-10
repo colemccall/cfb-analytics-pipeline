@@ -65,7 +65,7 @@ Teams and players carry their own games-played state: wins and losses per team, 
 python scripts/01b_refresh_in_season.py --season 2026 --weeks N --stage   # then validate_week_ingest.py, then --merge
 python scripts/17_live_season.py --season 2026 --offline                  # live_2026.json
 python scripts/17b_weekly_progression.py --season 2026                    # weekly_*_2026.json
-python scripts/12_export_frontend_json.py --season 2026                   # the app's files
+python scripts/12_export_frontend_json.py --season 2026 --cards           # the app's files, and cards/ for the player cards
 python scripts/21_export_contract.py                                      # data/exports/v1 for the sibling apps
 python scripts/22_freeze_snapshot.py                                      # data/snapshots/2026-wkNN-<release>/
 ```

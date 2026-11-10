@@ -69,7 +69,8 @@ class TestBoxScoreTotals:
     def test_the_sums_are_what_stats_season_reports(self):
         """Every statistic both sources carry, every FBS team, 2026 through the weeks on file: the rule the weekly stats half rests on."""
         season = 2026
-        needed = [("/stats/season", {"year": season})] + [("/games/teams", {"year": season, "week": w, "seasonType": "regular"}) for w in range(1, 10)]
+        through = _weekly("live_2026.json")["through_week"]    # the newest complete week: a fixed number here turned this into a skip when week 10 arrived
+        needed = [("/stats/season", {"year": season})] + [("/games/teams", {"year": season, "week": w, "seasonType": "regular"}) for w in range(1, through + 1)]
         if not all(os.path.exists(os.path.join(api_client.CACHE_DIR, api_client._cache_key(p, q) + ".json")) for p, q in needed):
             pytest.skip("2026 box scores or season stats are not in the API cache")
         season_tab = {}
@@ -77,10 +78,10 @@ class TestBoxScoreTotals:
             season_tab.setdefault(r["team"], {})[r["statName"]] = float(r["statValue"] or 0)
         games = max(v.get("games", 0) for v in season_tab.values())
         mine = {}
-        for r in fetch_season_rows("x", season, 9, api_client._get_list):
+        for r in fetch_season_rows("x", season, through, api_client._get_list):
             mine.setdefault(r["team"], {})[r["statName"]] = r["statValue"]
-        if games > 9:
-            pytest.skip("the season stats cover more than the nine weeks compared")
+        if games > through:
+            pytest.skip(f"the season stats cover more than the {through} weeks compared")
         bad = [(t, k, v, mine[t][k]) for t, d in season_tab.items() if t in mine for k, v in d.items()
                if k in mine[t] and abs(v - mine[t][k]) > 0.5]
         assert not bad, f"{len(bad)} statistics differ between /stats/season and the summed box scores, e.g. {bad[:3]}"

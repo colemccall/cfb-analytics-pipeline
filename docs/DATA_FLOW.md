@@ -50,7 +50,7 @@ python scripts/01b_refresh_in_season.py --season 2026 --weeks 9 --merge   # cach
 python scripts/09_harvest_supplemental.py --dataset team_advanced_season team_records --seasons 2026   # from the cache
 python scripts/17_live_season.py --season 2026 --offline                  # live_2026.json
 python scripts/17b_weekly_progression.py --season 2026                    # weekly_*_2026.json (every week, ~30 min)
-python scripts/12_export_frontend_json.py --season 2026                   # the app's per-season files
+python scripts/12_export_frontend_json.py --season 2026 --cards           # the app's per-season files and cards/ (the player cards read these)
 python scripts/12_export_frontend_json.py --season 2026 --game-logs       # gamelog_2026_{team}.json
 python scripts/21_export_contract.py                                      # data/exports/v1/ for the sibling apps
 python scripts/22_freeze_snapshot.py                                      # data/snapshots/2026-wkNN-<release>/, write-once
