@@ -125,6 +125,23 @@ endpoint. Each points to a different fix.
 
 **Raised by:** Claude (v4.25.1).
 
+## A defensive back's coverage credit should not fall for a game he sat out
+
+A defensive back's coverage credit counts in every game he played, and it scales with his rank in his team's secondary by
+cumulative tackles: the top five get all of it, 6th gets 60%, 7th 30%, 8th nothing (`build_coverage_participation`, script 06).
+Teammates can pass him while he sits, and the credit for games already played goes with it. Brycen Scott (Louisville) kept his 17
+tackles in week 10, went from 6th to 8th, and fell 7.5 points without playing. The same week, 32 of 979 defensive backs who did not
+play moved 2 or more points: a few on this rank cliff, the rest with their team's pass defense. No other position group did.
+
+**Why it is interesting:** it is the owner's own objection ("why are we punishing him for games he did not play in"), in the one
+place the v4.24 fix did not reach, and a per-game or per-appearance measure of being in the rotation might remove the cliff.
+
+**What must be true first:** a measurement. Does a replacement hold up on the part-season test (`validate_part_time_rating.py`) and
+against a shuffled placebo? `COVERAGE_CREDIT` is an input, so `ARCHETYPE_SCALE` must be re-measured with any change (CLAUDE.md §3).
+It changes finished seasons too, so it is its own release with the projection gates.
+
+**Raised by:** Claude (v4.26.2, from the week-10 moves).
+
 ---
 
 ## Left this file
