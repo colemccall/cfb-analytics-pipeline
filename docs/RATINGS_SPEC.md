@@ -468,7 +468,6 @@ rejected, what was measured, which gates ran and what was not fixed. This index 
    26 in 2024 (1.0%, 12 with no game row at all) and 5 in 2025 (0.2%). A week-N snapshot reads only the per-game rows, so these players rate lower there
    (Joshua Eaton, §8.1). Not traced to a cause and not fixed.
 11. **Still open from the backlog** (root `CLAUDE.md` §6):
-    - the empty `research_cache`;
     - the slim/detail export split;
     - the class year;
     - the 110 MB `team_advanced_games.json`;

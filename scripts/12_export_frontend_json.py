@@ -19,7 +19,6 @@ Exports (season-agnostic):
   team_history.json         — year-by-year progression    {team_id: [{season,...}]}
   player_transfers.json     — portal moves keyed by player
   manifest.json             — seasons, last_played_season, projected_seasons
-  research/index.json       — published findings index
 
 Exports (per season):
   players_{season}.json     — rated players (ratings, SHAP, recruiting, team, stats)
@@ -192,7 +191,6 @@ def load_tables() -> dict:
         "recruiting":     read_raw("recruiting"),
         "transfers":      read_raw("transfers"),
         "player_edge":    read_raw("player_edge"),
-        "research_cache": read_raw("research_cache"),
         "ratings":          read_ratings("edge"),   # engine-filtered: see read_ratings
         # Seasons that have not been played have no earned ratings at all; their
         # numbers come from script 16 under engine="projected". Kept as a
@@ -1249,6 +1247,11 @@ def export_team_history(T: dict, output_dir: Path) -> None:
             sea = _i(g.get("season"))
             hid = _i(g.get("home_team_id"))
             aid = _i(g.get("away_team_id"))
+            # A team with a scored game has a known 0 on the side it never
+            # recorded; only a team-season with no scored game stays unknown.
+            for tid_ in (hid, aid):
+                wins_by[tid_][sea] += 0
+                losses_by[tid_][sea] += 0
             if hs > as_:
                 wins_by[hid][sea]   += 1
                 losses_by[aid][sea] += 1
@@ -1354,7 +1357,7 @@ def export_player_transfers(T: dict, output_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Export: research/index.json
+# Export: manifest.json
 # ---------------------------------------------------------------------------
 
 def export_manifest(T: dict, output_dir: Path) -> None:
@@ -1385,45 +1388,6 @@ def export_manifest(T: dict, output_dir: Path) -> None:
     print(f"    first={manifest['first_season']} "
           f"last_played={manifest['last_played_season']} "
           f"current={manifest['current_season']} projected={projected}")
-
-
-def export_research(T: dict, output_dir: Path) -> None:
-    """Write data/research/index.json plus one research/{key}.json per
-    research_cache entry. research_cache is currently empty, so this writes
-    `[]` — see the backlog item in CLAUDE.md §6 (wire it or delete it).
-    """
-    rc = T["research_cache"]
-    research_dir = output_dir / "research"
-
-    if rc.empty:
-        research_dir.mkdir(parents=True, exist_ok=True)
-        write_json(research_dir / "index.json", [])
-        print("  No research_cache entries yet — index.json written as empty array")
-        return
-
-    index = []
-    for _, row in rc.iterrows():
-        key = row.get("research_key")
-        data = row.get("data") or {}
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except Exception:
-                data = {}
-        meta = data.get("_meta", {})
-        if meta:
-            index.append({
-                "key":           key,
-                "title":         meta.get("title", key),
-                "category":      meta.get("category", ""),
-                "summary":       meta.get("summary", ""),
-                "headline_stat": meta.get("headline_stat", ""),
-            })
-        # Write individual finding file
-        data["_generated_at"] = str(row.get("generated_at", ""))
-        write_json(research_dir / f"{key}.json", data)
-
-    write_json(research_dir / "index.json", index)
 
 
 # ---------------------------------------------------------------------------
@@ -1582,7 +1546,7 @@ def main():
     --output (default: the sibling app's data/).
 
     Season-agnostic files first (teams, team ratings, history, similar players,
-    player transfers, manifest, research), then the six per-season
+    player transfers, manifest), then the six per-season
     files. Tables are loaded once. Note that teams.json's player_count reflects
     the LAST season in the run.
     """
@@ -1630,9 +1594,6 @@ def main():
 
     print("manifest.json...")
     export_manifest(T, output_dir)
-
-    print("research/...")
-    export_research(T, output_dir)
 
     # Per-season exports
     for season in seasons:

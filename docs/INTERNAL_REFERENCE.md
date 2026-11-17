@@ -133,7 +133,6 @@ single fetch layer, with an in-memory `_load()` cache; nothing else fetches.
 | `teams.json`, `team_ratings.json`, `team_history.json` | `fetchTeams`, `fetchTeamOvrMap`, team history tab |
 | `player_transfers.json` | player modal career path |
 | `team_performance.json` (13), `recruiting_roi.json` (14), `trajectory.json` (15) | Research page tables + home storylines |
-| `research/index.json` | research "Published Findings" — **currently `[]`, `research_cache` is empty** |
 
 **Resolved in v3.2 (2026-08-10):**
 
@@ -155,8 +154,7 @@ single fetch layer, with an in-memory `_load()` cache; nothing else fetches.
 - **`trajectory_detail.json` is 5.5 MB** and fetched whole the first time any player modal
   opens on a projected season. Acceptable (it is lazy and cached) but it wants the same
   slim/detail treatment eventually.
-- **`research_cache` is still empty**, so `research/index.json` is `[]`. Either wire the
-  publishing path or delete it — one mechanism.
+- **`research_cache` was removed in v4.27.3** (it was empty and nothing read `research/index.json`); findings live in the `FINDINGS` registry, one mechanism.
 - **Class year is the API's value and is unreliable.** Several players hold the same
   `year` across four seasons. It feeds the cohort development curves, consistently in both
   training and prediction, so it does not bias the projection — but it is not a

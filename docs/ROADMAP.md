@@ -244,10 +244,8 @@ Small, real, and each one has bitten at least once.
   average player; the ceiling is ~88–90). **Not done in this pass on purpose:** changing a gate
   in the same commit that ships the output it judges is how goalposts move. Do it as its own
   change, with the reasoning written down.
-- **`research_cache` is empty**, so `data/research/index.json` exports `[]` and the site's
-  Published Findings section shows its empty state permanently.
-- **`team_advanced_games.json` is 107 MB.** Harvested for completeness and currently unread; the
-  season-level file is what the ratings use. Slim it or drop it if it never finds a consumer.
+- ~~`research_cache` is empty~~ — **removed in v4.27.3**: nothing read `research/index.json`, and findings live in the `FINDINGS` registry.
+- **`team_advanced_games.json` is 110 MB** and is not unread: `scripts/validate_early_reliability.py` reads it (checked v4.27.3). Gitignored, so it costs disk, not the repo. Slim it to the columns that script names if disk matters.
 - **Coordinator changes are gone.** `/coaches` is head coaches only, and the retired seed CSV had
   OC/DC rows. Script 10's coaching-change flag is now HC-only, which is a narrower signal than
   before even though it covers 2,584 coach-seasons instead of 20.
@@ -269,4 +267,4 @@ Small, real, and each one has bitten at least once.
   process and the stats index built once.
 - Script 07's K/P distribution bounds were stale and warned on every run. Re-derived in v4.3 as
   its own change, separately from the ratings they judge.
-- `player_seasons.year` is still not a class year and script 12 still exports the raw value.
+- ~~`player_seasons.year` is still not a class year~~ — script 12 exports the derived `class_year` and `class_year_basis` (`utils/class_year.attach_class_year`); confirmed v4.27.3.

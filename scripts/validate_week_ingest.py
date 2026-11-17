@@ -30,6 +30,7 @@ import json
 import statistics as st
 import sys
 from collections import Counter, defaultdict
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -86,6 +87,37 @@ def stored_game_rows(season: int) -> dict:
     return by_game
 
 
+WEEK_DATE_TOLERANCE_DAYS = 14   # measured: over 39,040 dated regular-season games 2008-2026 only 4 sit more than 10 days
+                                # from their week's median date (the next is 9: week 0); those 4 are 105 days off
+MIN_GAMES_FOR_WEEK_MEDIAN = 20  # a week with fewer dated games has no median worth comparing to
+
+
+def week_date_outliers(rows: list, week_of, date_of) -> list:
+    """Rows dated more than WEEK_DATE_TOLERANCE_DAYS from the median date of their own week (weeks of 20+ dated games).
+
+    `week_of(row)` and `date_of(row)` read the week number and an ISO date string, so stored rows and API rows share
+    one rule. A game in the wrong week makes a replay week look finished (the four December 2025 games, v4.25.1)."""
+    by_week = defaultdict(list)
+    for r in rows:
+        if week_of(r) is not None and date_of(r):
+            by_week[week_of(r)].append(date.fromisoformat(date_of(r)[:10]))
+    median = {w: sorted(d)[len(d) // 2] for w, d in by_week.items() if len(d) >= MIN_GAMES_FOR_WEEK_MEDIAN}
+    return [r for r in rows if week_of(r) in median and date_of(r)
+            and abs((date.fromisoformat(date_of(r)[:10]) - median[week_of(r)]).days) > WEEK_DATE_TOLERANCE_DAYS]
+
+
+def check_week_dates(staged: dict, fbs: set, maps: dict) -> None:
+    """The staged /games rows against their week's dates. FAIL if an FBS-involved game is out of its week (it would
+    corrupt every replay), WARN for lower-division rows, which no FBS rating reads."""
+    out = week_date_outliers(staged["games_regular"], lambda g: g.get("week"), lambda g: g.get("startDate"))
+    school = maps["team"]
+    fbs_out = [g for g in out if school.get(str(g.get("homeTeam", "")).lower()) in fbs or school.get(str(g.get("awayTeam", "")).lower()) in fbs]
+    label = [f"{g.get('homeTeam')} v {g.get('awayTeam')} ({str(g.get('startDate'))[:10]}, week {g.get('week')})" for g in out]
+    report("week dates", "FAIL" if fbs_out else ("WARN" if out else "PASS"),
+           f"{len(out)} of {len(staged['games_regular'])} games dated over {WEEK_DATE_TOLERANCE_DAYS} days from their week's median, "
+           f"{len(fbs_out)} FBS-involved: {label[:6]}")
+
+
 def team_box_ids(season: int, week: int, payload=None) -> set:
     """API game ids with a team box score for the week: from `payload` if given, else from the cache."""
     rows = payload if payload is not None else (cache_read("/games/teams", {"year": season, "week": week, "seasonType": "regular"}) or [])
@@ -101,6 +133,9 @@ def audit(season: int) -> None:
     rows = stored_game_rows(season)
     weeks = sorted({g["week"] for g in games if g.get("week") is not None})
     print(f"{season} stored regular season: {len(games)} games, weeks {weeks[0]}-{weeks[-1]}")
+    off = week_date_outliers(games, lambda g: g.get("week"), lambda g: g.get("game_date"))
+    print(f"games dated over {WEEK_DATE_TOLERANCE_DAYS} days from their week's median: {len(off)}"
+          + "".join(f"\n  week {g['week']} {str(g['game_date'])[:10]} {g['home_team_name']} v {g['away_team_name']}" for g in off[:8]))
     print("week | FBS-involved | scored | with player rows | with team box score | gaps (scored, missing either)")
     for w in weeks:
         wk = [g for g in games if g["week"] == w and fbs_involved(g, fbs)]
@@ -276,6 +311,7 @@ def validate(season: int, weeks: list) -> int:
     }
     check_schema(staged, weeks, season, stored_rows, games)
     check_counts(staged, weeks, season, stored_rows, games, fbs, maps)
+    check_week_dates(staged, fbs, maps)
     check_uniqueness(staged, weeks)
     check_consistency(staged, weeks, season, stored_rows, games, maps)
     check_conferences(staged, season)

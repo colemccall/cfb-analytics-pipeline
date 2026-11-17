@@ -850,3 +850,17 @@ class TestTransferHomeState:
             for rows in json.loads(p.read_text(encoding="utf-8")).values():
                 for t in rows:
                     assert "hometown_state" in t, f"{p.name}: a transfer row lacks hometown_state"
+
+
+class TestTeamHistoryRecord:
+    """A season's record is both counts or neither. A team that never lost has
+    0 losses, not a missing one (LSU 2019 was printed "15-null" until v4.27.3)."""
+
+    def test_no_season_has_only_one_of_wins_and_losses(self):
+        half = [
+            (tid, r["season"], r["wins"], r["losses"])
+            for tid, rows in _load("team_history.json").items()
+            for r in rows
+            if (r["wins"] is None) != (r["losses"] is None)
+        ]
+        assert not half, f"{len(half)} season rows hold one count and not the other: {half[:5]}"

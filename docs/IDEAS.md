@@ -100,19 +100,6 @@ Each is published on the site already, so each would be an additive field (v1.1)
 
 **Raised by:** Claude.
 
-## A harvest-time check for games stored in the wrong week
-
-Four 2025 lower-division games are stored as regular-season week 1 and dated in December, and they made every 2025 replay week
-look finished (v4.25.1). A check at harvest time would flag any game whose date is far from its week's other games, before the
-row is merged.
-
-**Why it is interesting:** the defect it would have caught cost a rebuild of two seasons, and the rows are still mislabelled.
-
-**What must be true first:** a tolerance that survives week 0, bye weeks and rescheduled games. The 2024 and 2025 files can be
-measured for that today.
-
-**Raised by:** Claude (v4.25.1).
-
 ## Find why some players' season totals hold games their per-game rows lack
 
 Of defenders with 10 or more season tackles, the per-game rows hold under half of them for 26 in 2024 (1.0%) and 5 in 2025 (0.2%).
@@ -168,9 +155,78 @@ It changes finished seasons too, so it is its own release with the projection ga
 
 **Raised by:** Claude (v4.26.2, from the week-10 moves).
 
+## Interceptions barely move a quarterback's game grade
+
+The QB per-game score charges an interception -20, the same as 19 passing yards, against +25 for a passing touchdown, and sacks
+are not counted (`OFFENSIVE_COMPOSITE` in `scripts/06_compute_edge_scores.py`). The common ANY/A formula charges -45. Over 1,271
+2026 QB games of 15+ attempts, mean grade is 82.5 with no interception, 79.1 with one, 78.1 with two and 78.2 with three or more;
+35% of the 23 games with three or more interceptions and at most one passing touchdown still graded 80+. Grade correlates 0.72 with
+passing yards and -0.19 with interceptions. Example: Sam Leavitt, 0 TD and 1 INT in a 13-31 loss at Alabama, graded 96.1.
+
+**Why it is interesting:** a game grade that rewards a turnover-heavy game is the first thing a reader checks and the first thing
+that loses them. It is a position-group pattern, not one player, so it meets the bar for touching a weight (CLAUDE.md §3).
+
+**What must be true first:** a measurement. `scripts/validate_qb_composite.py` reports held-out R2 for the current weights (0.3983);
+an interception weight near -45, and sacks, must beat it and a shuffled placebo, with the change in the running rating stated
+beside the change in the game grade. Every QB rating moves, so it is its own release with `validate_ratings`, the draft check and
+the projection gates.
+
+**Raised by:** the owner (2026-11-17, Sam Leavitt's game grades).
+
+## Explain each team's two numbers: what lifts them, what holds them down
+
+A page under a team's schedule that explains the earned number (which results lift it, which hold it down, and how it is graded
+against the schedule) and the team rating (which position groups and which players carry the roster reading, where the stats half
+is strong or weak). Rankings rows would stay light, showing the earned number and the team rating, and open this explanation on a click.
+
+**Why it is interesting:** the site states two numbers per team and explains neither on the team's own page. The pieces exist:
+`earned_ratings` has the per-game margins and win bonus, power's explanation panel on Rankings already splits two parts, and the
+roster reading is built from position groups (`roster_groups` in the live file).
+
+**What must be true first:** an export of each team's per-game contribution to its earned number (script 17 has it in memory;
+nothing writes it). It is page code, so the design is agreed before it is written (CLAUDE.md §2).
+
+**Raised by:** the owner (2026-11-17).
+
+## Home: the biggest mismatches and the best matchups between the two numbers
+
+Headlines that set the earned number against the roster reading: high roster with a low earned number (underachieving), low roster
+with a high one (overachieving), and upcoming games where the two teams sit at the same level (high against high, middle against
+middle).
+
+**Why it is interesting:** it turns the gap between "who has the players" and "who has the results" into the story of the week, and
+every headline links to the explanation page above.
+
+**What must be true first:** a definition of "mismatch" that survives the noise. A rank gap of 20+ places on 138 teams, measured
+week to week, so a headline does not appear and vanish on one game. Home's storylines (`menuStorylines.js`) already build headlines
+from the data.
+
+**Raised by:** the owner (2026-11-17).
+
+## FCS, Division II and Division III: a results-only view
+
+About 2,800 games a season have no FBS team. They are already on disk (2025: D3-D3 1,215, D2-D2 876, FCS-FCS 691), but
+`save_games` drops their ids and classification; the API cache keeps both, and `team_records.json` carries CFBD `teamId`,
+classification and conference for about 540 non-FBS teams. No rosters, player stats or advanced stats exist below FBS, so only results
+can be used. CFBD has no NAIA classification at all: NAIA schools appear only as opponents of NCAA teams, so NAIA cannot be covered.
+
+**Why it is interesting:** `utils/results_rating.earned_ratings` and `utils/opponent_strength.solve` have no FBS assumption; given ids,
+the earned order runs on any pool.
+
+**What must be true first:** a walk-forward backtest per division (rate weeks 1..k, predict week k+1, 2021-2025) that beats a naive
+baseline (home team; better win share), with a placebo that shuffles margins, and a check of how connected each division's schedule
+is (D2 and D3 meet 3 to 5 times a season). A division that fails ships as standings only. Then `divisions_{season}.json` and a
+`#/divisions` screen. It is a separate number with its own `METHODS` entry, not a headline rating.
+
+**Raised by:** the owner (2026-11-16); parked for later on 2026-11-17.
+
 ---
 
 ## Left this file
 
+- **A harvest-time check for games stored in the wrong week.** Built in v4.27.3 (Build Log `v4.27.3-housekeeping`):
+  `validate_week_ingest.py` flags any game dated more than 14 days from its week's median date (FAIL if FBS-involved, WARN
+  otherwise), and `--audit` lists stored ones. Over 39,040 dated regular-season games, only the four December 2025 games exceed 10
+  days (105 days off; the next largest is 9, week 0). Those four come from CFBD itself as regular-season week 1, and no FBS rating reads them.
 - **Choose badge text by contrast, not by a luminance cut.** Built in v4.26.1 on the owner's go-ahead (Build Log
   `v4.26.1-badge-text-by-contrast`): black or white, whichever has the higher contrast with the fill, so every badge clears AA.
