@@ -155,23 +155,21 @@ It changes finished seasons too, so it is its own release with the projection ga
 
 **Raised by:** Claude (v4.26.2, from the week-10 moves).
 
-## Interceptions barely move a quarterback's game grade
+## The earned order: a conference term, or a wider margin cap
 
-The QB per-game score charges an interception -20, the same as 19 passing yards, against +25 for a passing touchdown, and sacks
-are not counted (`OFFENSIVE_COMPOSITE` in `scripts/06_compute_edge_scores.py`). The common ANY/A formula charges -45. Over 1,271
-2026 QB games of 15+ attempts, mean grade is 82.5 with no interception, 79.1 with one, 78.1 with two and 78.2 with three or more;
-35% of the 23 games with three or more interceptions and at most one passing touchdown still graded 80+. Grade correlates 0.72 with
-passing yards and -0.19 with interceptions. Example: Sam Leavitt, 0 TD and 1 INT in a 13-31 loss at Alabama, graded 96.1.
+The earned solve shrinks every team toward average (ridge 2) and has no conference term, so a schedule in a conference that dominates
+other conferences is under-credited and one in a conference that loses to them is over-credited. In 2026 through week 11 the SEC went
+28-2 against other FBS conferences and the Pac-12 9-16. A conference term (ridge 8) moves Boise State from 8th to 15th and Texas Tech
+from 12th to 10th, and lifts the SEC (LSU 26th to 18th, Florida 22nd to 16th, Ole Miss 25th to 17th); winners after week 10,
+2016-2025, 71.01% against 70.70%. A margin cap of 14 has the best backtest (71.64%) and moves LSU to 17th (12th with the term).
 
-**Why it is interesting:** a game grade that rewards a turnover-heavy game is the first thing a reader checks and the first thing
-that loses them. It is a position-group pattern, not one player, so it meets the bar for touching a weight (CLAUDE.md §3).
+**Why it is interesting:** it is the principled form of the owner's "quality of wins" objection, and the backtest does not object.
 
-**What must be true first:** a measurement. `scripts/validate_qb_composite.py` reports held-out R2 for the current weights (0.3983);
-an interception weight near -45, and sacks, must beat it and a shuffled placebo, with the change in the running rating stated
-beside the change in the game grade. Every QB rating moves, so it is its own release with `validate_ratings`, the draft check and
-the projection gates.
+**What must be true first:** the owner's call, because it trades two of the owner's own views (Boise State lower, the SEC punished)
+against each other and breaks the v4.27 condition that LSU stay outside the top 15 if combined with cap 14. Measured in
+`scripts/validate_earned_variants.py`; the METHODS `earned-ranking` entry lists the variants as experiments.
 
-**Raised by:** the owner (2026-11-17, Sam Leavitt's game grades).
+**Raised by:** the owner (2026-11-19: Boise State above Texas Tech, Wake Forest and Indiana).
 
 ## Explain each team's two numbers: what lifts them, what holds them down
 
@@ -224,6 +222,10 @@ is (D2 and D3 meet 3 to 5 times a season). A division that fails ships as standi
 
 ## Left this file
 
+- **Interceptions barely move a quarterback's game grade.** Rejected in v4.27.4 and moved to `ALTERNATIVES.md`: on the game grade's own
+  test (same-game points, 15,785 games) -45 per interception describes the day worse (0.3600 against 0.3657), and the interception's
+  fitted price is -27.6 yards against -19 shipped. What lifts a turnover-heavy game is passing volume, which the blend already weighs
+  at its best value on both the same-game and the later-game test.
 - **A harvest-time check for games stored in the wrong week.** Built in v4.27.3 (Build Log `v4.27.3-housekeeping`):
   `validate_week_ingest.py` flags any game dated more than 14 days from its week's median date (FAIL if FBS-involved, WARN
   otherwise), and `--audit` lists stored ones. Over 39,040 dated regular-season games, only the four December 2025 games exceed 10

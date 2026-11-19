@@ -322,6 +322,12 @@ projections only — labelled through `projection_source`.
 | QB score: volume only | Replaced | Held-out R2 0.3766; the half-and-half blend 0.3970 (placebo 0.3608) |
 | QB score: add points scored while he played | Rejected | Best predictor (0.4687) but it is his offense, not him |
 | QB score: heavier interception weight | Rejected | 0.3985 at x2, no better |
+| QB game grade: -45 per interception (ANY/A), v4.27.4 | Rejected | Same-game R2 0.3600 against 0.3657 shipped (picks shuffled: 0.3444); the interception priced from the same game's points is -27.6 yards, not -45 |
+| QB game grade: -30 per interception (x1.5), v4.27.4 | Rejected | 0.3659 against 0.3657 same game, 0.3994 against 0.3983 later games: noise. The setting to take if the weight is reopened |
+| QB game grade: more efficiency (blend 0.75 or 1) | Rejected | Same game 0.3659 / 0.3322 against 0.3657; later games 0.3943 / 0.3804 against 0.3983 |
+| Earned order: conference term (ridge 8), v4.27.4 | Owner's call | Winners 71.01% against 70.70%; Boise State 8th to 15th, SEC teams back up (LSU 26th to 18th). SEC 28-2 and Pac-12 9-16 against other conferences. `scripts/validate_earned_variants.py` |
+| Earned order: margin cap 14, v4.27.4 | Owner's call | Best backtest, 71.64%; LSU to 17th (12th with the conference term), against the v4.27 condition |
+| Earned order: FCS games counted, ridge 1 or 4, bonus 8 or 16, v4.27.4 | Rejected | 70.54% to 70.96%; Boise State stays 7th to 9th |
 | Roster: layout and weights through v4.19 | Replaced | 0.876 / 0.646 (same / next season) against 0.834 / 0.624 for the explainable half-and-half; the new layout fitted alone is 0.881 / 0.657 |
 | Roster weights: football prior alone, equal per starter alone | Rejected | 0.745 and 0.742 same season |
 | Roster: keep the position-weighted half at 40% | Rejected | The line unit is now a group of its own and was counted twice: 0.815 against 0.834 |

@@ -120,6 +120,38 @@ def blended(G: pd.DataFrame, D: pd.DataFrame, lam: float, att_ref: float, int_mu
     return D.merge(g.groupby(["season", "pid", "team"])["c"].mean().rename("cnew").reset_index(), on=["season", "pid", "team"])
 
 
+def game_score(G: pd.DataFrame, lam: float, int_mult: float = 1.0) -> pd.Series:
+    """One QB game's score as the game grade reads it: the volume score with the interception weight times int_mult, blended
+    with the same score restated at QB_ATT_REF attempts."""
+    c = G["comp"] - (int_mult - 1.0) * 20.0 * G["ints"]
+    return (1 - lam) * c + lam * c / G["att"].clip(lower=t06.QB_ATT_FLOOR) * t06.QB_ATT_REF
+
+
+def same_game_r2(G: pd.DataFrame, x: pd.Series) -> float:
+    """Leave-one-season-out R2 of the team's points over expectation IN THAT GAME on one score, within-season z-scores.
+
+    This is the descriptive test of the published game grade (does a QB's line track his offense that day?), where heldout_r2
+    is the predictive test of the running rating (does it track his offense in later games?)."""
+    zs = lambda c: (c - c.groupby(G.season).transform("mean")) / c.groupby(G.season).transform("std")  # noqa: E731
+    X, y = zs(x).values, zs(G["poe"]).values
+    pred = np.zeros(len(G))
+    for s in G.season.unique():
+        te = (G.season == s).values
+        b = np.linalg.lstsq(np.column_stack([np.ones((~te).sum()), X[~te]]), y[~te], rcond=None)[0]
+        pred[te] = b[0] + b[1] * X[te]
+    return 1 - np.sum((y - pred) ** 2) / np.sum((y - y.mean()) ** 2)
+
+
+def interception_price(G: pd.DataFrame) -> tuple:
+    """The price of one interception and one passing touchdown in passing yards, fitted from the same game's points over
+    expectation (OLS on passing yards, TD, INT and attempts with season fixed effects). A touchdown is points, so its price here
+    is inflated by construction; the interception's is the useful number."""
+    dummies = pd.get_dummies(G.season, drop_first=True).values.astype(float)
+    A = np.column_stack([np.ones(len(G)), G["yds"], G["td"], G["ints"], G["att"], dummies])
+    b = np.linalg.lstsq(A, G["poe"].values, rcond=None)[0]
+    return b[3] / b[1], b[2] / b[1]
+
+
 def main() -> int:
     """Print the held-out table and return 1 if the shipped blend is not the best of the grid."""
     G = game_table()
@@ -149,6 +181,18 @@ def main() -> int:
     Gp["att"] = Gp.groupby("season")["att"].transform(lambda v: rng.permutation(v.values))
     d = blended(Gp, D, t06.QB_EFFICIENCY_BLEND, ref)
     print(f"   placebo (attempts shuffled across games within season) at the shipped blend: {heldout_r2(d.assign(vol=d['cnew']), ['ctrl', 'vol'])[0]:.4f}")
+
+    # The published game grade, tested on what it describes: the same game (v4.27.4, after the owner's Sam Leavitt question).
+    Gs = G[G["off"].notna()]
+    print(f"\nthe game grade's own test: same-game R2 of his offense's points over expectation that day ({len(Gs):,} games):")
+    for im in (0.0, 1.0, 1.5, 2.0, 2.25, 3.0):
+        print(f"   interception weight x{im:<4} (-{20 * im:>2.0f}) at the shipped blend: {same_game_r2(Gs, game_score(Gs, t06.QB_EFFICIENCY_BLEND, im)):.4f}")
+    for lam in (0.0, 0.25, 0.75, 1.0):
+        print(f"   blend lambda {lam:4.2f} at today's interception weight:     {same_game_r2(Gs, game_score(Gs, lam)):.4f}")
+    shuf = Gs.assign(ints=Gs.groupby("season")["ints"].transform(lambda v: rng.permutation(v.values)))
+    print(f"   placebo (interceptions shuffled across games within season), x2.25: {same_game_r2(Gs, game_score(shuf, t06.QB_EFFICIENCY_BLEND, 2.25)):.4f}")
+    pi, pt = interception_price(Gs)
+    print(f"   one interception, priced from the same game's points: {pi:+.1f} passing yards (shipped {-20 / 1.05:+.1f}; ANY/A -45)")
     best = max(scores, key=scores.get)
     return 0 if abs(best - t06.QB_EFFICIENCY_BLEND) < 1e-9 else 1
 
