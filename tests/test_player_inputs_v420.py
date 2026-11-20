@@ -281,3 +281,27 @@ class TestQbAccuracyAndTurnovers:
         games = [self._line(6, 10, 0, 0, 0), self._line(14, 20, 0, 0, 0), self._line(1, 5, 0, 0, 0)]
         assert t06.season_completion_rate(games) == pytest.approx(20 / 30)
         assert t06.season_completion_rate([]) is None
+
+
+class TestCountedSeasonThatSumsToZero:
+    """v4.28.1: a season of counted games whose every score floored at 0 is minimal production, not missing data. Script 07
+    reads an EDGE of 0 as "no data", so without this a 2020 QB's three floored games became a 62.7 recruiting fallback."""
+
+    def _season(self, monkeypatch, lines):
+        import pandas as pd
+        rows = pd.DataFrame([{"position_group": "QB", "player_team_id": 1, "home_team_id": 1, "away_team_id": 2, "player_id": 7,
+                              "game_id": i, "data": d} for i, d in enumerate(lines)])
+        monkeypatch.setattr(t06, "_load_game_stats", lambda season, positions: rows)
+        monkeypatch.setattr(t06, "opponent_multiplier", lambda *a, **k: 1.0)
+        return t06.compute_offensive_edge(2020, {})
+
+    def test_three_floored_games_are_rated_at_the_bottom(self, monkeypatch):
+        bad = {"passingC/ATT": "8/28", "passingYDS": 90, "passingTD": 0, "passingINT": 3}   # V = 94.5 - 60 > 0, A < 0
+        out = self._season(monkeypatch, [bad, bad, bad])
+        assert out.iloc[0]["games_played"] == 3
+        assert out.iloc[0]["edge_score"] == t06.MIN_COUNTED_EDGE
+
+    def test_a_season_with_production_is_untouched(self, monkeypatch):
+        ok = {"passingC/ATT": "17/28", "passingYDS": 220, "passingTD": 2, "passingINT": 0}
+        out = self._season(monkeypatch, [ok, ok, ok])
+        assert out.iloc[0]["edge_score"] > 100

@@ -667,7 +667,7 @@ QB volume score V = 1.05 passing yards + 0.6 rushing yards + 25 passing TD + 18 
 **v4.28 (accuracy and turnover-heavy games).** Before the blend, a QB's score is A = V + 5 x (completions - season rate x attempts)
 - 30 x max(interceptions - passing TD, 0), floored at 0; the game score is 0.5 A + 0.5 A / max(attempts, 10) x 28. The season rate is
 completions over attempts across that season's QB games of 10+ attempts, never one pooled rate (0.593 in 2015 to 0.631 in 2026). Which
-games count is unchanged (V > 0). Constants QB_ACC_PER_CMP, QB_EXCESS_INT, QB_RATE_MIN_ATT in script 06; evidence in
+games count is unchanged (V > 0). A season of counted games that sums to 0 gets EDGE 1e-6 (MIN_COUNTED_EDGE, v4.28.1), the bottom of the scale, because script 07 reads 0 as no data. Constants QB_ACC_PER_CMP, QB_EXCESS_INT, QB_RATE_MIN_ATT in script 06; evidence in
 `scripts/validate_qb_composite.py` and the METHODS `qb-composite` entry.
 Live teams carry roster_half, stats_half, results_half, results_points and play_rating; a projected season exports its projection row only.
 

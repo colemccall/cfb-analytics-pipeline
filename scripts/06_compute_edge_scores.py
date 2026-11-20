@@ -1116,6 +1116,7 @@ QB_ATT_FLOOR = 10.0
 QB_ACC_PER_CMP = 5.0
 QB_EXCESS_INT = 30.0
 QB_RATE_MIN_ATT = 10.0
+MIN_COUNTED_EDGE = 1e-6   # an offensive season of counted games that sums to 0: rated at the bottom, never read as missing (v4.28.1)
 
 
 def _qb_attempts(stats: dict) -> float:
@@ -1242,6 +1243,11 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
     def agg(grp):
         n         = len(grp)
         edge      = grp["adj_score"].sum() / max(np.sqrt(n), 1.0)
+        # Counted games whose every score floored at 0 (v4.28) are minimal production, not missing data: script 07 reads an EDGE
+        # of 0 as "no data" and the low-game rule refuses it, so such a season would lose its rating (three one-game 2026 QBs did).
+        # The smallest positive EDGE maps to the bottom of the scale. Only seasons that would otherwise be exactly 0 change (v4.28.1).
+        if n and edge <= 0:
+            edge = MIN_COUNTED_EDGE
         avg_mult  = grp["opp_mult"].mean()
         return pd.Series({
             "edge_score":      edge,
