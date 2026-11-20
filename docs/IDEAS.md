@@ -171,6 +171,25 @@ against each other and breaks the v4.27 condition that LSU stay outside the top 
 
 **Raised by:** the owner (2026-11-19: Boise State above Texas Tech, Wake Forest and Indiana).
 
+**Decided 2026-11-20: left as it is, and monitored.** The owner: the margin cap "rewards teams that win big and lose close, which is
+very different than some teams like kentucky or texas, who win close and lose big", so it is not explored further for now. Rerun
+`scripts/validate_earned_variants.py` after later weeks to watch whether Boise State's place and the SEC's hold.
+
+## A QB game score where accuracy and turnover-heavy games count
+
+The owner: "even if a quarterback throws for 400 yds, but has 3 ints to 1 td, its a really bad game". Measured 2026-11-20 on 15,785
+games 2016-2025 (both tests in `scripts/validate_qb_composite.py` terms): offenses in 300+ yard, 3+ interception, at most one touchdown
+games scored at the 35.5th percentile while the score put the games at the 48.6th, a miss away from the middle, not regression to it.
+Two terms fix it: 5 points per completion over the season's expected rate (shuffled completions: 0.3546, so it is real), and 30 per
+interception beyond passing touchdowns. Same-game R2 0.3657 to 0.3671, later-game 0.3983 to 0.3980; those games move to the 33.4th
+percentile; a 400-yard, 1 TD, 3 INT game from the 68th to the 51st. With 20 per excess interception instead of 30: 0.3691 and 0.3986
+(both better), the example game at the 56th. Pushing the example below the 40th (60 per excess) costs 0.010 of same-game R2.
+
+**What must be true first:** the owner's go, because every QB rating in every season moves; then a full recompute (script order in
+CLAUDE.md §4), `validate_ratings`, the draft check, reliability and both projection gates, and a model snapshot.
+
+**Raised by:** the owner (2026-11-20).
+
 ## Explain each team's two numbers: what lifts them, what holds them down
 
 A page under a team's schedule that explains the earned number (which results lift it, which hold it down, and how it is graded
