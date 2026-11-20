@@ -1103,6 +1103,20 @@ QB_EFFICIENCY_BLEND = 0.5
 QB_ATT_REF = 28.0
 QB_ATT_FLOOR = 10.0
 
+# ACCURACY AND TURNOVER-HEAVY GAMES (v4.28, the owner: "even if a quarterback throws for 400 yds, but has 3 ints to 1 td, its a
+# really bad game"). Two terms join the QB game score before the blend:
+#   + QB_ACC_PER_CMP per completion over the season's expected rate (completions - season rate x attempts), the rate measured from
+#     that season's QB games of 10+ attempts (0.593 in 2015 to 0.631 in 2026: an era drift, so never one pooled rate);
+#   - QB_EXCESS_INT per interception beyond passing touchdowns (max(INT - TD, 0)), on top of the -20 every interception costs.
+# Measured on 15,785 QB games 2016-2025 (scripts/validate_qb_composite.py): offenses in 300+ yard, 3+ interception, at most one
+# touchdown games scored at the 35.5th percentile while the old score put the games at the 48.6th, a miss AWAY from the middle,
+# not regression to it. Same-game R2 0.3657 -> 0.3671, later-game 0.3983 -> 0.3980; shuffling completions across games drops the
+# same-game R2 to 0.3546. Which games count is unchanged: the old score must be above 0 (_off_game_counts); the new score is
+# floored at 0 so a disastrous game counts as nothing rather than vanishing from the season.
+QB_ACC_PER_CMP = 5.0
+QB_EXCESS_INT = 30.0
+QB_RATE_MIN_ATT = 10.0
+
 
 def _qb_attempts(stats: dict) -> float:
     """Pass attempts in one game, read from "C/ATT" ("12/20") when that is the form present, else passingATT."""
@@ -1112,13 +1126,48 @@ def _qb_attempts(stats: dict) -> float:
     return float(_coerce_int(catt))
 
 
-def _off_stat_composite(pg: str, stats: dict) -> float:
-    """One offensive game's score: sum of stat x weight; a QB's is blended with the same score at a standard attempt count."""
-    weights = OFFENSIVE_COMPOSITE.get(pg, {})
-    base = sum(_coerce_float(stats.get(k)) * w for k, w in weights.items())
+def _qb_completions(stats: dict) -> float:
+    """Completions in one game, read from "C/ATT" ("12/20"); 0 when absent."""
+    catt = stats.get("passingC/ATT")
+    if catt and "/" in str(catt):
+        return float(_coerce_int(str(catt).split("/")[0]))
+    return 0.0
+
+
+def season_completion_rate(game_stats) -> float | None:
+    """The season's expected completion rate: completions over attempts across QB games of QB_RATE_MIN_ATT+ attempts in
+    `game_stats` (an iterable of stat dicts). None when there are none, and the accuracy term is then left out."""
+    c = a = 0.0
+    for s in game_stats:
+        att = _qb_attempts(s)
+        if att >= QB_RATE_MIN_ATT:
+            c += _qb_completions(s)
+            a += att
+    return c / a if a else None
+
+
+def _off_base(pg: str, stats: dict) -> float:
+    """The volume score: sum of stat x OFFENSIVE_COMPOSITE weight."""
+    return sum(_coerce_float(stats.get(k)) * w for k, w in OFFENSIVE_COMPOSITE.get(pg, {}).items())
+
+
+def _off_game_counts(pg: str, stats: dict) -> bool:
+    """Whether an offensive game counts toward a season: its volume score is above 0 (unchanged by the v4.28 QB terms)."""
+    return _off_base(pg, stats) > 0
+
+
+def _off_stat_composite(pg: str, stats: dict, cmp_rate: float | None = None) -> float:
+    """One offensive game's score: sum of stat x weight. A QB's adds the accuracy and turnover-heavy terms (cmp_rate is the
+    season's expected completion rate; without it the accuracy term is left out), is floored at 0, and is blended with the same
+    score at a standard attempt count."""
+    base = _off_base(pg, stats)
     if pg == "QB" and base > 0:
+        adj = base - QB_EXCESS_INT * max(_coerce_float(stats.get("passingINT")) - _coerce_float(stats.get("passingTD")), 0.0)
+        if cmp_rate is not None:
+            adj += QB_ACC_PER_CMP * (_qb_completions(stats) - cmp_rate * _qb_attempts(stats))
+        adj = max(adj, 0.0)
         att = max(_qb_attempts(stats), QB_ATT_FLOOR)
-        return (1.0 - QB_EFFICIENCY_BLEND) * base + QB_EFFICIENCY_BLEND * base / att * QB_ATT_REF
+        return (1.0 - QB_EFFICIENCY_BLEND) * adj + QB_EFFICIENCY_BLEND * adj / att * QB_ATT_REF
     return base
 
 
@@ -1157,6 +1206,7 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
 
     season_means = _season_means(sp_map)
     records = []
+    cmp_rate = season_completion_rate(d for d, pg in zip(rows["data"], rows["position_group"]) if pg == "QB" and isinstance(d, dict))
 
     for _, r in rows.iterrows():
         pg      = r["position_group"]
@@ -1164,9 +1214,9 @@ def compute_offensive_edge(season: int, sp_map: dict) -> pd.DataFrame:
         opp_team = r["away_team_id"] if my_team == r["home_team_id"] else r["home_team_id"]
         stats   = r["data"] if isinstance(r["data"], dict) else {}
 
-        raw = _off_stat_composite(pg, stats)
-        if raw <= 0:
+        if not _off_game_counts(pg, stats):
             continue
+        raw = _off_stat_composite(pg, stats, cmp_rate)
 
         try:
             opp_id = int(opp_team) if opp_team is not None and not pd.isna(opp_team) else None

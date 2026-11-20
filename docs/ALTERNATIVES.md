@@ -323,6 +323,7 @@ projections only — labelled through `projection_source`.
 | QB score: add points scored while he played | Rejected | Best predictor (0.4687) but it is his offense, not him |
 | QB score: heavier interception weight | Rejected | 0.3985 at x2, no better |
 | QB game grade: -45 per interception (ANY/A), v4.27.4 | Rejected | Same-game R2 0.3600 against 0.3657 shipped (picks shuffled: 0.3444); the interception priced from the same game's points is -27.6 yards, not -45 |
+| QB score: accuracy + 30 per interception beyond TDs, v4.28 | Shipped | Same-game 0.3651 -> 0.3707, later-game 0.3983 -> 0.3990; draft agreement 0.4493 -> 0.4429 (the cost) |
 | QB game grade: -30 per interception (x1.5), v4.27.4 | Rejected | 0.3659 against 0.3657 same game, 0.3994 against 0.3983 later games: noise. The setting to take if the weight is reopened |
 | QB game grade: more efficiency (blend 0.75 or 1) | Rejected | Same game 0.3659 / 0.3322 against 0.3657; later games 0.3943 / 0.3804 against 0.3983 |
 | Earned order: conference term (ridge 8), v4.27.4 | Owner's call | Winners 71.01% against 70.70%; Boise State 8th to 15th, SEC teams back up (LSU 26th to 18th). SEC 28-2 and Pac-12 9-16 against other conferences. `scripts/validate_earned_variants.py` |

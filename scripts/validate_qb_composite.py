@@ -56,7 +56,9 @@ def game_table() -> pd.DataFrame:
         g = games[(games["season"] == s) & games["home_score"].notna() & games["away_score"].notna()]
         sol = ostr.solve(g.to_dict("records"), conf, sorted(sc))
         gi = games[games["season"] == s].set_index("id")
-        for r in t06._load_game_stats(s, {"QB"}).itertuples():
+        qb = t06._load_game_stats(s, {"QB"})
+        rate = t06.season_completion_rate(d for d in qb["data"] if isinstance(d, dict))
+        for r in qb.itertuples():
             gm = gi.loc[r.game_id] if r.game_id in gi.index else None
             if gm is None or gm.season_type != "regular" or pd.isna(gm.home_score):
                 continue
@@ -71,6 +73,7 @@ def game_table() -> pd.DataFrame:
             pts = float(gm.home_score if home else gm.away_score)
             rows.append(dict(season=s, pid=r.player_id, team=me, week=int(gm.week), att=att, cmp=cmp_, yds=num(r.data, "passingYDS"),
                              td=num(r.data, "passingTD"), ints=num(r.data, "passingINT"), comp=base_composite(r.data),
+                             prod=t06._off_stat_composite("QB", r.data, rate) if t06._off_game_counts("QB", r.data) else np.nan,
                              poe=pts + (sol[opp]["dfn"] if opp in sol else sol[ostr.FCS]["dfn"]), off=sol.get(me, {}).get("off")))
     out = pd.DataFrame(rows)
     out["poe"] = out["poe"] - out.groupby("season")["poe"].transform("mean")
@@ -191,6 +194,17 @@ def main() -> int:
         print(f"   blend lambda {lam:4.2f} at today's interception weight:     {same_game_r2(Gs, game_score(Gs, lam)):.4f}")
     shuf = Gs.assign(ints=Gs.groupby("season")["ints"].transform(lambda v: rng.permutation(v.values)))
     print(f"   placebo (interceptions shuffled across games within season), x2.25: {same_game_r2(Gs, game_score(shuf, t06.QB_EFFICIENCY_BLEND, 2.25)):.4f}")
+    prod = Gs[Gs["prod"].notna()]
+    print(f"   SHIPPED production score (v4.28: accuracy {t06.QB_ACC_PER_CMP:g}/completion over the season rate, -{t06.QB_EXCESS_INT:g} per interception beyond TDs, floored at 0), "
+          f"{len(prod):,} counted games: {same_game_r2(prod, prod['prod']):.4f} against the pre-v4.28 score on the same games {same_game_r2(prod, game_score(prod, t06.QB_EFFICIENCY_BLEND)):.4f}")
+    pre = G[G.week <= 8].dropna(subset=["prod"]).groupby(["season", "pid", "team"])["prod"].mean().rename("cnew").reset_index()
+    dp = D.merge(pre, on=["season", "pid", "team"])
+    print(f"   SHIPPED production score, later-game (predictive) test: {heldout_r2(dp.assign(vol=dp['cnew']), ['ctrl', 'vol'])[0]:.4f} (pre-v4.28 0.3983)")
+    pct = lambda col: prod.groupby("season")[col].rank(pct=True) * 100  # noqa: E731
+    bad = (prod.yds >= 300) & (prod.ints >= 3) & (prod.td <= 1)
+    pp, py = pct("prod"), pct("poe")
+    old = prod.assign(o=game_score(prod, t06.QB_EFFICIENCY_BLEND)).groupby("season")["o"].rank(pct=True) * 100
+    print(f"   300+ yds, 3+ INT, <=1 TD ({int(bad.sum())} games): score percentile {old[bad].mean():.1f} before, {pp[bad].mean():.1f} now; the offense's points {py[bad].mean():.1f}")
     pi, pt = interception_price(Gs)
     print(f"   one interception, priced from the same game's points: {pi:+.1f} passing yards (shipped {-20 / 1.05:+.1f}; ANY/A -45)")
     best = max(scores, key=scores.get)

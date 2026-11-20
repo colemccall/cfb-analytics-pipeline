@@ -239,3 +239,45 @@ class TestPartTimeThroughTheEdgePath:
         assert not t07.part_time_edge(row(games=2))
         assert not t07.part_time_edge(row(edge=float("nan")))
         assert not t07.part_time_edge(self._row(0.0).iloc[0])
+
+
+class TestQbAccuracyAndTurnovers:
+    """v4.28: completions over the season's expected rate count, interceptions beyond passing touchdowns cost extra, and a
+    disastrous game is floored at 0 rather than dropped (which games count is unchanged)."""
+
+    @staticmethod
+    def _line(cmp_, att, yds, td, ints):
+        return {"passingC/ATT": f"{cmp_}/{att}", "passingYDS": yds, "passingTD": td, "passingINT": ints}
+
+    def test_completions_over_the_rate_are_credited(self):
+        hi = t06._off_stat_composite("QB", self._line(21, 28, 250, 2, 0), cmp_rate=0.6)
+        lo = t06._off_stat_composite("QB", self._line(15, 28, 250, 2, 0), cmp_rate=0.6)
+        assert hi - lo == pytest.approx(t06.QB_ACC_PER_CMP * 6)       # 28 attempts: the blend leaves the score unscaled
+
+    def test_without_a_season_rate_there_is_no_accuracy_term(self):
+        s = self._line(21, 28, 250, 2, 0)
+        assert t06._off_stat_composite("QB", s) == pytest.approx(1.05 * 250 + 25 * 2)
+
+    def test_interceptions_beyond_touchdowns_cost_extra(self):
+        one_three = t06._off_stat_composite("QB", self._line(17, 28, 400, 1, 3))
+        three_three = t06._off_stat_composite("QB", self._line(17, 28, 400, 3, 3))
+        # two more touchdowns are worth 2 x 25, and remove two excess interceptions (2 x QB_EXCESS_INT)
+        assert three_three - one_three == pytest.approx(2 * 25 + 2 * t06.QB_EXCESS_INT)
+
+    def test_no_extra_charge_when_touchdowns_cover_the_interceptions(self):
+        s = self._line(17, 28, 300, 2, 2)
+        assert t06._off_stat_composite("QB", s) == pytest.approx(1.05 * 300 + 25 * 2 - 20 * 2)
+
+    def test_a_disastrous_game_is_floored_and_still_counts(self):
+        s = self._line(10, 28, 120, 0, 3)                            # V = 126 - 60 = 66 > 0; A = 66 - 90 - accuracy < 0
+        assert t06._off_game_counts("QB", s)
+        assert t06._off_stat_composite("QB", s, cmp_rate=0.6) == 0.0
+
+    def test_which_games_count_reads_the_volume_score(self):
+        assert not t06._off_game_counts("QB", self._line(4, 12, 20, 0, 2))
+        assert t06._off_game_counts("QB", self._line(17, 28, 200, 1, 1))
+
+    def test_the_season_rate_reads_games_of_ten_attempts_or_more(self):
+        games = [self._line(6, 10, 0, 0, 0), self._line(14, 20, 0, 0, 0), self._line(1, 5, 0, 0, 0)]
+        assert t06.season_completion_rate(games) == pytest.approx(20 / 30)
+        assert t06.season_completion_rate([]) is None

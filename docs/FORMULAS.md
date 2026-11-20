@@ -663,6 +663,12 @@ Headline = 0.30 roster + 0.20 team stats + 0.50 results; results = SP_OVERALL_AN
 
 Headline = 1/6 roster + 1/6 team stats + 2/3 results (renormalised when one is absent); the group shares of the roster are 1/6 of the weights in the v4.20 table (QB 2.3%, RB 1.5%, WR 1.5%, TE 0.5%, OL 1.7%, DL 2.2%, LB 2.4%, DB 4.2%, K 0.2%, P 0.3%, stats 16.7%, results 66.7% of the final score). Offense and defense use the same weights. Power's rating part is unchanged (0.60 roster + 0.40 stats).
 QB volume score V = 1.05 passing yards + 0.6 rushing yards + 25 passing TD + 18 rushing TD - 20 interceptions (was 1.0, 0.7, 25, 20, -20); the game score is still 0.5 V + 0.5 V / max(attempts, 10) x 28.
+
+**v4.28 (accuracy and turnover-heavy games).** Before the blend, a QB's score is A = V + 5 x (completions - season rate x attempts)
+- 30 x max(interceptions - passing TD, 0), floored at 0; the game score is 0.5 A + 0.5 A / max(attempts, 10) x 28. The season rate is
+completions over attempts across that season's QB games of 10+ attempts, never one pooled rate (0.593 in 2015 to 0.631 in 2026). Which
+games count is unchanged (V > 0). Constants QB_ACC_PER_CMP, QB_EXCESS_INT, QB_RATE_MIN_ATT in script 06; evidence in
+`scripts/validate_qb_composite.py` and the METHODS `qb-composite` entry.
 Live teams carry roster_half, stats_half, results_half, results_points and play_rating; a projected season exports its projection row only.
 
 ## v4.22 - live power on games alone, weekly progression (mirrors METHODS `power-rating`, `weekly-progression`)
